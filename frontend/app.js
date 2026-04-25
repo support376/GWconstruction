@@ -816,6 +816,552 @@ function projectCardHtml(p) {
 }
 
 // ============================================================
+// 아침 요약 (Phase 5) — 경영진용 한 페이지
+// ============================================================
+route('/morning', async () => {
+  const d = await api.get('/api/morning');
+  const k = d.kpi, n = d.notifications;
+  const sevIcon = { urgent: '🚨', warning: '⚠️', info: 'ℹ️' };
+
+  $('#app').innerHTML = `
+    <div class="morning-hero">
+      <h2>오늘 아침 — ${d.as_of}</h2>
+      <div class="date">한 페이지 요약. 빨간 항목부터 처리하시면 됩니다.</div>
+      <div class="quick">
+        <div><div class="label">활성 현장</div><div class="value">${k.active_sites}</div><div class="delta">총 직원 ${k.workers_total}명</div></div>
+        <div><div class="label">오늘 출근</div><div class="value">${k.clocked_today}</div><div class="delta">어제 ${k.clocked_yesterday}명</div></div>
+        <div><div class="label">신규 가입 (7일)</div><div class="value">${k.new_signups_week}</div></div>
+        <div><div class="label">잔여 공사대금</div><div class="value">${fmtMoney(k.remaining)}</div><div class="delta">계약 ${fmtMoney(k.contract_total)}</div></div>
+      </div>
+    </div>
+
+    <div class="stat-grid">
+      <div class="stat ${n.urgent>0?'warning':''}"><div class="label">🚨 긴급</div><div class="value">${n.urgent}</div></div>
+      <div class="stat warning"><div class="label">⚠️ 경고</div><div class="value">${n.warning}</div></div>
+      <div class="stat accent"><div class="label">ℹ️ 안내</div><div class="value">${n.info}</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head"><h3>오늘의 액션 (Top ${d.top_actions.length})</h3></div>
+      <div class="card-pad">
+        ${d.top_actions.length === 0 ? '<div style="color:var(--text-muted)">처리할 액션 없음 ✅</div>' :
+          d.top_actions.map(a => `<div class="action-card">
+            <div>
+              <span class="ico">${sevIcon[a.severity]||'•'}</span>
+              <span class="${a.severity}"><b>${a.title}</b></span>
+            </div>
+            <a href="${a.link||'#'}" class="btn btn-sm">이동 →</a>
+          </div>`).join('')}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>진행 중 프로세스</h3></div>
+      <table class="table">
+        <thead><tr><th>워크플로우</th><th>상태</th><th style="text-align:right">건수</th></tr></thead>
+        <tbody>
+          ${d.processes_by_state.length === 0 ? '<tr><td colspan="3" style="text-align:center;color:var(--text-muted)">없음</td></tr>' :
+            d.processes_by_state.map(p => `<tr>
+              <td>${(window.__procDefs||{})[p.workflow]?.name || p.workflow}</td>
+              <td>${p.current_state}</td>
+              <td style="text-align:right"><b>${p.cnt}</b></td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+});
+
+// ============================================================
+// 프로세스 칸반 (Phase 4)
+// ============================================================
+let procState = { workflow: null, defs: null };
+
+route('/processes', async () => {
+  if (!procState.defs) {
+    procState.defs = await api.get('/api/process-definitions');
+    window.__procDefs = {};
+    procState.defs.forEach(d => window.__procDefs[d.id] = d);
+  }
+  if (!procState.workflow) procState.workflow = procState.defs[0]?.id || 'sales';
+
+  const procs = await api.get('/api/processes?workflow=' + procState.workflow);
+  const def = procState.defs.find(d => d.id === procState.workflow);
+  if (!def) { $('#app').innerHTML = '정의 없음'; return; }
+
+  // 카운트 per workflow
+  const allProcs = await api.get('/api/processes');
+  const cntByWf = {};
+  allProcs.forEach(p => { cntByWf[p.workflow] = (cntByWf[p.workflow] || 0) + 1; });
+
+  // 상태별로 묶기
+  const byState = {};
+  def.states.forEach(s => byState[s] = []);
+  procs.forEach(p => {
+    if (byState[p.current_state]) byState[p.current_state].push(p);
+    else byState[p.current_state] = [p];
+  });
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">프로세스 보드</div>
+        <div class="page-sub">7개 업무 흐름 — 카드 클릭하면 다음 단계로 진행할 수 있습니다.</div>
+      </div>
+    </div>
+
+    <div class="proc-tabs">
+      ${procState.defs.map(d => `<span class="proc-tab ${d.id===procState.workflow?'active':''}" data-w="${d.id}">${d.name}<span class="cnt">${cntByWf[d.id]||0}</span></span>`).join('')}
+    </div>
+
+    <div class="kanban">
+      ${def.states.map(state => {
+        const cards = byState[state] || [];
+        const isTerminal = (def.terminal||[]).includes(state);
+        return `<div class="kanban-col ${isTerminal?'terminal':''}">
+          <h5>${state}<span class="cnt">${cards.length}</span></h5>
+          ${cards.length === 0 ? '<div class="proc-empty">—</div>' :
+            cards.map(p => `<div class="proc-card" data-pid="${p.id}" data-cur="${p.current_state}">
+              <div class="name">${p.subject_name||('#'+p.subject_id)}</div>
+              ${p.scope_key ? `<div class="scope">${p.scope_key}</div>` : ''}
+              <div class="updated">${(p.updated_at||p.started_at||'').slice(0,16).replace('T',' ')}</div>
+            </div>`).join('')}
+        </div>`;
+      }).join('')}
+    </div>
+  `;
+
+  $$('.proc-tab').forEach(t => t.onclick = () => {
+    procState.workflow = t.dataset.w; navigate();
+  });
+  $$('.proc-card').forEach(card => card.onclick = async () => {
+    const pid = +card.dataset.pid;
+    const cur = card.dataset.cur;
+    const states = def.states;
+    const idx = states.indexOf(cur);
+    const choices = states.slice(idx+1);
+    if (choices.length === 0) { alert('이미 마지막 상태입니다.'); return; }
+    const target = prompt(
+      '다음 상태를 선택하세요:\n' + choices.map((s,i) => `${i+1}. ${s}`).join('\n') + '\n\n번호 또는 상태명 입력:',
+      '1');
+    if (!target) return;
+    const num = parseInt(target);
+    const targetState = (!isNaN(num) && num >= 1 && num <= choices.length) ? choices[num-1] :
+                        choices.includes(target) ? target : null;
+    if (!targetState) { alert('잘못된 선택'); return; }
+    await api.post('/api/processes/'+pid+'/advance', { target_state: targetState });
+    navigate();
+  });
+});
+
+// ============================================================
+// 알림 (Phase 5)
+// ============================================================
+route('/inbox', async () => {
+  // refresh 룰 한 번
+  await fetch('/api/notifications/refresh', { method: 'POST' });
+  const notifs = await api.get('/api/notifications');
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">📬 알림</div>
+        <div class="page-sub">자동 룰 엔진이 만든 ${notifs.length}건의 처리 항목</div>
+      </div>
+      <button class="btn" id="all-read">전부 읽음 처리</button>
+    </div>
+
+    ${notifs.length === 0 ? '<div class="card card-pad" style="text-align:center; color:var(--text-muted)">처리할 알림 없음 ✅</div>' :
+      notifs.map(n => `<div class="notif ${n.is_read?'':'unread'}" data-id="${n.id}" data-link="${n.link||''}">
+        <div class="sev-bar ${n.severity}"></div>
+        <div class="body">
+          <div class="title">${n.title}</div>
+          ${n.message ? `<div class="msg">${n.message}</div>` : ''}
+          <div class="meta">${(n.created_at||'').slice(0,16).replace('T',' ')} · ${n.rule_type}</div>
+        </div>
+        <div class="actions">
+          <span class="notif-tag">${{urgent:'🚨긴급',warning:'⚠️경고',info:'ℹ️안내'}[n.severity]||n.severity}</span>
+          ${n.link ? `<a href="${n.link}" class="btn btn-sm" onclick="event.stopPropagation()">이동 →</a>` : ''}
+        </div>
+      </div>`).join('')}
+  `;
+
+  $('#all-read').onclick = async () => {
+    await fetch('/api/notifications/read-all', { method: 'POST' });
+    navigate();
+    refreshNotifBadge();
+  };
+  $$('.notif').forEach(el => el.onclick = async () => {
+    const id = +el.dataset.id;
+    await fetch('/api/notifications/'+id+'/read', { method: 'POST' });
+    el.classList.remove('unread');
+    refreshNotifBadge();
+  });
+});
+
+async function refreshNotifBadge() {
+  try {
+    const r = await fetch('/api/notifications/count').then(r => r.json());
+    const badge = document.getElementById('notif-badge');
+    if (!badge) return;
+    if (r.unread > 0) {
+      badge.style.display = 'inline-block';
+      badge.textContent = r.unread > 99 ? '99+' : r.unread;
+      badge.style.background = r.urgent > 0 ? '#b3373d' : '#d97706';
+    } else {
+      badge.style.display = 'none';
+    }
+  } catch (e) {}
+}
+
+// ============================================================
+// 3 시점 (현장/행정/재무) — Phase 3
+// ============================================================
+let lensState = { tab: 'field' };
+
+route('/lens', async () => { await renderLens(); });
+
+async function renderLens() {
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">3 시점 — 현장 · 행정 · 재무</div>
+        <div class="page-sub">같은 사실을 3가지 관점에서. 모두 events 데이터 기반 — 디지털 트윈의 본질적 UX.</div>
+      </div>
+    </div>
+
+    <div class="lens-tabs">
+      <button data-t="field"   class="${lensState.tab==='field'?'active':''}">
+        <span class="ico">🌳</span>현장 시점
+      </button>
+      <button data-t="admin"   class="${lensState.tab==='admin'?'active':''}">
+        <span class="ico">📋</span>행정 시점
+      </button>
+      <button data-t="finance" class="${lensState.tab==='finance'?'active':''}">
+        <span class="ico">💰</span>재무 시점
+      </button>
+    </div>
+
+    <div id="lens-body">로딩…</div>
+  `;
+  $$('.lens-tabs button').forEach(b => b.onclick = () => {
+    lensState.tab = b.dataset.t;
+    renderLens();
+  });
+  if (lensState.tab === 'field')   await renderLensField();
+  else if (lensState.tab === 'admin') await renderLensAdmin();
+  else                                await renderLensFinance();
+}
+
+async function renderLensField() {
+  const d = await api.get('/api/views/field?days=1');
+  const totalToday = d.active_sites.reduce((s, x) => s + (x.clocked_in_today||0), 0);
+  $('#lens-body').innerHTML = `
+    <div class="stat-grid">
+      <div class="stat accent"><div class="label">활성 현장</div><div class="value">${d.active_sites.length}</div></div>
+      <div class="stat success"><div class="label">오늘 출근 인원</div><div class="value">${totalToday}</div><div class="delta">GPS 인증 기준</div></div>
+      <div class="stat warning"><div class="label">최근 활동 이벤트</div><div class="value">${d.recent_events.length}</div><div class="delta">출퇴근·배치</div></div>
+    </div>
+
+    <div class="lens-section">
+      <h3>🌳 활성 현장별 오늘 인원</h3>
+      ${d.active_sites.length === 0 ? '<div class="empty">활성 현장 없음</div>' :
+        '<table class="table"><thead><tr><th>현장</th><th>주소</th><th>지오펜스</th><th style="text-align:right">오늘 인원</th></tr></thead><tbody>'
+        + d.active_sites.map(s => `<tr>
+          <td><b>${s.name}</b></td>
+          <td style="font-size:11px;color:var(--text-muted)">${s.address||'-'}</td>
+          <td style="font-size:11px">${s.geofence_meters||200}m</td>
+          <td style="text-align:right"><b>${s.clocked_in_today}명</b></td>
+        </tr>`).join('') + '</tbody></table>'}
+    </div>
+
+    <div class="lens-section">
+      <h3>🌳 최근 24시간 활동 (${d.recent_events.length}건)</h3>
+      <div class="events-mini">
+        ${d.recent_events.length === 0 ? '<div class="empty">없음</div>' :
+          d.recent_events.map(eventCardHtml).join('')}
+      </div>
+    </div>
+  `;
+}
+
+async function renderLensAdmin() {
+  const d = await api.get('/api/views/admin');
+  const cnt = d.pending_review.length + d.sites_missing_gps.length +
+              d.workers_no_company.length + d.workers_no_wage.length;
+  $('#lens-body').innerHTML = `
+    <div class="stat-grid">
+      <div class="stat warning"><div class="label">처리 대기</div><div class="value">${cnt}</div><div class="delta">관리자 액션 필요</div></div>
+      <div class="stat accent"><div class="label">이번 달 신고 대상</div><div class="value">${d.report_targets_this_month.length}</div><div class="delta">일용근로내용 확인신고</div></div>
+      <div class="stat"><div class="label">최근 7일 신규</div><div class="value">${d.recent_signups_7d.length}</div><div class="delta">신규 가입자</div></div>
+    </div>
+
+    <div class="lens-section">
+      <h3>📋 본사 검토 대기 (${d.pending_review.length})</h3>
+      ${d.pending_review.length === 0 ? '<div class="empty">처리 대기 없음 ✅</div>' :
+        d.pending_review.map(w => `<div class="todo-card">
+          <div class="head">${w.name} · ${w.phone||'-'} · 가입일 ${w.hired_date||'-'}</div>
+          <ul><li>${w.note || '검토 필요'}</li><li>→ <a href="#/workers" style="color:var(--primary)">직원 페이지에서 일당·법인 보강</a></li></ul>
+        </div>`).join('')}
+    </div>
+
+    <div class="lens-section">
+      <h3>📋 이번 달 일용근로내용확인신고 대상 (${d.report_targets_this_month.length}명)</h3>
+      ${d.report_targets_this_month.length === 0 ? '<div class="empty">대상 없음</div>' :
+        '<table class="table"><thead><tr><th>이름</th><th style="text-align:right">출근일수</th><th>현장</th></tr></thead><tbody>'
+        + d.report_targets_this_month.map(r => `<tr>
+          <td><b>${r.worker_name||'#'+r.worker_id}</b></td>
+          <td style="text-align:right"><b>${r.days}일</b></td>
+          <td style="font-size:11px;color:var(--text-muted)">${(r.sites||'').replace(/null,?/g,'').replace(/,$/,'')||'-'}</td>
+        </tr>`).join('') + '</tbody></table>'}
+    </div>
+
+    ${d.sites_missing_gps.length ? `<div class="lens-section">
+      <h3>📋 GPS 좌표 미설정 현장 (${d.sites_missing_gps.length})</h3>
+      ${d.sites_missing_gps.map(s => `<div class="todo-card">
+        <div class="head">${s.name} · ${s.address||'-'}</div>
+        <ul><li>출퇴근 GPS 검증이 안 됩니다 — 현장 가서 좌표 등록 필요</li></ul>
+      </div>`).join('')}
+    </div>` : ''}
+
+    ${d.workers_no_company.length ? `<div class="lens-section">
+      <h3>📋 법인 미배정 직원 (${d.workers_no_company.length})</h3>
+      ${d.workers_no_company.map(w => `<div class="todo-card">
+        <div class="head">${w.name} · ${w.phone||'-'} · ${w.worker_type==='office'?'사무직':'일용직'}</div>
+        <ul><li>4대보험 가입·세무 처리에 법인 배정이 필요합니다</li></ul>
+      </div>`).join('')}
+    </div>` : ''}
+
+    ${d.workers_no_wage.length ? `<div class="lens-section">
+      <h3>📋 일당 미설정 일용직 (${d.workers_no_wage.length})</h3>
+      ${d.workers_no_wage.map(w => `<div class="todo-card">
+        <div class="head">${w.name} · ${w.phone||'-'}</div>
+        <ul><li>일당이 0원 — 노무비 자동 집계가 안 됩니다</li></ul>
+      </div>`).join('')}
+    </div>` : ''}
+  `;
+}
+
+async function renderLensFinance() {
+  const d = await api.get('/api/views/finance');
+  $('#lens-body').innerHTML = `
+    <div class="stat-grid">
+      <div class="stat accent"><div class="label">계약 (수주)</div><div class="value">${fmtMoney(d.totals.contract)}</div><div class="delta">SiteCreated 합산</div></div>
+      <div class="stat warning"><div class="label">누적 비용 (노무비)</div><div class="value">${fmtMoney(d.totals.expense)}</div><div class="delta">ClockIn × 일당</div></div>
+      <div class="stat success"><div class="label">실수금 (revenue)</div><div class="value">${fmtMoney(d.totals.revenue)}</div><div class="delta">아직 입력 안 됨</div></div>
+    </div>
+
+    <div class="lens-section">
+      <h3>💰 현장별 (${d.by_site.length})</h3>
+      ${d.by_site.length === 0 ? '<div class="empty">데이터 없음</div>' :
+        d.by_site.map(r => `<div class="fin-row">
+          <span class="label">${r.name}</span>
+          <span class="num contract" title="계약">${fmtMoney(r.contract)}</span>
+          <span class="num expense" title="비용">−${fmtMoney(r.expense)}</span>
+          <span class="num" title="잔액"><b>${fmtMoney(r.contract - r.expense)}</b></span>
+          <span class="count">${r.count}건</span>
+        </div>`).join('')}
+    </div>
+
+    <div class="lens-section">
+      <h3>💰 법인별 (${d.by_company.length})</h3>
+      ${d.by_company.length === 0 ? '<div class="empty">데이터 없음</div>' :
+        d.by_company.map(r => `<div class="fin-row">
+          <span class="label">${r.name}</span>
+          <span class="num contract">${fmtMoney(r.contract)}</span>
+          <span class="num expense">−${fmtMoney(r.expense)}</span>
+          <span class="num"><b>${fmtMoney(r.contract - r.expense)}</b></span>
+          <span class="count">${r.count}건</span>
+        </div>`).join('')}
+    </div>
+
+    <div class="lens-section">
+      <h3>💰 계정 과목별</h3>
+      ${d.by_account.length === 0 ? '<div class="empty">데이터 없음</div>' :
+        d.by_account.map(r => {
+          const total = r.contract + r.expense + r.revenue;
+          const cls = r.expense > 0 ? 'expense' : r.contract > 0 ? 'contract' : 'revenue';
+          return `<div class="fin-row">
+            <span class="label">${r.name}</span>
+            <span class="num ${cls}">${fmtMoney(total)}</span>
+            <span class="count">${r.count}건</span>
+            <span></span><span></span>
+          </div>`;
+        }).join('')}
+    </div>
+
+    <div class="lens-section">
+      <h3>💰 월별 추이 (${d.by_month.length})</h3>
+      ${d.by_month.length === 0 ? '<div class="empty">데이터 없음 — 이벤트가 쌓일수록 추이가 만들어집니다</div>' :
+        d.by_month.map(r => `<div class="fin-row">
+          <span class="label">${r.name}</span>
+          <span class="num contract">${fmtMoney(r.contract)}</span>
+          <span class="num expense">−${fmtMoney(r.expense)}</span>
+          <span class="num"><b>${fmtMoney(r.contract - r.expense)}</b></span>
+          <span class="count">${r.count}건</span>
+        </div>`).join('')}
+    </div>
+  `;
+}
+
+// ============================================================
+// 그래프 / 온톨로지 (Phase 2)
+// ============================================================
+const ENTITY_LABELS = { Person:'사람', Place:'현장', Org:'법인', User:'관리자' };
+const PREDICATE_LABELS = {
+  employed_by:'소속',
+  owned_by:'소속',
+  has_role_in:'권한 보유',
+  manages:'담당',
+};
+let graphState = { tab:'Person', selectedType:null, selectedId:null };
+
+route('/graph', async () => {
+  await renderGraph();
+});
+
+async function renderGraph() {
+  const stats = await api.get('/api/graph/stats');
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">엔티티 그래프 (온톨로지)</div>
+        <div class="page-sub">사람·현장·법인을 클릭하면 그것과 연결된 모든 관계 + 최근 이벤트가 한 화면에. (Person ${stats.Person} · Place ${stats.Place} · Org ${stats.Org} · 관계 ${stats.Relations})</div>
+      </div>
+    </div>
+
+    <div class="graph-layout">
+      <div class="graph-side">
+        <div class="graph-tabs">
+          <button data-tab="Person" class="${graphState.tab==='Person'?'active':''}">사람 (${stats.Person})</button>
+          <button data-tab="Place"  class="${graphState.tab==='Place'?'active':''}">현장 (${stats.Place})</button>
+          <button data-tab="Org"    class="${graphState.tab==='Org'?'active':''}">법인 (${stats.Org})</button>
+          <button data-tab="User"   class="${graphState.tab==='User'?'active':''}">관리자 (${stats.User})</button>
+        </div>
+        <div id="ent-list">로딩…</div>
+      </div>
+      <div class="graph-main" id="graph-main">
+        <div class="empty">왼쪽에서 엔티티를 선택하세요.</div>
+      </div>
+    </div>
+  `;
+
+  $$('.graph-tabs button').forEach(b => b.onclick = async () => {
+    graphState.tab = b.dataset.tab;
+    graphState.selectedType = null;
+    graphState.selectedId = null;
+    await renderGraph();
+  });
+
+  await loadEntityList();
+  if (graphState.selectedType && graphState.selectedId) {
+    await loadEntityDetail(graphState.selectedType, graphState.selectedId);
+  }
+}
+
+async function loadEntityList() {
+  const ents = await api.get('/api/graph/entities?entity_type=' + graphState.tab);
+  $('#ent-list').innerHTML = ents.length === 0
+    ? '<div style="font-size:12px; color:var(--text-muted); padding:8px">없음</div>'
+    : ents.map(e => {
+        const isActive = (graphState.selectedType === graphState.tab && graphState.selectedId === e.id);
+        let meta = '';
+        if (graphState.tab === 'Person') meta = e.job_role || (e.worker_type==='office'?'사무직':'일용직');
+        else if (graphState.tab === 'Place') meta = e.status === 'active' ? '진행' : '마감';
+        else if (graphState.tab === 'Org') meta = e.business_no || '';
+        else if (graphState.tab === 'User') meta = e.role;
+        return `<div class="ent-item ${isActive?'active':''}" data-id="${e.id}">
+          <span>${e.name||e.username||'#'+e.id}</span>
+          <span class="meta">${meta}</span>
+        </div>`;
+      }).join('');
+  $$('.ent-item').forEach(el => el.onclick = () => {
+    const id = +el.dataset.id;
+    graphState.selectedType = graphState.tab;
+    graphState.selectedId = id;
+    loadEntityDetail(graphState.tab, id);
+    $$('.ent-item').forEach(x => x.classList.remove('active'));
+    el.classList.add('active');
+  });
+}
+
+async function loadEntityDetail(type, id) {
+  $('#graph-main').innerHTML = '<div class="empty">로딩 중…</div>';
+  let data;
+  try { data = await api.get(`/api/graph/entity/${type}/${id}`); }
+  catch (e) { $('#graph-main').innerHTML = '<div class="empty">불러오기 실패</div>'; return; }
+
+  const e = data.entity;
+  const name = e.name || e.username || '(이름 없음)';
+  const meta = type === 'Person'
+    ? `${e.worker_type==='office'?'사무직':'일용직'}${e.job_role?' · '+e.job_role:''}${e.phone?' · '+e.phone:''}`
+    : type === 'Place'
+    ? `${e.address||''}${e.manager?' · 담당 '+e.manager:''}`
+    : type === 'Org'
+    ? `${e.business_no||''}${e.ceo?' · 대표 '+e.ceo:''}`
+    : `${e.role}${e.username?' · '+e.username:''}`;
+
+  $('#graph-main').innerHTML = `
+    <div class="entity-header">
+      <div>
+        <div class="name">${name}</div>
+        <div class="meta">${meta}</div>
+      </div>
+      <span class="type-badge">${ENTITY_LABELS[type]}</span>
+    </div>
+
+    <div class="rel-section">
+      <h4>나가는 관계 (${data.outgoing_relations.length})</h4>
+      ${data.outgoing_relations.length === 0
+        ? '<div style="font-size:12px; color:var(--text-muted)">없음</div>'
+        : data.outgoing_relations.map(r => `<div class="rel-row">
+            <b>이 ${ENTITY_LABELS[type]||type}</b>
+            <span class="pred">${PREDICATE_LABELS[r.predicate]||r.predicate}</span>
+            <span class="target" data-type="${r.object_type}" data-id="${r.object_id}">${r.object_name}</span>
+            <span class="type-tag">${ENTITY_LABELS[r.object_type]||r.object_type}</span>
+          </div>`).join('')}
+    </div>
+
+    <div class="rel-section">
+      <h4>들어오는 관계 (${data.incoming_relations.length})</h4>
+      ${data.incoming_relations.length === 0
+        ? '<div style="font-size:12px; color:var(--text-muted)">없음</div>'
+        : data.incoming_relations.map(r => `<div class="rel-row">
+            <span class="target" data-type="${r.subject_type}" data-id="${r.subject_id}">${r.subject_name}</span>
+            <span class="pred">${PREDICATE_LABELS[r.predicate]||r.predicate}</span>
+            <b>이 ${ENTITY_LABELS[type]||type}</b>
+            <span class="type-tag">${ENTITY_LABELS[r.subject_type]||r.subject_type}</span>
+          </div>`).join('')}
+    </div>
+
+    <div class="rel-section">
+      <h4>최근 이벤트 (${data.recent_events.length})</h4>
+      <div class="events-mini">
+        ${data.recent_events.length === 0
+          ? '<div style="font-size:12px; color:var(--text-muted)">없음</div>'
+          : data.recent_events.map(eventCardHtml).join('')}
+      </div>
+    </div>
+  `;
+
+  // 관계 끝의 엔티티 클릭하면 그쪽으로 이동
+  $$('.rel-row .target').forEach(t => t.onclick = () => {
+    const ttype = t.dataset.type, tid = +t.dataset.id;
+    // 탭이 다르면 탭 전환부터
+    if (ttype !== graphState.tab) {
+      graphState.tab = ttype;
+      graphState.selectedType = ttype;
+      graphState.selectedId = tid;
+      renderGraph();
+    } else {
+      graphState.selectedType = ttype;
+      graphState.selectedId = tid;
+      loadEntityDetail(ttype, tid);
+    }
+  });
+}
+
+// ============================================================
 // 타임라인 (Phase 1 — 디지털 트윈 코어)
 // ============================================================
 const EVENT_DESC = {
@@ -833,6 +1379,8 @@ const EVENT_DESC = {
   WorkerSelfRegistered:{cat:'t-worker',label:'자가 가입',  fmt: e => `<b>${e.payload.name}</b> (${e.payload.phone}) 폰에서 자가 가입` },
   CompanyCreated:    { cat:'t-other',  label:'법인 등록',  fmt: e => `<b>${e.payload.name}</b> 법인 등록` },
   AdminSignedUp:     { cat:'t-other',  label:'관리자 가입', fmt: e => `<b>${e.payload.name}</b> (${e.payload.username}, ${e.payload.role}) 관리자 가입` },
+  ProcessStarted:    { cat:'t-other',  label:'프로세스 시작', fmt: e => `${(window.__procDefs||{})[e.payload.workflow]?.name || e.payload.workflow} — ${e.payload.subject_type} #${e.payload.subject_id} → "${e.payload.state}"` },
+  ProcessAdvanced:   { cat:'t-other',  label:'프로세스 진행', fmt: e => `${(window.__procDefs||{})[e.payload.workflow]?.name || e.payload.workflow} — ${e.payload.subject_type} #${e.payload.subject_id}: ${e.payload.from} → <b>${e.payload.to}</b>${e.payload.manual?' (수동)':''}` },
 };
 
 let tlState = { type: '', source: '', from: '', to: '' };
@@ -1017,4 +1565,6 @@ route('/users', async () => {
     return;
   }
   navigate();
+  refreshNotifBadge();
+  setInterval(refreshNotifBadge, 60000); // 1분마다 알림 카운트 갱신
 })();

@@ -81,6 +81,56 @@ CREATE TABLE IF NOT EXISTS deployments (
   note TEXT,
   UNIQUE(worker_id, date, kind)
 );
+CREATE TABLE IF NOT EXISTS process_instances (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workflow TEXT NOT NULL,                  -- 'sales'|'hr_onboarding'|'daily_ops'|...
+  subject_type TEXT NOT NULL,              -- 'Place'|'Person'|'Document'
+  subject_id INTEGER NOT NULL,
+  scope_key TEXT,                          -- 일일운영 같은 일자별 인스턴스용 (예: '2026-04-25')
+  current_state TEXT NOT NULL,
+  meta TEXT,                               -- JSON
+  started_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT,
+  completed_at TEXT,
+  UNIQUE(workflow, subject_type, subject_id, scope_key)
+);
+CREATE INDEX IF NOT EXISTS proc_workflow ON process_instances(workflow, current_state);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  unique_key TEXT UNIQUE,                  -- 중복 방지
+  rule_type TEXT,                          -- 'pending_approval'|'no_gps'|'expiring'|...
+  severity TEXT DEFAULT 'info',            -- 'info'|'warning'|'urgent'
+  title TEXT NOT NULL,
+  message TEXT,
+  link TEXT,
+  related_entity_type TEXT,
+  related_entity_id INTEGER,
+  is_read INTEGER DEFAULT 0,
+  resolved INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  read_at TEXT,
+  resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS notif_status ON notifications(resolved, severity, created_at);
+
+CREATE TABLE IF NOT EXISTS relations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  subject_type TEXT NOT NULL,             -- 'Person'|'Place'|'Org'|'Resource'|'Document'
+  subject_id   INTEGER NOT NULL,
+  predicate    TEXT NOT NULL,             -- 'employed_by'|'owns'|'manages'|'has_role_in'|...
+  object_type  TEXT NOT NULL,
+  object_id    INTEGER NOT NULL,
+  metadata     TEXT,                       -- JSON, optional
+  valid_from   TEXT,                       -- 시간적 관계 (옵션)
+  valid_to     TEXT,
+  created_at   TEXT DEFAULT (datetime('now')),
+  UNIQUE(subject_type, subject_id, predicate, object_type, object_id)
+);
+CREATE INDEX IF NOT EXISTS rel_subject ON relations(subject_type, subject_id);
+CREATE INDEX IF NOT EXISTS rel_object  ON relations(object_type, object_id);
+CREATE INDEX IF NOT EXISTS rel_pred    ON relations(predicate);
+
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   type TEXT NOT NULL,                     -- 'ClockIn'|'Deploy'|'WorkerCreated'|...
@@ -157,11 +207,199 @@ def row_to_dict(row):
 def rows(rs):
     return [dict(r) for r in rs]
 
+# ---- 프로세스 정의 (Phase 4) ----
+PROCESS_DEFS = {
+    'sales': {
+        'name': '수주 프로세스', 'subject': 'Place',
+        'states': ['발주정보', '견적준비', '입찰참여', '낙찰', '계약체결', '착공', '진행', '준공'],
+        'terminal': ['준공'],
+    },
+    'hr_onboarding': {
+        'name': '인력 온보딩', 'subject': 'Person',
+        'states': ['가입신청', '신원확인', '계좌등록', '안전교육', '4대보험', '활성'],
+        'terminal': ['활성'],
+    },
+    'daily_ops': {
+        'name': '일일 운영', 'subject': 'Place',
+        'states': ['배치계획', 'TBM', '출역체크', '작업중', '일보작성', '실적확정'],
+        'terminal': ['실적확정'],
+    },
+    'progress_billing': {
+        'name': '기성 청구', 'subject': 'Place',
+        'states': ['실적누적', '기성산정', '청구서작성', '제출', '검수', '승인', '수금'],
+        'terminal': ['수금'],
+    },
+    'safety': {
+        'name': '안전 관리', 'subject': 'Place',
+        'states': ['위험성평가', 'TBM', '작업중', '무사고종료', '사고발생'],
+        'terminal': ['무사고종료'],
+    },
+    'compliance': {
+        'name': '신고 컴플라이언스', 'subject': 'Place',
+        'states': ['실적확정', '월말집계', '신고서생성', '검토', '제출', '접수확인'],
+        'terminal': ['접수확인'],
+    },
+    'close_out': {
+        'name': '정산 준공', 'subject': 'Place',
+        'states': ['준공검사', '최종기성', '잔금청구', '하자보증', '실적등재', '결산반영'],
+        'terminal': ['결산반영'],
+    },
+}
+
+def create_or_advance_process(workflow, subject_type, subject_id, target_state,
+                              scope_key=None, meta=None):
+    """프로세스 인스턴스를 만들거나 다음 상태로 진행. 뒤로 안 가고 같거나 앞 상태일 때만 갱신."""
+    defn = PROCESS_DEFS.get(workflow)
+    if not defn or target_state not in defn['states']:
+        return
+    try:
+        with conn() as c:
+            row = c.execute(
+                "SELECT id, current_state FROM process_instances "
+                "WHERE workflow=? AND subject_type=? AND subject_id=? AND IFNULL(scope_key,'')=IFNULL(?,'')",
+                (workflow, subject_type, subject_id, scope_key)
+            ).fetchone()
+            if row:
+                states = defn['states']
+                try:
+                    cur_idx = states.index(row['current_state'])
+                    tgt_idx = states.index(target_state)
+                    if tgt_idx > cur_idx:
+                        completed = (target_state in defn.get('terminal', []))
+                        c.execute(
+                            "UPDATE process_instances SET current_state=?, meta=?, updated_at=datetime('now'), "
+                            "completed_at=CASE WHEN ?=1 THEN datetime('now') ELSE completed_at END WHERE id=?",
+                            (target_state, json.dumps(meta or {}, ensure_ascii=False),
+                             1 if completed else 0, row['id'])
+                        )
+                        emit_event("ProcessAdvanced", payload={
+                            "workflow": workflow, "subject_type": subject_type,
+                            "subject_id": subject_id, "scope_key": scope_key,
+                            "from": row['current_state'], "to": target_state
+                        }, source='system')
+                except ValueError:
+                    pass
+            else:
+                c.execute(
+                    "INSERT INTO process_instances(workflow,subject_type,subject_id,scope_key,current_state,meta) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (workflow, subject_type, subject_id, scope_key, target_state,
+                     json.dumps(meta or {}, ensure_ascii=False))
+                )
+                emit_event("ProcessStarted", payload={
+                    "workflow": workflow, "subject_type": subject_type,
+                    "subject_id": subject_id, "scope_key": scope_key, "state": target_state
+                }, source='system')
+    except Exception as e:
+        print(f"[create_or_advance_process] {e}")
+
+def _process_react_to_event(event_type, actors, place, payload, financial):
+    """이벤트가 발생하면 자동으로 관련 프로세스 진행/생성."""
+    today_str = date.today().isoformat()
+    actors = actors or {}; place = place or {}; payload = payload or {}
+    try:
+        if event_type == 'WorkerSelfRegistered':
+            wid = actors.get('worker_id')
+            if wid: create_or_advance_process('hr_onboarding', 'Person', wid, '가입신청')
+        elif event_type == 'WorkerCreated':
+            wid = actors.get('worker_id')
+            if wid: create_or_advance_process('hr_onboarding', 'Person', wid, '활성')
+        elif event_type == 'WorkerUpdated':
+            wid = actors.get('worker_id')
+            if wid and payload.get('daily_wage') and payload.get('daily_wage') > 0:
+                create_or_advance_process('hr_onboarding', 'Person', wid, '계좌등록')
+        elif event_type == 'SiteCreated':
+            sid = place.get('site_id')
+            if sid:
+                create_or_advance_process('sales', 'Place', sid, '계약체결')
+                create_or_advance_process('safety', 'Place', sid, '위험성평가')
+        elif event_type == 'Deploy':
+            sid = place.get('site_id'); d = payload.get('date') or today_str
+            if sid: create_or_advance_process('daily_ops', 'Place', sid, '배치계획', scope_key=d)
+        elif event_type == 'ClockIn':
+            sid = place.get('site_id'); d = payload.get('date') or today_str
+            if sid:
+                create_or_advance_process('daily_ops', 'Place', sid, '출역체크', scope_key=d)
+                create_or_advance_process('safety', 'Place', sid, '작업중')
+                create_or_advance_process('sales', 'Place', sid, '진행')  # 첫 출근 = 진행 단계로
+        elif event_type == 'SiteUpdated':
+            sid = place.get('site_id')
+            if sid and payload.get('status') == 'closed':
+                create_or_advance_process('sales', 'Place', sid, '준공')
+                create_or_advance_process('close_out', 'Place', sid, '준공검사')
+    except Exception as e:
+        print(f"[process_react] {e}")
+
+# ---- 온톨로지 / 관계 그래프 (Phase 2) ----
+# 6대 엔티티: Person, Place, Organization, Resource, Document, Money
+# 기존 테이블 매핑: workers↔Person, sites↔Place, companies↔Organization, users↔Person(role)
+# 관계는 명시적으로 relations 테이블에 저장 — FK는 그대로 두고 위에 layered
+
+ENTITY_TABLES = {
+    'Person':  ('workers',   'name'),
+    'Place':   ('sites',     'name'),
+    'Org':     ('companies', 'name'),
+    'User':    ('users',     'name'),   # admin/manager 계정도 Person 그래프에
+}
+
+def add_relation(subject_type, subject_id, predicate, object_type, object_id,
+                 metadata=None, valid_from=None, valid_to=None):
+    if not (subject_type and subject_id and predicate and object_type and object_id):
+        return
+    try:
+        with conn() as c:
+            c.execute(
+                """INSERT OR IGNORE INTO relations
+                   (subject_type,subject_id,predicate,object_type,object_id,metadata,valid_from,valid_to)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (subject_type, subject_id, predicate, object_type, object_id,
+                 json.dumps(metadata or {}, ensure_ascii=False) if metadata else None,
+                 valid_from, valid_to))
+    except Exception as e:
+        print(f"[add_relation] failed: {e}")
+
+def remove_relations(subject_type=None, subject_id=None, predicate=None,
+                     object_type=None, object_id=None):
+    sql = "DELETE FROM relations WHERE 1=1"
+    args = []
+    if subject_type: sql += " AND subject_type=?"; args.append(subject_type)
+    if subject_id:   sql += " AND subject_id=?";   args.append(subject_id)
+    if predicate:    sql += " AND predicate=?";    args.append(predicate)
+    if object_type:  sql += " AND object_type=?";  args.append(object_type)
+    if object_id:    sql += " AND object_id=?";    args.append(object_id)
+    try:
+        with conn() as c:
+            c.execute(sql, args)
+    except Exception as e:
+        print(f"[remove_relations] failed: {e}")
+
+def _backfill_relations():
+    """기존 FK 관계를 relations 테이블에 1회 채워넣음 (이미 있는 행은 skip)."""
+    try:
+        with conn() as c:
+            n = c.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+            if n > 0:
+                return
+            # workers.company_id → Person employed_by Org
+            for r in c.execute("SELECT id, company_id FROM workers WHERE company_id IS NOT NULL").fetchall():
+                add_relation('Person', r['id'], 'employed_by', 'Org', r['company_id'])
+            # sites.company_id → Place owned_by Org
+            for r in c.execute("SELECT id, company_id FROM sites WHERE company_id IS NOT NULL").fetchall():
+                add_relation('Place', r['id'], 'owned_by', 'Org', r['company_id'])
+            # users.company_id → User has_role_in Org
+            for r in c.execute("SELECT id, company_id, role FROM users WHERE company_id IS NOT NULL").fetchall():
+                add_relation('User', r['id'], 'has_role_in', 'Org', r['company_id'],
+                             metadata={'role': r['role']})
+            print("[startup] relations backfill 완료")
+    except Exception as e:
+        print(f"[backfill_relations] {e}")
+
 # ---- 이벤트 코어 (Phase 1: 디지털 트윈의 시작) ----
 def emit_event(event_type, actors=None, place=None, payload=None, financial=None,
                created_by=None, source='api'):
     """모든 도메인 액션은 이걸 호출해서 events 테이블에 기록.
-    실패해도 주 동작에 영향 없도록 best-effort. Append-only history."""
+    실패해도 주 동작에 영향 없도록 best-effort. Append-only history.
+    추가: 이벤트가 자동으로 관련 프로세스를 진행시킴 (Phase 4)."""
     try:
         with conn() as c:
             c.execute(
@@ -177,6 +415,10 @@ def emit_event(event_type, actors=None, place=None, payload=None, financial=None
             )
     except Exception as e:
         print(f"[emit_event] {event_type} failed: {e}")
+    # 프로세스 자동 진행 (Process* 이벤트는 무한루프 방지를 위해 제외)
+    if not event_type.startswith('Process'):
+        try: _process_react_to_event(event_type, actors, place, payload, financial)
+        except Exception as e: print(f"[process_react] {e}")
 
 # ========================================================================
 # Pydantic models (입력)
@@ -325,6 +567,9 @@ def _startup():
     init_db()
     _bootstrap_admin()
     _auto_seed_if_empty()
+    _backfill_relations()
+    _backfill_processes()
+    _evaluate_rules()
 
 # ----- Auth -----
 @app.post("/api/login")
@@ -562,6 +807,8 @@ def create_site(payload: SiteIn, user: dict = Depends(require_login)):
                         "start_date": payload.start_date, "end_date": payload.end_date},
                financial={"amount": payload.contract_amount or 0, "account": "계약금액", "kind": "contract"},
                created_by=user["id"], source="admin_ui")
+    if payload.company_id:
+        add_relation('Place', new_id, 'owned_by', 'Org', payload.company_id)
     return {"id": new_id}
 
 @app.put("/api/sites/{sid}")
@@ -580,6 +827,10 @@ def update_site(sid: int, payload: SiteIn, user: dict = Depends(require_login)):
                payload={"name": payload.name, "status": payload.status,
                         "contract_amount": payload.contract_amount, "paid_amount": payload.paid_amount},
                created_by=user["id"], source="admin_ui")
+    # 관계 동기화 (소속 법인 변경 가능)
+    remove_relations(subject_type='Place', subject_id=sid, predicate='owned_by')
+    if payload.company_id:
+        add_relation('Place', sid, 'owned_by', 'Org', payload.company_id)
     return {"ok": True}
 
 @app.delete("/api/sites/{sid}")
@@ -588,6 +839,8 @@ def delete_site(sid: int, user: dict = Depends(require_login)):
         c.execute("DELETE FROM sites WHERE id=?", (sid,))
     emit_event("SiteDeleted", place={"site_id": sid},
                created_by=user["id"], source="admin_ui")
+    remove_relations(subject_type='Place', subject_id=sid)
+    remove_relations(object_type='Place', object_id=sid)
     return {"ok": True}
 
 # ----- Workers -----
@@ -621,6 +874,8 @@ def create_worker(payload: WorkerIn, user: dict = Depends(require_login)):
                payload={"name": payload.name, "worker_type": payload.worker_type,
                         "job_role": payload.job_role, "daily_wage": payload.daily_wage},
                created_by=user["id"], source="admin_ui")
+    if payload.company_id:
+        add_relation('Person', new_id, 'employed_by', 'Org', payload.company_id)
     return {"id": new_id}
 
 @app.put("/api/workers/{wid}")
@@ -638,6 +893,9 @@ def update_worker(wid: int, payload: WorkerIn, user: dict = Depends(require_logi
                payload={"name": payload.name, "daily_wage": payload.daily_wage,
                         "job_role": payload.job_role},
                created_by=user["id"], source="admin_ui")
+    remove_relations(subject_type='Person', subject_id=wid, predicate='employed_by')
+    if payload.company_id:
+        add_relation('Person', wid, 'employed_by', 'Org', payload.company_id)
     return {"ok": True}
 
 @app.delete("/api/workers/{wid}")
@@ -646,6 +904,8 @@ def delete_worker(wid: int, user: dict = Depends(require_login)):
         c.execute("DELETE FROM workers WHERE id=?", (wid,))
     emit_event("WorkerDeleted", actors={"worker_id": wid},
                created_by=user["id"], source="admin_ui")
+    remove_relations(subject_type='Person', subject_id=wid)
+    remove_relations(object_type='Person', object_id=wid)
     return {"ok": True}
 
 # ----- 직원 자가 가입 (공개 엔드포인트) -----
@@ -880,6 +1140,609 @@ def list_event_types(_: dict = Depends(require_login)):
         return rows(c.execute(
             "SELECT type, COUNT(*) AS cnt FROM events GROUP BY type ORDER BY cnt DESC"
         ).fetchall())
+
+# ----- 그래프 / 온톨로지 (Phase 2) -----
+def _entity_lookup(entity_type, entity_id):
+    """엔티티 타입+id로 실제 데이터 한 줄 가져오기."""
+    if entity_type not in ENTITY_TABLES:
+        return None
+    table, name_col = ENTITY_TABLES[entity_type]
+    with conn() as c:
+        row = c.execute(f"SELECT * FROM {table} WHERE id=?", (entity_id,)).fetchone()
+    return dict(row) if row else None
+
+@app.get("/api/graph/entities")
+def list_entities(entity_type: str, _: dict = Depends(require_login)):
+    """엔티티 타입별 목록 (그래프 뷰 진입점)."""
+    if entity_type not in ENTITY_TABLES:
+        raise HTTPException(400, f"unknown entity type: {entity_type}")
+    table, name_col = ENTITY_TABLES[entity_type]
+    if entity_type == 'Person':
+        sql = "SELECT id, name, worker_type, job_role, phone FROM workers ORDER BY name"
+    elif entity_type == 'Place':
+        sql = "SELECT id, name, address, status FROM sites ORDER BY status, name"
+    elif entity_type == 'Org':
+        sql = "SELECT id, name, business_no, ceo FROM companies ORDER BY name"
+    elif entity_type == 'User':
+        sql = "SELECT id, username AS name, role, company_id FROM users ORDER BY username"
+    else:
+        sql = f"SELECT id, {name_col} AS name FROM {table} ORDER BY {name_col}"
+    with conn() as c:
+        return rows(c.execute(sql).fetchall())
+
+@app.get("/api/graph/entity/{entity_type}/{entity_id}")
+def graph_entity(entity_type: str, entity_id: int, _: dict = Depends(require_login)):
+    """한 엔티티의 전체 그래프 뷰 — 본인 정보 + 모든 관계 + 최근 이벤트."""
+    entity = _entity_lookup(entity_type, entity_id)
+    if not entity:
+        raise HTTPException(404, "entity not found")
+
+    with conn() as c:
+        # 1) 이 엔티티가 subject 인 관계
+        outgoing = rows(c.execute(
+            "SELECT * FROM relations WHERE subject_type=? AND subject_id=?",
+            (entity_type, entity_id)).fetchall())
+        # 2) 이 엔티티가 object 인 관계
+        incoming = rows(c.execute(
+            "SELECT * FROM relations WHERE object_type=? AND object_id=?",
+            (entity_type, entity_id)).fetchall())
+
+        # 관계 끝의 엔티티 이름 채워주기
+        for r in outgoing:
+            target = _entity_lookup(r['object_type'], r['object_id'])
+            r['object_name'] = (target.get('name') or target.get('username') or '?') if target else '(삭제됨)'
+        for r in incoming:
+            source = _entity_lookup(r['subject_type'], r['subject_id'])
+            r['subject_name'] = (source.get('name') or source.get('username') or '?') if source else '(삭제됨)'
+
+        # 3) 이 엔티티 관련 최근 이벤트 (90일)
+        cutoff = (datetime.now().date().toordinal() - 90)
+        # 이벤트는 actors/place JSON 안에 id 가 들어감
+        if entity_type == 'Person':
+            evt_rows = c.execute(
+                "SELECT * FROM events WHERE json_extract(actors,'$.worker_id')=? "
+                "OR json_extract(actors,'$.user_id')=? "
+                "ORDER BY occurred_at DESC LIMIT 100",
+                (entity_id, entity_id)).fetchall()
+        elif entity_type == 'Place':
+            evt_rows = c.execute(
+                "SELECT * FROM events WHERE json_extract(place,'$.site_id')=? "
+                "ORDER BY occurred_at DESC LIMIT 100",
+                (entity_id,)).fetchall()
+        elif entity_type == 'Org':
+            evt_rows = c.execute(
+                "SELECT * FROM events WHERE json_extract(actors,'$.company_id')=? "
+                "ORDER BY occurred_at DESC LIMIT 100",
+                (entity_id,)).fetchall()
+        else:
+            evt_rows = []
+        events_out = []
+        for r in evt_rows:
+            d = dict(r)
+            for k in ("actors", "place", "payload", "financial"):
+                try: d[k] = json.loads(d.get(k) or "{}")
+                except Exception: d[k] = {}
+            events_out.append(d)
+
+    return {
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "entity": entity,
+        "outgoing_relations": outgoing,    # 내가 ~한다
+        "incoming_relations": incoming,    # ~가 나를 한다
+        "recent_events": events_out,
+    }
+
+@app.get("/api/graph/predicates")
+def list_predicates(_: dict = Depends(require_login)):
+    """존재하는 관계 종류 + 카운트."""
+    with conn() as c:
+        return rows(c.execute(
+            "SELECT predicate, subject_type, object_type, COUNT(*) AS cnt "
+            "FROM relations GROUP BY predicate, subject_type, object_type ORDER BY cnt DESC"
+        ).fetchall())
+
+# ----- Reality Views (Phase 3) — 같은 events 를 3개 시점으로 -----
+
+def _parse_event_json(r):
+    d = dict(r)
+    for k in ('actors','place','payload','financial'):
+        try: d[k] = json.loads(d.get(k) or '{}')
+        except Exception: d[k] = {}
+    return d
+
+@app.get("/api/views/field")
+def view_field(site_id: Optional[int] = None, days: int = 1,
+               _: dict = Depends(require_login)):
+    """현장 시점 — 오늘/최근 며칠의 실시간 활동 중심."""
+    today_d = date.today()
+    cutoff = (today_d.replace(day=today_d.day) if days <= 1 else today_d).isoformat()
+    if days > 1:
+        from datetime import timedelta
+        cutoff = (today_d - timedelta(days=days-1)).isoformat()
+
+    with conn() as c:
+        # 활성 현장 + 오늘 인원 카운트
+        site_q = "SELECT id, name, address, latitude, longitude, geofence_meters FROM sites WHERE status='active'"
+        if site_id:
+            site_q += " AND id=?"; sites_arg = (site_id,)
+        else:
+            sites_arg = ()
+        active_sites = rows(c.execute(site_q, sites_arg).fetchall())
+        for s in active_sites:
+            cnt = c.execute(
+                "SELECT COUNT(DISTINCT json_extract(actors,'$.worker_id')) FROM events "
+                "WHERE type='ClockIn' AND occurred_at >= ? AND json_extract(place,'$.site_id')=?",
+                (today_d.isoformat(), s['id'])).fetchone()[0]
+            s['clocked_in_today'] = cnt or 0
+
+        # 최근 24h~며칠 events (출퇴근/배치/안전 등 현장에서 일어난 것)
+        evt_q = ("SELECT * FROM events WHERE type IN ('ClockIn','ClockOut','Deploy','DeploymentRemoved') "
+                 "AND occurred_at >= ?")
+        evt_args = [cutoff]
+        if site_id:
+            evt_q += " AND json_extract(place,'$.site_id')=?"
+            evt_args.append(site_id)
+        evt_q += " ORDER BY occurred_at DESC LIMIT 200"
+        recent = [_parse_event_json(r) for r in c.execute(evt_q, evt_args).fetchall()]
+
+    return {
+        "as_of": today_d.isoformat(),
+        "days": days,
+        "active_sites": active_sites,
+        "recent_events": recent,
+    }
+
+@app.get("/api/views/admin")
+def view_admin(_: dict = Depends(require_login)):
+    """행정 시점 — 신고 대상자, 처리 대기 항목, 컴플라이언스 갭."""
+    today_d = date.today()
+    month_start = today_d.replace(day=1).isoformat()
+    week_ago = (datetime.fromisoformat(today_d.isoformat()) -
+                __import__('datetime').timedelta(days=7)).date().isoformat()
+
+    with conn() as c:
+        # 1) 자가가입 검토 대기
+        pending = rows(c.execute(
+            "SELECT id, name, phone, hired_date, note FROM workers "
+            "WHERE note LIKE '%검토 대기%' OR (daily_wage = 0 AND worker_type='daily') "
+            "ORDER BY hired_date DESC LIMIT 50"
+        ).fetchall())
+
+        # 2) 이번 달 일용근로내용확인신고 대상 (ClockIn 누적)
+        report_targets_raw = rows(c.execute("""
+            SELECT json_extract(actors,'$.worker_id') AS worker_id,
+                   json_extract(actors,'$.worker_name') AS worker_name,
+                   COUNT(*) AS days,
+                   GROUP_CONCAT(DISTINCT json_extract(place,'$.site_name')) AS sites
+            FROM events
+            WHERE type='ClockIn' AND occurred_at >= ?
+            GROUP BY worker_id ORDER BY days DESC
+        """, (month_start,)).fetchall())
+
+        # 3) GPS 좌표 없는 활성 현장
+        sites_no_gps = rows(c.execute(
+            "SELECT id, name, address FROM sites WHERE status='active' "
+            "AND (latitude IS NULL OR longitude IS NULL OR latitude = 0)"
+        ).fetchall())
+
+        # 4) 법인 미배정 워커
+        no_company = rows(c.execute(
+            "SELECT id, name, phone, worker_type, hired_date FROM workers "
+            "WHERE company_id IS NULL ORDER BY hired_date DESC"
+        ).fetchall())
+
+        # 5) 일당 미설정 워커 (일용직만)
+        no_wage = rows(c.execute(
+            "SELECT id, name, phone, hired_date FROM workers "
+            "WHERE worker_type='daily' AND (daily_wage IS NULL OR daily_wage = 0) "
+            "ORDER BY hired_date DESC"
+        ).fetchall())
+
+        # 6) 최근 7일 신규 가입 (자가)
+        recent_signups = rows(c.execute(
+            "SELECT id, name, phone, hired_date FROM workers "
+            "WHERE hired_date >= ? ORDER BY hired_date DESC LIMIT 30",
+            (week_ago,)
+        ).fetchall())
+
+    return {
+        "month_start": month_start,
+        "pending_review": pending,
+        "report_targets_this_month": report_targets_raw,
+        "sites_missing_gps": sites_no_gps,
+        "workers_no_company": no_company,
+        "workers_no_wage": no_wage,
+        "recent_signups_7d": recent_signups,
+    }
+
+@app.get("/api/views/finance")
+def view_finance(
+    site_id: Optional[int] = None,
+    company_id: Optional[int] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    _: dict = Depends(require_login),
+):
+    """재무 시점 — events 의 financial 데이터를 다차원 집계."""
+    sql = ("SELECT * FROM events "
+           "WHERE json_extract(financial,'$.amount') IS NOT NULL "
+           "AND CAST(json_extract(financial,'$.amount') AS INTEGER) > 0")
+    args = []
+    if site_id:
+        sql += " AND json_extract(place,'$.site_id') = ?"; args.append(site_id)
+    if company_id:
+        sql += " AND (json_extract(actors,'$.company_id') = ? "
+        sql += "      OR json_extract(place,'$.site_id') IN (SELECT id FROM sites WHERE company_id=?))"
+        args += [company_id, company_id]
+    if from_date:
+        sql += " AND occurred_at >= ?"; args.append(from_date)
+    if to_date:
+        sql += " AND occurred_at <= ?"; args.append(to_date + "T23:59:59")
+    sql += " ORDER BY occurred_at DESC LIMIT 500"
+
+    with conn() as c:
+        ledger = [_parse_event_json(r) for r in c.execute(sql, args).fetchall()]
+
+        # 사이트/법인 이름 매핑
+        site_names = {r['id']: r['name'] for r in c.execute("SELECT id, name FROM sites").fetchall()}
+        site_company = {r['id']: r['company_id'] for r in c.execute("SELECT id, company_id FROM sites").fetchall()}
+        company_names = {r['id']: r['name'] for r in c.execute("SELECT id, name FROM companies").fetchall()}
+
+    by_site = {}      # site_id -> {expense, contract, revenue}
+    by_company = {}
+    by_account = {}
+    by_month = {}     # YYYY-MM -> {expense, contract, revenue}
+
+    for r in ledger:
+        fin = r.get('financial', {}) or {}
+        amt = int(fin.get('amount') or 0)
+        if amt <= 0: continue
+        kind = fin.get('kind') or 'expense'   # expense | contract | revenue
+        acct = fin.get('account') or '미분류'
+        sid = r.get('place', {}).get('site_id')
+        cid = (r.get('actors', {}).get('company_id')
+               or (site_company.get(sid) if sid else None))
+        month = (r.get('occurred_at') or '')[:7]
+
+        # 이름 채워주기
+        if sid: r['_site_name'] = site_names.get(sid)
+        if cid: r['_company_name'] = company_names.get(cid)
+
+        def _bump(d, key):
+            if key not in d: d[key] = {'expense': 0, 'contract': 0, 'revenue': 0, 'count': 0}
+            d[key][kind] = d[key].get(kind, 0) + amt
+            d[key]['count'] += 1
+
+        if sid: _bump(by_site, sid)
+        if cid: _bump(by_company, cid)
+        _bump(by_account, acct)
+        if month: _bump(by_month, month)
+
+    # dict → list with names for client
+    def _list(d, name_map):
+        return [{'id': k, 'name': name_map.get(k, f'#{k}'), **v} for k, v in d.items()]
+
+    return {
+        "ledger": ledger,
+        "by_site": _list(by_site, site_names),
+        "by_company": _list(by_company, company_names),
+        "by_account": [{'name': k, **v} for k, v in by_account.items()],
+        "by_month": [{'name': k, **v} for k, v in sorted(by_month.items())],
+        "totals": {
+            "expense":  sum(v.get('expense', 0)  for v in by_account.values()),
+            "contract": sum(v.get('contract', 0) for v in by_account.values()),
+            "revenue":  sum(v.get('revenue', 0)  for v in by_account.values()),
+        }
+    }
+
+# ----- Processes (Phase 4) -----
+@app.get("/api/process-definitions")
+def list_process_defs(_: dict = Depends(require_login)):
+    return [{"id": k, **v} for k, v in PROCESS_DEFS.items()]
+
+@app.get("/api/processes")
+def list_processes(workflow: Optional[str] = None,
+                   subject_id: Optional[int] = None,
+                   _: dict = Depends(require_login)):
+    sql = """SELECT p.*,
+             CASE p.subject_type
+               WHEN 'Place'  THEN (SELECT name FROM sites    WHERE id=p.subject_id)
+               WHEN 'Person' THEN (SELECT name FROM workers  WHERE id=p.subject_id)
+               WHEN 'Org'    THEN (SELECT name FROM companies WHERE id=p.subject_id)
+             END AS subject_name
+             FROM process_instances p WHERE 1=1"""
+    args = []
+    if workflow:
+        sql += " AND p.workflow=?"; args.append(workflow)
+    if subject_id is not None:
+        sql += " AND p.subject_id=?"; args.append(subject_id)
+    sql += " ORDER BY p.updated_at DESC, p.started_at DESC LIMIT 500"
+    with conn() as c:
+        return rows(c.execute(sql, args).fetchall())
+
+class ProcessAdvanceIn(BaseModel):
+    target_state: str
+    note: Optional[str] = None
+
+@app.post("/api/processes/{pid}/advance")
+def advance_process(pid: int, payload: ProcessAdvanceIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        row = c.execute("SELECT * FROM process_instances WHERE id=?", (pid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "process not found")
+        defn = PROCESS_DEFS.get(row['workflow'])
+        if not defn or payload.target_state not in defn['states']:
+            raise HTTPException(400, "invalid target state")
+        completed = (payload.target_state in defn.get('terminal', []))
+        c.execute(
+            "UPDATE process_instances SET current_state=?, updated_at=datetime('now'), "
+            "completed_at=CASE WHEN ?=1 THEN datetime('now') ELSE completed_at END WHERE id=?",
+            (payload.target_state, 1 if completed else 0, pid)
+        )
+    emit_event("ProcessAdvanced", payload={
+        "workflow": row['workflow'], "subject_type": row['subject_type'],
+        "subject_id": row['subject_id'], "from": row['current_state'],
+        "to": payload.target_state, "note": payload.note, "manual": True
+    }, created_by=user["id"], source='admin_ui')
+    return {"ok": True}
+
+def _backfill_processes():
+    """기존 sites/workers 에 프로세스 인스턴스가 없으면 만들어줌. 멱등."""
+    try:
+        with conn() as c:
+            n_proc = c.execute("SELECT COUNT(*) FROM process_instances").fetchone()[0]
+            if n_proc > 0:
+                return
+            for s in c.execute("SELECT id, status FROM sites").fetchall():
+                state = '준공' if s['status'] == 'closed' else '진행'
+                c.execute("INSERT OR IGNORE INTO process_instances(workflow,subject_type,subject_id,current_state) "
+                          "VALUES('sales','Place',?,?)", (s['id'], state))
+                c.execute("INSERT OR IGNORE INTO process_instances(workflow,subject_type,subject_id,current_state) "
+                          "VALUES('safety','Place',?,?)", (s['id'], '위험성평가'))
+            for w in c.execute("SELECT id, daily_wage, note FROM workers").fetchall():
+                state = '활성' if (w['daily_wage'] and w['daily_wage'] > 0) else '가입신청'
+                c.execute("INSERT OR IGNORE INTO process_instances(workflow,subject_type,subject_id,current_state) "
+                          "VALUES('hr_onboarding','Person',?,?)", (w['id'], state))
+            print("[startup] processes backfill 완료")
+    except Exception as e:
+        print(f"[backfill_processes] {e}")
+
+# ----- Notifications + Rules Engine (Phase 5) -----
+def _upsert_notification(unique_key, rule_type, severity, title, message=None, link=None,
+                         related_type=None, related_id=None):
+    """이미 있으면 무시. 사용자가 read 하거나 resolved 처리한 것도 그대로 유지."""
+    try:
+        with conn() as c:
+            c.execute(
+                """INSERT OR IGNORE INTO notifications
+                   (unique_key,rule_type,severity,title,message,link,related_entity_type,related_entity_id)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (unique_key, rule_type, severity, title, message, link, related_type, related_id))
+    except Exception as e:
+        print(f"[upsert_notification] {e}")
+
+def _evaluate_rules():
+    """현 상태에서 알림 생성·해소. 멱등 + idempotent."""
+    today_d = date.today()
+    week_ago = (today_d - __import__('datetime').timedelta(days=7)).isoformat()
+    month_ago = (today_d - __import__('datetime').timedelta(days=30)).isoformat()
+
+    try:
+        with conn() as c:
+            # === RULE 1: 자가가입 7일 초과 검토 대기 ===
+            for w in c.execute(
+                "SELECT id, name FROM workers WHERE note LIKE '%검토 대기%' AND hired_date < ?",
+                (week_ago,)).fetchall():
+                _upsert_notification(
+                    f"pending7_{w['id']}", 'pending_approval', 'warning',
+                    f"{w['name']} 님 가입 7일째 검토 대기",
+                    "본사가 일당·법인을 보강하지 않으면 배치할 수 없습니다.",
+                    '#/lens', 'Person', w['id'])
+            # 해결: 검토 완료된 워커는 resolved
+            c.execute("UPDATE notifications SET resolved=1, resolved_at=datetime('now') "
+                      "WHERE rule_type='pending_approval' AND resolved=0 AND related_entity_id IN ("
+                      "  SELECT id FROM workers WHERE note NOT LIKE '%검토 대기%' OR daily_wage > 0)")
+
+            # === RULE 2: 활성 현장 GPS 미설정 ===
+            for s in c.execute(
+                "SELECT id, name FROM sites WHERE status='active' "
+                "AND (latitude IS NULL OR longitude IS NULL OR latitude=0)").fetchall():
+                _upsert_notification(
+                    f"no_gps_{s['id']}", 'no_gps', 'warning',
+                    f"{s['name']} 현장 GPS 좌표 미설정",
+                    "출퇴근 GPS 검증이 동작하지 않습니다.",
+                    '#/sites', 'Place', s['id'])
+            c.execute("UPDATE notifications SET resolved=1, resolved_at=datetime('now') "
+                      "WHERE rule_type='no_gps' AND resolved=0 AND related_entity_id IN ("
+                      "  SELECT id FROM sites WHERE latitude IS NOT NULL AND latitude!=0)")
+
+            # === RULE 3: 일당 미설정 일용직 ===
+            for w in c.execute(
+                "SELECT id, name FROM workers "
+                "WHERE worker_type='daily' AND (daily_wage IS NULL OR daily_wage=0)").fetchall():
+                _upsert_notification(
+                    f"no_wage_{w['id']}", 'no_wage', 'warning',
+                    f"{w['name']} 님 일당 미설정",
+                    "노무비 자동 집계가 작동하지 않습니다.",
+                    '#/workers', 'Person', w['id'])
+            c.execute("UPDATE notifications SET resolved=1, resolved_at=datetime('now') "
+                      "WHERE rule_type='no_wage' AND resolved=0 AND related_entity_id IN ("
+                      "  SELECT id FROM workers WHERE daily_wage > 0)")
+
+            # === RULE 4: 법인 미배정 워커 ===
+            for w in c.execute(
+                "SELECT id, name FROM workers WHERE company_id IS NULL").fetchall():
+                _upsert_notification(
+                    f"no_company_{w['id']}", 'no_company', 'info',
+                    f"{w['name']} 님 소속 법인 미배정",
+                    "4대보험·세무 처리에 법인 배정이 필요합니다.",
+                    '#/workers', 'Person', w['id'])
+            c.execute("UPDATE notifications SET resolved=1, resolved_at=datetime('now') "
+                      "WHERE rule_type='no_company' AND resolved=0 AND related_entity_id IN ("
+                      "  SELECT id FROM workers WHERE company_id IS NOT NULL)")
+
+            # === RULE 5: 30일 미배치 활성 워커 ===
+            for w in c.execute("""
+                SELECT w.id, w.name FROM workers w
+                WHERE w.daily_wage > 0
+                AND NOT EXISTS (SELECT 1 FROM events e
+                    WHERE e.type IN ('ClockIn','Deploy')
+                    AND json_extract(e.actors,'$.worker_id') = w.id
+                    AND e.occurred_at >= ?)""", (month_ago,)).fetchall():
+                _upsert_notification(
+                    f"idle30_{w['id']}", 'idle', 'info',
+                    f"{w['name']} 님 30일간 활동 없음",
+                    "휴면·퇴사 검토가 필요할 수 있습니다.",
+                    '#/workers', 'Person', w['id'])
+
+            # === RULE 6: 기성 청구 미진행 (착공 후 60일+) ===
+            for s in c.execute("""
+                SELECT id, name, start_date FROM sites
+                WHERE status='active' AND start_date IS NOT NULL
+                AND date(start_date) <= date(?, '-60 days')
+                AND id NOT IN (SELECT subject_id FROM process_instances
+                               WHERE workflow='progress_billing' AND subject_type='Place')""",
+                (today_d.isoformat(),)).fetchall():
+                _upsert_notification(
+                    f"billing_overdue_{s['id']}", 'billing_overdue', 'warning',
+                    f"{s['name']} 현장 — 착공 60일 넘었는데 기성 청구 0회",
+                    "기성 청구 사이클을 시작해야 자금 흐름이 정상화됩니다.",
+                    '#/lens', 'Place', s['id'])
+
+            # === RULE 7: 자가가입 신규 (24시간 안) — 알림용 ===
+            yesterday = (today_d - __import__('datetime').timedelta(days=1)).isoformat()
+            for r in c.execute(
+                "SELECT json_extract(actors,'$.worker_id') AS wid, "
+                "json_extract(payload,'$.name') AS name "
+                "FROM events WHERE type='WorkerSelfRegistered' AND occurred_at >= ? "
+                "ORDER BY occurred_at DESC LIMIT 50",
+                (yesterday,)).fetchall():
+                if r['wid'] and r['name']:
+                    _upsert_notification(
+                        f"new_signup_{r['wid']}", 'new_signup', 'info',
+                        f"{r['name']} 님 신규 가입 — 정보 보강 필요",
+                        "일당·법인 등을 보강하면 배치할 수 있습니다.",
+                        '#/workers', 'Person', int(r['wid']))
+    except Exception as e:
+        print(f"[evaluate_rules] {e}")
+
+@app.get("/api/notifications")
+def list_notifications(unread_only: bool = False, _: dict = Depends(require_login)):
+    sql = "SELECT * FROM notifications WHERE resolved=0"
+    if unread_only:
+        sql += " AND is_read=0"
+    sql += " ORDER BY CASE severity WHEN 'urgent' THEN 1 WHEN 'warning' THEN 2 ELSE 3 END, created_at DESC LIMIT 200"
+    with conn() as c:
+        return rows(c.execute(sql).fetchall())
+
+@app.get("/api/notifications/count")
+def count_notifications(_: dict = Depends(require_login)):
+    with conn() as c:
+        unread = c.execute("SELECT COUNT(*) FROM notifications WHERE is_read=0 AND resolved=0").fetchone()[0]
+        urgent = c.execute("SELECT COUNT(*) FROM notifications WHERE severity='urgent' AND resolved=0").fetchone()[0]
+    return {"unread": unread, "urgent": urgent}
+
+@app.post("/api/notifications/{nid}/read")
+def mark_read(nid: int, _: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute("UPDATE notifications SET is_read=1, read_at=datetime('now') WHERE id=?", (nid,))
+    return {"ok": True}
+
+@app.post("/api/notifications/read-all")
+def mark_all_read(_: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute("UPDATE notifications SET is_read=1, read_at=datetime('now') WHERE is_read=0")
+    return {"ok": True}
+
+@app.post("/api/notifications/refresh")
+def refresh_rules(_: dict = Depends(require_login)):
+    """룰 재평가 — 새 알림 생성 + 해결된 것 자동 닫기."""
+    _evaluate_rules()
+    return {"ok": True}
+
+# ----- 일일 요약 (경영진용) -----
+@app.get("/api/morning")
+def morning_summary(_: dict = Depends(require_login)):
+    """아침에 한 번 보면 끝나는 한 페이지."""
+    today_d = date.today()
+    today_str = today_d.isoformat()
+    yesterday = (today_d - __import__('datetime').timedelta(days=1)).isoformat()
+    week_ago = (today_d - __import__('datetime').timedelta(days=7)).isoformat()
+
+    _evaluate_rules()  # 매번 룰 갱신
+
+    with conn() as c:
+        sites_active = c.execute("SELECT COUNT(*) FROM sites WHERE status='active'").fetchone()[0]
+        workers_total = c.execute("SELECT COUNT(*) FROM workers").fetchone()[0]
+        clocked_today = c.execute(
+            "SELECT COUNT(DISTINCT json_extract(actors,'$.worker_id')) "
+            "FROM events WHERE type='ClockIn' AND occurred_at >= ?", (today_str,)
+        ).fetchone()[0]
+        clocked_yesterday = c.execute(
+            "SELECT COUNT(DISTINCT json_extract(actors,'$.worker_id')) "
+            "FROM events WHERE type='ClockIn' AND occurred_at >= ? AND occurred_at < ?",
+            (yesterday, today_str)).fetchone()[0]
+        new_signups_week = c.execute(
+            "SELECT COUNT(*) FROM events WHERE type='WorkerSelfRegistered' AND occurred_at >= ?",
+            (week_ago,)).fetchone()[0]
+
+        # 알림 통계
+        notif_urgent = c.execute(
+            "SELECT COUNT(*) FROM notifications WHERE severity='urgent' AND resolved=0").fetchone()[0]
+        notif_warning = c.execute(
+            "SELECT COUNT(*) FROM notifications WHERE severity='warning' AND resolved=0").fetchone()[0]
+        notif_info = c.execute(
+            "SELECT COUNT(*) FROM notifications WHERE severity='info' AND resolved=0").fetchone()[0]
+
+        # 진행 중 프로세스 통계
+        proc_by_state = rows(c.execute(
+            "SELECT workflow, current_state, COUNT(*) AS cnt FROM process_instances "
+            "WHERE completed_at IS NULL GROUP BY workflow, current_state ORDER BY workflow, current_state"
+        ).fetchall())
+
+        # 오늘의 액션 추천 — top warning notifications
+        top_actions = rows(c.execute(
+            "SELECT id, title, severity, link FROM notifications "
+            "WHERE resolved=0 ORDER BY CASE severity WHEN 'urgent' THEN 1 WHEN 'warning' THEN 2 ELSE 3 END, created_at DESC LIMIT 10"
+        ).fetchall())
+
+        # 재무 한 줄
+        contract_total = c.execute("SELECT IFNULL(SUM(contract_amount),0) FROM sites WHERE status='active'").fetchone()[0]
+        paid_total = c.execute("SELECT IFNULL(SUM(paid_amount),0) FROM sites WHERE status='active'").fetchone()[0]
+
+    return {
+        "as_of": today_str,
+        "kpi": {
+            "active_sites": sites_active,
+            "workers_total": workers_total,
+            "clocked_today": clocked_today,
+            "clocked_yesterday": clocked_yesterday,
+            "new_signups_week": new_signups_week,
+            "contract_total": contract_total,
+            "paid_total": paid_total,
+            "remaining": contract_total - paid_total,
+        },
+        "notifications": {
+            "urgent": notif_urgent, "warning": notif_warning, "info": notif_info,
+        },
+        "processes_by_state": proc_by_state,
+        "top_actions": top_actions,
+    }
+
+@app.get("/api/graph/stats")
+def graph_stats(_: dict = Depends(require_login)):
+    """엔티티 타입별 카운트 + 관계 총수."""
+    with conn() as c:
+        out = {
+            "Person": c.execute("SELECT COUNT(*) FROM workers").fetchone()[0],
+            "Place":  c.execute("SELECT COUNT(*) FROM sites").fetchone()[0],
+            "Org":    c.execute("SELECT COUNT(*) FROM companies").fetchone()[0],
+            "User":   c.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            "Relations": c.execute("SELECT COUNT(*) FROM relations").fetchone()[0],
+            "Events":    c.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+        }
+    return out
 
 # ----- Projects (현장별 일정·인력·비용·손익 종합) -----
 @app.get("/api/projects")
