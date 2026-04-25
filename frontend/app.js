@@ -1386,6 +1386,14 @@ const EVENT_DESC = {
   TenderDiscovered:  { cat:'t-other',  label:'공고 발견',  fmt: e => `<b>${e.payload.title}</b> · ${e.payload.org_name||''} · 예산 ${e.payload.budget?'₩'+e.payload.budget.toLocaleString('ko-KR'):'-'}` },
   TenderReviewed:    { cat:'t-other',  label:'공고 검토',  fmt: e => `<b>${e.payload.title}</b>: ${e.payload.from} → ${e.payload.to}` },
   BidSubmitted:      { cat:'t-money',  label:'입찰 응찰',  fmt: e => `<b>${e.payload.title}</b> 응찰가 ${e.payload.bid_amount?'₩'+e.payload.bid_amount.toLocaleString('ko-KR'):'-'}` },
+  VehicleCreated:    { cat:'t-other',  label:'차량 등록',  fmt: e => `<b>${e.payload.name}</b> (${e.payload.plate_no||'-'}, ${e.payload.vehicle_type||'-'}) 등록` },
+  VehicleUpdated:    { cat:'t-other',  label:'차량 수정',  fmt: e => `<b>${e.payload.name}</b> 정보 수정` },
+  VehicleDeleted:    { cat:'t-other',  label:'차량 삭제',  fmt: e => `차량 #${e.actors.vehicle_id} 삭제` },
+  VehicleAssigned:   { cat:'t-deploy', label:'차량 배정',  fmt: e => `<b>${e.payload.vehicle_name||''}</b> (${e.payload.plate_no||'-'}) → ${e.actors.driver_name||'기사미정'}, ${e.place.site_name||'현장미정'}` },
+  VehicleReturned:   { cat:'t-deploy', label:'차량 반환',  fmt: e => `차량 #${e.actors.vehicle_id} 반환` },
+  LicenseAdded:      { cat:'t-other',  label:'면허 등록',  fmt: e => `<b>${e.payload.license_type}</b> ${e.payload.license_no||''} (만료 ${e.payload.expires_at?.slice(0,10)||'-'})` },
+  LicenseUpdated:    { cat:'t-other',  label:'면허 수정',  fmt: e => `<b>${e.payload.license_type}</b> 정보 수정` },
+  LicenseDeleted:    { cat:'t-other',  label:'면허 삭제',  fmt: e => `면허 #${e.payload.license_id} 삭제` },
   AdminSignedUp:     { cat:'t-other',  label:'관리자 가입', fmt: e => `<b>${e.payload.name}</b> (${e.payload.username}, ${e.payload.role}) 관리자 가입` },
   ProcessStarted:    { cat:'t-other',  label:'프로세스 시작', fmt: e => `${(window.__procDefs||{})[e.payload.workflow]?.name || e.payload.workflow} — ${e.payload.subject_type} #${e.payload.subject_id} → "${e.payload.state}"` },
   ProcessAdvanced:   { cat:'t-other',  label:'프로세스 진행', fmt: e => `${(window.__procDefs||{})[e.payload.workflow]?.name || e.payload.workflow} — ${e.payload.subject_type} #${e.payload.subject_id}: ${e.payload.from} → <b>${e.payload.to}</b>${e.payload.manual?' (수동)':''}` },
@@ -1545,6 +1553,316 @@ route('/users', async () => {
     navigate();
   });
 });
+
+// ============================================================
+// 차량 / 자원 관리
+// ============================================================
+const VEH_STATUS_LABEL = { available:'사용 가능', in_use:'운행 중', maintenance:'정비', retired:'매각' };
+
+route('/vehicles', async () => {
+  const [vehicles, workers, sites, companies] = await Promise.all([
+    api.get('/api/vehicles'),
+    api.get('/api/workers'),
+    api.get('/api/sites?active_only=true'),
+    api.get('/api/companies'),
+  ]);
+  const inUse = vehicles.filter(v => v.status === 'in_use').length;
+  const avail = vehicles.filter(v => v.status === 'available').length;
+  const maint = vehicles.filter(v => v.status === 'maintenance').length;
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">🚚 차량·자원 관리</div>
+        <div class="page-sub">${vehicles.length}대 보유 — 누가 어느 차량으로 어느 현장에 갔는지</div>
+      </div>
+      <button class="btn btn-primary" id="add-veh">+ 차량 등록</button>
+    </div>
+
+    <div class="stat-grid">
+      <div class="stat accent"><div class="label">총 보유</div><div class="value">${vehicles.length}</div></div>
+      <div class="stat warning"><div class="label">운행 중</div><div class="value">${inUse}</div><div class="delta">현장 파견</div></div>
+      <div class="stat success"><div class="label">사용 가능</div><div class="value">${avail}</div><div class="delta">대기 중</div></div>
+      <div class="stat"><div class="label">정비</div><div class="value">${maint}</div></div>
+    </div>
+
+    <div class="card">
+      <table class="table">
+        <thead><tr>
+          <th>차량</th><th>차량번호</th><th>종류</th><th>용량</th><th>소속 법인</th>
+          <th>상태</th><th>현재 운전자 / 현장</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${vehicles.length === 0 ? '<tr><td colspan="8" style="text-align:center;color:var(--text-muted)">등록된 차량 없음</td></tr>' :
+            vehicles.map(v => {
+              const a = v.active_assignment;
+              const activeInfo = a
+                ? `<div class="veh-active-info"><b>${a.driver_name||'기사미정'}</b> → ${a.site_name||'현장미정'}<br><span style="font-size:10.5px">${(a.assigned_at||'').slice(0,16).replace('T',' ')}</span></div>`
+                : '<div class="veh-active-info" style="opacity:0.5">미배정</div>';
+              return `<tr>
+                <td><b>${v.name}</b></td>
+                <td style="font-family:ui-monospace,monospace">${v.plate_no||'-'}</td>
+                <td>${v.vehicle_type||'-'}</td>
+                <td>${v.capacity||'-'}</td>
+                <td style="font-size:11.5px">${v.company_name||'-'}</td>
+                <td><span class="veh-status ${v.status}">${VEH_STATUS_LABEL[v.status]||v.status}</span></td>
+                <td>${activeInfo}</td>
+                <td>
+                  ${v.status === 'in_use'
+                    ? `<button class="btn btn-sm" data-return="${v.id}">반환</button>`
+                    : `<button class="btn btn-sm btn-primary" data-assign="${v.id}">배정</button>`}
+                  <button class="btn btn-sm" data-edit="${v.id}">수정</button>
+                  <button class="btn btn-sm btn-danger" data-del="${v.id}">삭제</button>
+                </td>
+              </tr>`;
+            }).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="diff-banner" style="margin-top:8px">
+      💡 <b>배정</b>: 차량 → 운전자(기사) + 현장. 동일 차량에 새로 배정하면 기존 배정은 자동 반환됩니다.
+      &nbsp; <b>반환</b>: 차량을 사용 가능 상태로 돌립니다.
+      &nbsp; 모든 배정·반환은 events에 기록 → 타임라인·재무 시점·관계 그래프에 자동 반영.
+    </div>
+  `;
+
+  $('#add-veh').onclick = () => vehicleModal(null, companies);
+  $$('[data-edit]').forEach(b => b.onclick = () => {
+    const v = vehicles.find(x => x.id == b.dataset.edit);
+    vehicleModal(v, companies);
+  });
+  $$('[data-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('차량을 삭제하시겠습니까?')) return;
+    await api.del('/api/vehicles/'+b.dataset.del);
+    navigate();
+  });
+  $$('[data-return]').forEach(b => b.onclick = async () => {
+    if (!confirm('차량을 반환하시겠습니까?')) return;
+    await fetch('/api/vehicles/'+b.dataset.return+'/return', { method:'POST' });
+    navigate();
+  });
+  $$('[data-assign]').forEach(b => b.onclick = () => {
+    assignVehicleModal(+b.dataset.assign, workers, sites);
+  });
+});
+
+function vehicleModal(v, companies) {
+  const isNew = !v;
+  modal(isNew ? '차량 등록' : '차량 수정', `
+    <div class="form-grid">
+      <div class="form-row"><label>차량명 *</label><input id="f-name" value="${v?.name || ''}" placeholder="예: 5톤 트럭 1호"></div>
+      <div class="form-row"><label>차량번호</label><input id="f-plate" value="${v?.plate_no || ''}" placeholder="12가1234"></div>
+      <div class="form-row"><label>종류</label>
+        <select id="f-type">
+          ${['덤프트럭','카고트럭','포클레인','지게차','승합','승용','크레인','기타'].map(t =>
+            `<option value="${t}" ${v?.vehicle_type===t?'selected':''}>${t}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>용량/규격</label><input id="f-cap" value="${v?.capacity || ''}" placeholder="5톤, 0.7㎥ 등"></div>
+      <div class="form-row"><label>소속 법인</label>
+        <select id="f-company">
+          <option value="">선택</option>
+          ${companies.map(c => `<option value="${c.id}" ${v?.company_id==c.id?'selected':''}>${c.name}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>상태</label>
+        <select id="f-status">
+          ${Object.entries(VEH_STATUS_LABEL).map(([k,lbl]) =>
+            `<option value="${k}" ${v?.status===k?'selected':''}>${lbl}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>구입일</label><input id="f-purchased" type="date" value="${v?.purchased_at || ''}"></div>
+    </div>
+    <div class="form-row"><label>비고</label><textarea id="f-note" rows="2">${v?.note || ''}</textarea></div>
+  `, async () => {
+    const payload = {
+      name: $('#f-name').value.trim(),
+      plate_no: $('#f-plate').value.trim(),
+      vehicle_type: $('#f-type').value,
+      capacity: $('#f-cap').value.trim(),
+      company_id: $('#f-company').value ? +$('#f-company').value : null,
+      status: $('#f-status').value,
+      purchased_at: $('#f-purchased').value,
+      note: $('#f-note').value,
+    };
+    if (!payload.name) { alert('차량명을 입력하세요'); return false; }
+    if (isNew) await api.post('/api/vehicles', payload);
+    else      await api.put('/api/vehicles/'+v.id, payload);
+    navigate();
+  });
+}
+
+function assignVehicleModal(vid, workers, sites) {
+  modal('차량 배정', `
+    <div class="form-row"><label>운전자(기사) 선택 *</label>
+      <select id="f-driver">
+        <option value="">— 미선택 —</option>
+        ${workers.map(w => `<option value="${w.id}">${w.name} · ${w.job_role || (w.worker_type==='office'?'사무직':'일용직')}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-row"><label>파견 현장 *</label>
+      <select id="f-site">
+        <option value="">— 미선택 —</option>
+        ${sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-row"><label>비고</label><textarea id="f-note" rows="2" placeholder="기간·용도 등"></textarea></div>
+  `, async () => {
+    const payload = {
+      vehicle_id: vid,
+      driver_id: $('#f-driver').value ? +$('#f-driver').value : null,
+      site_id:   $('#f-site').value ? +$('#f-site').value : null,
+      note: $('#f-note').value,
+    };
+    if (!payload.driver_id && !payload.site_id) {
+      alert('운전자 또는 현장 중 하나는 선택해주세요'); return false;
+    }
+    await fetch('/api/vehicles/'+vid+'/assign', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    navigate();
+  });
+}
+
+// ============================================================
+// 면허 관리
+// ============================================================
+route('/licenses', async () => {
+  const [licenses, companies] = await Promise.all([
+    api.get('/api/licenses'),
+    api.get('/api/companies'),
+  ]);
+  const today = new Date();
+  const daysToExpire = (iso) => {
+    if (!iso) return null;
+    return Math.ceil((new Date(iso) - today) / 86400000);
+  };
+  const expiringSoon = licenses.filter(l => {
+    const d = daysToExpire(l.expires_at);
+    return d !== null && d >= 0 && d <= 90;
+  });
+  const expired = licenses.filter(l => {
+    const d = daysToExpire(l.expires_at);
+    return d !== null && d < 0;
+  });
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">📜 면허 관리</div>
+        <div class="page-sub">전문건설업 면허 — 등록번호·시평액·갱신 만료 추적</div>
+      </div>
+      <button class="btn btn-primary" id="add-lic">+ 면허 등록</button>
+    </div>
+
+    <div class="stat-grid">
+      <div class="stat accent"><div class="label">총 면허</div><div class="value">${licenses.length}</div></div>
+      <div class="stat warning"><div class="label">만료 임박 (90일)</div><div class="value">${expiringSoon.length}</div><div class="delta">갱신 필요</div></div>
+      <div class="stat ${expired.length>0?'warning':''}"><div class="label">만료됨</div><div class="value">${expired.length}</div></div>
+      <div class="stat success"><div class="label">활성 법인</div><div class="value">${new Set(licenses.map(l=>l.company_id)).size}</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>면허 일람 (만료 임박순)</h3></div>
+      <div class="lic-row" style="font-weight:700; background:#fafbfc; color:var(--text-muted); font-size:11px; text-transform:uppercase; letter-spacing:0.4px;">
+        <div>업종 / 등록번호</div><div>법인</div><div>유효 기간</div><div style="text-align:right">시평액</div><div>잔여</div><div></div>
+      </div>
+      ${licenses.length === 0 ? '<div style="padding:30px; text-align:center; color:var(--text-muted)">등록된 면허 없음</div>' :
+        licenses.map(l => {
+          const days = daysToExpire(l.expires_at);
+          let cls = '', dCls = 'ok', dLbl = '-';
+          if (days === null) dLbl = '-';
+          else if (days < 0) { cls = 'expired'; dCls = 'urgent'; dLbl = `만료 ${-days}일`; }
+          else if (days <= 30) { cls = 'expiring-30'; dCls = 'urgent'; dLbl = `D-${days}`; }
+          else if (days <= 60) { cls = 'expiring-60'; dCls = 'warn'; dLbl = `D-${days}`; }
+          else if (days <= 90) { cls = 'expiring-90'; dCls = 'warn'; dLbl = `D-${days}`; }
+          else dLbl = `D-${days}`;
+          return `<div class="lic-row ${cls}">
+            <div>
+              <div class="lic-type">${l.license_type}</div>
+              <div style="font-size:11px; color:var(--text-muted); font-family:ui-monospace,monospace">${l.license_no||'-'}</div>
+            </div>
+            <div>${l.company_name||'-'}</div>
+            <div style="font-size:11.5px">${(l.issued_at||'-').slice(0,10)} ~ <b>${(l.expires_at||'-').slice(0,10)}</b></div>
+            <div style="text-align:right">${l.capacity_amount?fmtMoney(l.capacity_amount):'-'}</div>
+            <div><span class="days-left ${dCls}">${dLbl}</span></div>
+            <div>
+              <button class="btn btn-sm" data-lic-edit="${l.id}">수정</button>
+              <button class="btn btn-sm btn-danger" data-lic-del="${l.id}">삭제</button>
+            </div>
+          </div>`;
+        }).join('')}
+    </div>
+
+    <div class="diff-banner" style="margin-top:8px">
+      💡 만료 60일 내가 되면 자동으로 알림(/inbox)에 ⚠️ 경고가 뜨고, 30일 내는 🚨 긴급으로 올라갑니다.
+      &nbsp; 갱신 후 만료일 수정하면 알림 자동 해소.
+    </div>
+  `;
+
+  $('#add-lic').onclick = () => licenseModal(null, companies);
+  $$('[data-lic-edit]').forEach(b => b.onclick = () => {
+    const l = licenses.find(x => x.id == b.dataset.licEdit);
+    licenseModal(l, companies);
+  });
+  $$('[data-lic-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('면허를 삭제하시겠습니까?')) return;
+    await api.del('/api/licenses/'+b.dataset.licDel);
+    navigate();
+  });
+});
+
+function licenseModal(l, companies) {
+  const isNew = !l;
+  const types = ['토목공사업','건축공사업','조경공사업','산업환경설비공사업','철근콘크리트공사업',
+                 '토공사업','지정공사업','금속구조물·창호공사업','기계설비공사업','상·하수도설비공사업',
+                 '가스시설공사업','난방시공업','시설물유지관리업','전기공사업','정보통신공사업','소방시설공사업','기타'];
+  modal(isNew ? '면허 등록' : '면허 수정', `
+    <div class="form-grid">
+      <div class="form-row"><label>법인 *</label>
+        <select id="f-company">
+          <option value="">선택</option>
+          ${companies.map(c => `<option value="${c.id}" ${l?.company_id==c.id?'selected':''}>${c.name}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>업종 *</label>
+        <select id="f-type">
+          ${types.map(t => `<option value="${t}" ${l?.license_type===t?'selected':''}>${t}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>등록번호</label><input id="f-no" value="${l?.license_no || ''}" placeholder="예: 서울-12345"></div>
+      <div class="form-row"><label>시평액 (원)</label><input id="f-cap" type="number" value="${l?.capacity_amount || 0}"></div>
+      <div class="form-row"><label>발급일</label><input id="f-issued" type="date" value="${l?.issued_at?.slice(0,10) || ''}"></div>
+      <div class="form-row"><label>만료일 *</label><input id="f-expires" type="date" value="${l?.expires_at?.slice(0,10) || ''}"></div>
+      <div class="form-row"><label>상태</label>
+        <select id="f-status">
+          <option value="active" ${l?.status==='active'?'selected':''}>활성</option>
+          <option value="suspended" ${l?.status==='suspended'?'selected':''}>정지</option>
+          <option value="expired" ${l?.status==='expired'?'selected':''}>만료</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row"><label>비고</label><textarea id="f-note" rows="2">${l?.note || ''}</textarea></div>
+  `, async () => {
+    const payload = {
+      company_id: +$('#f-company').value,
+      license_type: $('#f-type').value,
+      license_no: $('#f-no').value.trim(),
+      capacity_amount: +$('#f-cap').value || 0,
+      issued_at: $('#f-issued').value,
+      expires_at: $('#f-expires').value,
+      status: $('#f-status').value,
+      note: $('#f-note').value,
+    };
+    if (!payload.company_id) { alert('법인을 선택해주세요'); return false; }
+    if (!payload.license_type) { alert('업종을 선택해주세요'); return false; }
+    if (isNew) await api.post('/api/licenses', payload);
+    else      await api.put('/api/licenses/'+l.id, payload);
+    navigate();
+  });
+}
 
 // ============================================================
 // 주간 배치 보드 (다일자 미리 계획)

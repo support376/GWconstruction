@@ -144,6 +144,48 @@ CREATE TABLE IF NOT EXISTS competitor_bids (
 );
 CREATE INDEX IF NOT EXISTS comp_bid_detect ON competitor_bids(detected_at);
 
+-- 차량 (Vehicle) 마스터 + 배정
+CREATE TABLE IF NOT EXISTS vehicles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,                     -- 예: 5톤 트럭 1호
+  plate_no TEXT,                          -- 차량번호 12가1234
+  vehicle_type TEXT,                      -- 덤프트럭|포클레인|지게차|승합|기타
+  capacity TEXT,                          -- 5톤, 25톤, 0.7㎥ 등
+  company_id INTEGER REFERENCES companies(id),
+  status TEXT DEFAULT 'available',        -- 'available'|'in_use'|'maintenance'|'retired'
+  purchased_at TEXT,
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS vehicle_assignments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  driver_id  INTEGER REFERENCES workers(id),
+  site_id    INTEGER REFERENCES sites(id),
+  assigned_at TEXT DEFAULT (datetime('now')),
+  returned_at TEXT,                       -- NULL = 현재 진행 중
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS va_vehicle_active ON vehicle_assignments(vehicle_id, returned_at);
+CREATE INDEX IF NOT EXISTS va_driver_active  ON vehicle_assignments(driver_id, returned_at);
+CREATE INDEX IF NOT EXISTS va_site_active    ON vehicle_assignments(site_id, returned_at);
+
+-- 면허 (정식) — 회사별 면허 마스터
+CREATE TABLE IF NOT EXISTS licenses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  license_type TEXT NOT NULL,             -- 토목공사업, 건축공사업, 기계설비공사업 등
+  license_no TEXT,                        -- 등록번호
+  issued_at TEXT,
+  expires_at TEXT,                        -- 갱신 만료일
+  capacity_amount INTEGER DEFAULT 0,      -- 시평액 (원)
+  status TEXT DEFAULT 'active',           -- 'active'|'expired'|'suspended'
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS lic_company ON licenses(company_id);
+CREATE INDEX IF NOT EXISTS lic_expiry  ON licenses(expires_at);
+
 CREATE TABLE IF NOT EXISTS process_instances (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   workflow TEXT NOT NULL,                  -- 'sales'|'hr_onboarding'|'daily_ops'|...
@@ -247,9 +289,18 @@ def conn():
     finally:
         c.close()
 
+SCHEMA_MIGRATIONS = [
+    # 기존 테이블에 컬럼 추가 (있으면 IGNORE)
+    "ALTER TABLE sites ADD COLUMN site_category TEXT",
+    "ALTER TABLE sites ADD COLUMN required_license TEXT",
+]
+
 def init_db():
     with conn() as c:
         c.executescript(SCHEMA)
+        for stmt in SCHEMA_MIGRATIONS:
+            try: c.execute(stmt)
+            except sqlite3.OperationalError: pass  # column exists
 
 # ========================================================================
 # Helpers
@@ -625,6 +676,56 @@ def _auto_seed_if_empty():
     except Exception as e:
         print(f"[startup] auto-seed skipped: {e}")
 
+def _seed_mock_vehicles_licenses():
+    """차량·면허 시연용 데이터."""
+    try:
+        with conn() as c:
+            # Vehicles (회사별 몇 대씩)
+            if c.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0] == 0:
+                comps = [r[0] for r in c.execute("SELECT id FROM companies LIMIT 3").fetchall()]
+                samples = [
+                    ("5톤 트럭 1호", "12가1234", "덤프트럭", "5톤"),
+                    ("11톤 카고", "34나5678", "카고트럭", "11톤"),
+                    ("0.7㎥ 굴삭기", "강원01-1234", "포클레인", "0.7㎥"),
+                    ("2.5톤 지게차 A", "광주02-5678", "지게차", "2.5톤"),
+                    ("승합차 (사무)", "56다9012", "승합", "12인승"),
+                    ("미니 굴삭기", "경기03-7777", "포클레인", "0.3㎥"),
+                ]
+                for i, (n, p, t, cap) in enumerate(samples):
+                    cid = comps[i % len(comps)] if comps else None
+                    c.execute("""INSERT INTO vehicles(name,plate_no,vehicle_type,capacity,company_id,status)
+                                 VALUES(?,?,?,?,?,?)""",
+                              (n, p, t, cap, cid, 'available'))
+                    if cid:
+                        add_relation('Resource', c.execute("SELECT last_insert_rowid()").fetchone()[0],
+                                     'owned_by', 'Org', cid)
+                print("[startup] vehicles seed 완료")
+
+            # Licenses (각 회사에 면허 2~3개)
+            if c.execute("SELECT COUNT(*) FROM licenses").fetchone()[0] == 0:
+                comp_rows = c.execute("SELECT id, license_info FROM companies").fetchall()
+                from datetime import timedelta
+                today_d_ = date.today()
+                license_samples = [
+                    [("토목공사업", "서울-12345", today_d_ - timedelta(days=400), today_d_ + timedelta(days=200), 5_000_000_000),
+                     ("건축공사업", "서울-12346", today_d_ - timedelta(days=400), today_d_ + timedelta(days=60),  3_000_000_000)],
+                    [("철근콘크리트공사업", "서울-22345", today_d_ - timedelta(days=500), today_d_ + timedelta(days=15), 2_000_000_000),
+                     ("토공사업", "서울-22346", today_d_ - timedelta(days=300), today_d_ + timedelta(days=350), 1_500_000_000)],
+                    [("기계설비공사업", "서울-32345", today_d_ - timedelta(days=200), today_d_ + timedelta(days=400), 2_500_000_000),
+                     ("가스시설공사업", "서울-32346", today_d_ - timedelta(days=600), today_d_ + timedelta(days=20),  800_000_000)],
+                ]
+                for i, comp in enumerate(comp_rows):
+                    if i >= len(license_samples): break
+                    for lt, ln, issued, expires, cap in license_samples[i]:
+                        c.execute(
+                            """INSERT INTO licenses(company_id,license_type,license_no,issued_at,expires_at,capacity_amount)
+                               VALUES(?,?,?,?,?,?)""",
+                            (comp[0], lt, ln, issued.isoformat(), expires.isoformat(), cap)
+                        )
+                print("[startup] licenses seed 완료")
+    except Exception as e:
+        print(f"[mock_vehicles_licenses] {e}")
+
 def _seed_mock_competitor_bids():
     """경쟁사 + 일부 입찰 기록 시연 데이터."""
     try:
@@ -668,6 +769,7 @@ def _startup():
                 _seed_mock_tenders()
                 _seed_mock_competitor_bids()
     except Exception as e: print(f"[startup mock tenders] {e}")
+    _seed_mock_vehicles_licenses()
     _evaluate_rules()
 
 # ----- Auth -----
@@ -1676,6 +1778,32 @@ class CompetitorIn(BaseModel):
     business_no: Optional[str] = None
     note: Optional[str] = None
 
+class VehicleIn(BaseModel):
+    name: str
+    plate_no: Optional[str] = None
+    vehicle_type: Optional[str] = None
+    capacity: Optional[str] = None
+    company_id: Optional[int] = None
+    status: Optional[str] = "available"
+    purchased_at: Optional[str] = None
+    note: Optional[str] = None
+
+class VehicleAssignIn(BaseModel):
+    vehicle_id: int
+    driver_id: Optional[int] = None
+    site_id: Optional[int] = None
+    note: Optional[str] = None
+
+class LicenseIn(BaseModel):
+    company_id: int
+    license_type: str
+    license_no: Optional[str] = None
+    issued_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    capacity_amount: Optional[int] = 0
+    status: Optional[str] = "active"
+    note: Optional[str] = None
+
 @app.get("/api/procurement/tenders")
 def list_tenders(
     review_status: Optional[str] = None,
@@ -1958,6 +2086,202 @@ def _count_tenders():
     with conn() as c:
         return c.execute("SELECT COUNT(*) FROM tenders").fetchone()[0]
 
+# ----- 차량 (Vehicles) -----
+@app.get("/api/vehicles")
+def list_vehicles(_: dict = Depends(require_login)):
+    with conn() as c:
+        vehicles = rows(c.execute("""
+            SELECT v.*, c.name AS company_name FROM vehicles v
+            LEFT JOIN companies c ON v.company_id=c.id
+            ORDER BY v.status, v.name
+        """).fetchall())
+        # 활성 배정 정보 붙이기
+        for v in vehicles:
+            a = c.execute("""
+                SELECT va.*, w.name AS driver_name, w.phone AS driver_phone,
+                       s.name AS site_name
+                FROM vehicle_assignments va
+                LEFT JOIN workers w ON va.driver_id=w.id
+                LEFT JOIN sites s ON va.site_id=s.id
+                WHERE va.vehicle_id=? AND va.returned_at IS NULL
+                ORDER BY va.assigned_at DESC LIMIT 1
+            """, (v['id'],)).fetchone()
+            v['active_assignment'] = dict(a) if a else None
+    return vehicles
+
+@app.post("/api/vehicles")
+def create_vehicle(payload: VehicleIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO vehicles(name,plate_no,vehicle_type,capacity,company_id,
+                                    status,purchased_at,note)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (payload.name, payload.plate_no, payload.vehicle_type, payload.capacity,
+             payload.company_id, payload.status or "available",
+             payload.purchased_at, payload.note)
+        )
+        vid = cur.lastrowid
+    emit_event("VehicleCreated",
+               actors={"vehicle_id": vid, "company_id": payload.company_id},
+               payload={"name": payload.name, "plate_no": payload.plate_no,
+                        "vehicle_type": payload.vehicle_type},
+               created_by=user["id"], source="admin_ui")
+    if payload.company_id:
+        add_relation('Resource', vid, 'owned_by', 'Org', payload.company_id)
+    return {"id": vid}
+
+@app.put("/api/vehicles/{vid}")
+def update_vehicle(vid: int, payload: VehicleIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute(
+            """UPDATE vehicles SET name=?,plate_no=?,vehicle_type=?,capacity=?,company_id=?,
+                                   status=?,purchased_at=?,note=? WHERE id=?""",
+            (payload.name, payload.plate_no, payload.vehicle_type, payload.capacity,
+             payload.company_id, payload.status or "available",
+             payload.purchased_at, payload.note, vid)
+        )
+    emit_event("VehicleUpdated", actors={"vehicle_id": vid},
+               payload={"name": payload.name, "status": payload.status},
+               created_by=user["id"], source="admin_ui")
+    return {"ok": True}
+
+@app.delete("/api/vehicles/{vid}")
+def delete_vehicle(vid: int, user: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute("DELETE FROM vehicles WHERE id=?", (vid,))
+    emit_event("VehicleDeleted", actors={"vehicle_id": vid},
+               created_by=user["id"], source="admin_ui")
+    remove_relations(subject_type='Resource', subject_id=vid)
+    return {"ok": True}
+
+@app.post("/api/vehicles/{vid}/assign")
+def assign_vehicle(vid: int, payload: VehicleAssignIn, user: dict = Depends(require_login)):
+    """차량을 기사·현장에 배정. 기존 활성 배정이 있으면 자동 반환 처리."""
+    with conn() as c:
+        v = c.execute("SELECT * FROM vehicles WHERE id=?", (vid,)).fetchone()
+        if not v: raise HTTPException(404, "vehicle not found")
+        # 기존 활성 배정 자동 반환
+        c.execute("UPDATE vehicle_assignments SET returned_at=datetime('now') "
+                  "WHERE vehicle_id=? AND returned_at IS NULL", (vid,))
+        cur = c.execute(
+            """INSERT INTO vehicle_assignments(vehicle_id,driver_id,site_id,note)
+               VALUES(?,?,?,?)""",
+            (vid, payload.driver_id, payload.site_id, payload.note)
+        )
+        c.execute("UPDATE vehicles SET status='in_use' WHERE id=?", (vid,))
+        # 이름 가져오기
+        driver_name = None
+        if payload.driver_id:
+            r = c.execute("SELECT name FROM workers WHERE id=?", (payload.driver_id,)).fetchone()
+            driver_name = r[0] if r else None
+        site_name = None
+        if payload.site_id:
+            r = c.execute("SELECT name FROM sites WHERE id=?", (payload.site_id,)).fetchone()
+            site_name = r[0] if r else None
+    emit_event("VehicleAssigned",
+               actors={"vehicle_id": vid, "driver_id": payload.driver_id,
+                       "driver_name": driver_name},
+               place={"site_id": payload.site_id, "site_name": site_name},
+               payload={"vehicle_name": v['name'], "plate_no": v['plate_no']},
+               created_by=user["id"], source="admin_ui")
+    if payload.driver_id:
+        remove_relations(subject_type='Resource', subject_id=vid, predicate='operated_by')
+        add_relation('Resource', vid, 'operated_by', 'Person', payload.driver_id)
+    if payload.site_id:
+        remove_relations(subject_type='Resource', subject_id=vid, predicate='deployed_at')
+        add_relation('Resource', vid, 'deployed_at', 'Place', payload.site_id)
+    return {"id": cur.lastrowid}
+
+@app.post("/api/vehicles/{vid}/return")
+def return_vehicle(vid: int, user: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute("UPDATE vehicle_assignments SET returned_at=datetime('now') "
+                  "WHERE vehicle_id=? AND returned_at IS NULL", (vid,))
+        c.execute("UPDATE vehicles SET status='available' WHERE id=?", (vid,))
+    emit_event("VehicleReturned", actors={"vehicle_id": vid},
+               created_by=user["id"], source="admin_ui")
+    remove_relations(subject_type='Resource', subject_id=vid, predicate='operated_by')
+    remove_relations(subject_type='Resource', subject_id=vid, predicate='deployed_at')
+    return {"ok": True}
+
+@app.get("/api/fleet/site/{sid}")
+def fleet_at_site(sid: int, _: dict = Depends(require_login)):
+    """특정 현장에 배정된 차량 목록."""
+    with conn() as c:
+        return rows(c.execute("""
+            SELECT v.*, va.assigned_at, va.driver_id,
+                   w.name AS driver_name, w.phone AS driver_phone
+            FROM vehicle_assignments va
+            JOIN vehicles v ON va.vehicle_id=v.id
+            LEFT JOIN workers w ON va.driver_id=w.id
+            WHERE va.site_id=? AND va.returned_at IS NULL
+            ORDER BY v.name
+        """, (sid,)).fetchall())
+
+# ----- 면허 (Licenses) -----
+@app.get("/api/licenses")
+def list_licenses(company_id: Optional[int] = None, _: dict = Depends(require_login)):
+    sql = "SELECT l.*, c.name AS company_name FROM licenses l LEFT JOIN companies c ON l.company_id=c.id WHERE 1=1"
+    args = []
+    if company_id:
+        sql += " AND l.company_id=?"; args.append(company_id)
+    sql += " ORDER BY l.expires_at"
+    with conn() as c:
+        return rows(c.execute(sql, args).fetchall())
+
+@app.post("/api/licenses")
+def create_license(payload: LicenseIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO licenses(company_id,license_type,license_no,issued_at,expires_at,
+                                     capacity_amount,status,note)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (payload.company_id, payload.license_type, payload.license_no,
+             payload.issued_at, payload.expires_at, payload.capacity_amount or 0,
+             payload.status or "active", payload.note)
+        )
+        lid = cur.lastrowid
+    emit_event("LicenseAdded",
+               actors={"company_id": payload.company_id},
+               payload={"license_id": lid, "license_type": payload.license_type,
+                        "license_no": payload.license_no, "expires_at": payload.expires_at},
+               created_by=user["id"], source="admin_ui")
+    return {"id": lid}
+
+@app.put("/api/licenses/{lid}")
+def update_license(lid: int, payload: LicenseIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute(
+            """UPDATE licenses SET company_id=?,license_type=?,license_no=?,issued_at=?,
+                                    expires_at=?,capacity_amount=?,status=?,note=? WHERE id=?""",
+            (payload.company_id, payload.license_type, payload.license_no,
+             payload.issued_at, payload.expires_at, payload.capacity_amount or 0,
+             payload.status or "active", payload.note, lid)
+        )
+    emit_event("LicenseUpdated",
+               payload={"license_id": lid, "license_type": payload.license_type},
+               created_by=user["id"], source="admin_ui")
+    return {"ok": True}
+
+@app.delete("/api/licenses/{lid}")
+def delete_license(lid: int, user: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute("DELETE FROM licenses WHERE id=?", (lid,))
+    emit_event("LicenseDeleted", payload={"license_id": lid},
+               created_by=user["id"], source="admin_ui")
+    return {"ok": True}
+
+@app.get("/api/licenses/expiring")
+def list_expiring_licenses(days: int = 90, _: dict = Depends(require_login)):
+    with conn() as c:
+        return rows(c.execute(
+            """SELECT l.*, c.name AS company_name FROM licenses l
+               JOIN companies c ON l.company_id=c.id
+               WHERE l.status='active' AND l.expires_at IS NOT NULL
+               AND date(l.expires_at) <= date('now', '+' || ? || ' days')
+               ORDER BY l.expires_at""",
+            (days,)).fetchall())
+
 # ----- Notifications + Rules Engine (Phase 5) -----
 def _upsert_notification(unique_key, rule_type, severity, title, message=None, link=None,
                          related_type=None, related_id=None):
@@ -2059,6 +2383,25 @@ def _evaluate_rules():
                     f"{s['name']} 현장 — 착공 60일 넘었는데 기성 청구 0회",
                     "기성 청구 사이클을 시작해야 자금 흐름이 정상화됩니다.",
                     '#/lens', 'Place', s['id'])
+
+            # === RULE: 면허 만료 임박 (90일 이내) ===
+            for l in c.execute(
+                "SELECT l.id, l.license_type, l.expires_at, c.name AS cname "
+                "FROM licenses l JOIN companies c ON l.company_id=c.id "
+                "WHERE l.status='active' AND l.expires_at IS NOT NULL "
+                "AND date(l.expires_at) BETWEEN date('now') AND date('now','+90 days')").fetchall():
+                _upsert_notification(
+                    f"license_exp_{l['id']}", 'license_expiring',
+                    'urgent' if l['expires_at'] <= (today_d + __import__('datetime').timedelta(days=30)).isoformat() else 'warning',
+                    f"⏰ 면허 만료 임박: {l['cname']} {l['license_type']}",
+                    f"만료일 {l['expires_at']} — 갱신 신청 필요",
+                    '#/licenses', 'License', l['id'])
+            c.execute("UPDATE notifications SET resolved=1, resolved_at=datetime('now') "
+                      "WHERE rule_type='license_expiring' AND resolved=0 AND related_entity_id IN ("
+                      "  SELECT id FROM licenses WHERE date(expires_at) > date('now','+90 days') OR status != 'active')")
+
+            # === RULE: 차량 정비 필요 (status='maintenance' 30일 초과) ===
+            # placeholder for future
 
             # === RULE 8~10: 나라장터 (Phase 6) ===
             # 미검토 새 공고 (열린 것만)

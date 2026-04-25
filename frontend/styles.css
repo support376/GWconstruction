@@ -703,6 +703,41 @@ body { display: flex; min-height: 100vh; }
 .role-actions a .ico { font-size: 22px;}
 .role-actions a .desc { font-size: 11px; color: var(--text-muted); margin-top: 1px;}
 
+/* ===== Vehicle / License ===== */
+.veh-status {
+  display: inline-block; padding: 2px 8px; border-radius: 8px;
+  font-size: 11px; font-weight: 600;
+}
+.veh-status.available { background: #e7f6ec; color: #15803d;}
+.veh-status.in_use { background: #fef0e0; color: #a35907;}
+.veh-status.maintenance { background: #fbe9ea; color: #b3373d;}
+.veh-status.retired { background: #eef0f4; color: #707682;}
+
+.veh-active-info {
+  font-size: 11px; color: var(--text-muted); margin-top: 2px;
+}
+.veh-active-info b { color: var(--primary);}
+
+.lic-row {
+  display: grid; grid-template-columns: 2fr 1fr 1.5fr 1fr 1fr auto;
+  gap: 12px; align-items: center;
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.lic-row:last-child { border-bottom: none;}
+.lic-row.expiring-30 { background: #fbe9ea; }
+.lic-row.expiring-60 { background: #fef3e0; }
+.lic-row.expiring-90 { background: #fef9e7; }
+.lic-row.expired { background: #f0f0f0; opacity: 0.6;}
+.lic-row .lic-type { font-weight: 700;}
+.lic-row .days-left {
+  font-size: 11px; padding: 2px 8px; border-radius: 8px; font-weight: 600;
+  background: #eef0f4; color: #707682;
+}
+.lic-row .days-left.urgent { background: #fbe9ea; color: #b3373d;}
+.lic-row .days-left.warn { background: #fef0e0; color: #a35907;}
+.lic-row .days-left.ok { background: #e7f6ec; color: #15803d;}
+
 /* ===== Project (큰 카드) ===== */
 .project-card {
   background: var(--card);
