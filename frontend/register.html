@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>GW 건설 — 직원 등록</title>
+<link rel="stylesheet" href="/static/styles.css">
+<style>
+  .reg-form input[type=text], .reg-form input[type=tel], .reg-form select {
+    width: 100%; padding: 12px 14px; border: 1px solid var(--border);
+    border-radius: 8px; font-size: 16px; margin-bottom: 4px;
+    -webkit-appearance: none;
+  }
+  .reg-form input:focus, .reg-form select:focus { border-color: var(--primary); outline: none; }
+  .reg-form .helper { font-size: 11px; color: var(--text-muted); margin-bottom: 14px;}
+  .reg-form .submit {
+    width: 100%; padding: 16px; font-size: 16px; font-weight: 700;
+    background: var(--primary); color: #fff; border: none; border-radius: 10px;
+    margin-top: 10px;
+  }
+  .reg-form .submit:disabled { opacity: 0.5; }
+  .success {
+    background: #e7f6ec; border: 1px solid #bce5c5; border-radius: 10px;
+    padding: 18px; text-align: center;
+  }
+  .success h3 { color: #15803d; margin-bottom: 6px;}
+  .success a { display:inline-block; margin-top:12px; padding: 10px 16px;
+    background: var(--primary); color:#fff; border-radius: 8px; text-decoration: none; font-weight: 600;}
+  .err { background: #fbe9ea; color: #b3373d; padding: 10px 14px; border-radius: 8px;
+         font-size: 13px; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+<div class="m-wrap">
+
+<div class="m-header">
+  <div class="title">👷 GW 건설 직원 등록</div>
+  <div class="sub">이름과 연락처만으로 가입할 수 있습니다.<br>일당·계좌 등은 본사가 검토 후 보강합니다.</div>
+</div>
+
+<div class="m-card reg-form" id="form-card">
+  <label style="font-size:12px; font-weight:600; color:var(--text-muted); display:block; margin-bottom:6px;">이름 *</label>
+  <input id="f-name" type="text" placeholder="홍길동" autocomplete="name">
+  <div class="helper">실명을 입력해주세요.</div>
+
+  <label style="font-size:12px; font-weight:600; color:var(--text-muted); display:block; margin-bottom:6px;">연락처 *</label>
+  <input id="f-phone" type="tel" placeholder="010-1234-5678" autocomplete="tel" inputmode="tel">
+  <div class="helper">출퇴근/배치 알림을 받을 번호입니다.</div>
+
+  <label style="font-size:12px; font-weight:600; color:var(--text-muted); display:block; margin-bottom:6px;">구분 *</label>
+  <select id="f-type">
+    <option value="daily">일용직</option>
+    <option value="office">사무직</option>
+  </select>
+  <div class="helper">선택만 해두시면 본사가 확인 후 조정합니다.</div>
+
+  <label style="font-size:12px; font-weight:600; color:var(--text-muted); display:block; margin-bottom:6px;">담당 작업 / 직무 (선택)</label>
+  <input id="f-role" type="text" placeholder="예) 철근공, 형틀목공, 현장관리, 경리">
+  <div class="helper">비워두셔도 됩니다.</div>
+
+  <div id="err-box"></div>
+  <button class="submit" id="btn-submit">등록하기</button>
+</div>
+
+<div id="result-card" style="display:none"></div>
+
+<div style="text-align:center; margin-top:14px; font-size:11.5px; color:var(--text-muted);">
+  이미 등록되셨다면 → <a href="/m" style="color:var(--primary)">출퇴근 화면으로</a>
+</div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function showErr(msg) {
+  $('err-box').innerHTML = '<div class="err">' + msg + '</div>';
+}
+
+$('btn-submit').onclick = async () => {
+  $('err-box').innerHTML = '';
+  const name = $('f-name').value.trim();
+  const phone = $('f-phone').value.trim();
+  const worker_type = $('f-type').value;
+  const job_role = $('f-role').value.trim();
+
+  if (name.length < 2) { showErr('이름을 입력해주세요.'); return; }
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length < 10 || digits.length > 11) {
+    showErr('연락처를 010-XXXX-XXXX 형식으로 입력해주세요.');
+    return;
+  }
+
+  $('btn-submit').disabled = true;
+  $('btn-submit').textContent = '등록 중…';
+
+  try {
+    const r = await fetch('/api/register', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ name, phone, worker_type, job_role: job_role || null })
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      showErr(data.detail || '등록 실패. 다시 시도해주세요.');
+      $('btn-submit').disabled = false;
+      $('btn-submit').textContent = '등록하기';
+      return;
+    }
+
+    $('form-card').style.display = 'none';
+    $('result-card').style.display = 'block';
+    $('result-card').innerHTML = `
+      <div class="success">
+        <h3>✅ 등록 완료</h3>
+        <div style="font-size:14px; margin-top:6px;">
+          <b>${data.name}</b> 님,<br>가입이 접수되었습니다.
+        </div>
+        <div style="font-size:12px; color: var(--text-muted); margin-top:10px;">
+          본사 관리자가 확인 후 소속 법인·일당 등을 등록하면<br>
+          출퇴근과 현장 배치가 시작됩니다.
+        </div>
+        <a href="/m">출퇴근 화면으로 →</a>
+      </div>
+    `;
+  } catch (e) {
+    showErr('서버 통신 실패: ' + e);
+    $('btn-submit').disabled = false;
+    $('btn-submit').textContent = '등록하기';
+  }
+};
+
+// 자동 하이픈
+$('f-phone').addEventListener('input', e => {
+  let v = e.target.value.replace(/\D/g, '');
+  if (v.length > 11) v = v.slice(0,11);
+  if (v.length >= 8) e.target.value = v.slice(0,3) + '-' + v.slice(3, v.length-4) + '-' + v.slice(-4);
+  else if (v.length >= 4) e.target.value = v.slice(0,3) + '-' + v.slice(3);
+  else e.target.value = v;
+});
+</script>
+</body>
+</html>

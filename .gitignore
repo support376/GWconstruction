@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual env
+.venv/
+venv/
+env/
+.installed
+
+# SQLite DB (배포 시엔 새로 생성됨)
+backend/construction.db
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# 로컬 도구
+cloudflared.exe
+ngrok.exe
+
+# 환경변수 (있다면)
+.env
+.env.local

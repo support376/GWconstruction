@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>현장 출퇴근</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<div class="m-wrap">
+  <div class="m-header">
+    <div class="title">📍 현장 출퇴근</div>
+    <div class="sub">현장 반경 안에서만 출근으로 인정됩니다</div>
+  </div>
+
+  <div class="m-card">
+    <label>본인 선택</label>
+    <select id="worker-sel"></select>
+  </div>
+
+  <div class="m-card">
+    <label>현장 선택</label>
+    <select id="site-sel"></select>
+  </div>
+
+  <div class="m-card">
+    <div class="m-actions">
+      <button class="in" id="btn-in">출근</button>
+      <button class="out" id="btn-out">퇴근</button>
+    </div>
+    <div id="status" class="m-status muted">아래 버튼을 누르면 GPS 위치를 받아 현장과 거리를 확인합니다.</div>
+    <div class="gps-info" id="gps-info"></div>
+  </div>
+
+  <div class="m-card" id="today-record" style="display:none">
+    <label>오늘 기록</label>
+    <div id="today-text" style="font-size:13px;"></div>
+  </div>
+
+  <div style="text-align:center; margin-top:14px; font-size:11.5px; color:var(--text-muted);">
+    아직 등록 안 됐다면 → <a href="/register" style="color:var(--primary)">신규 직원 등록</a>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let workers = [], sites = [];
+
+async function load() {
+  const [w, s] = await Promise.all([
+    fetch('/api/workers').then(r => r.json()),
+    fetch('/api/sites?active_only=true').then(r => r.json()),
+  ]);
+  workers = w; sites = s;
+  $('worker-sel').innerHTML = workers.map(x =>
+    `<option value="${x.id}">${x.name} · ${x.job_role || x.worker_type}</option>`).join('');
+  $('site-sel').innerHTML = sites.map(x =>
+    `<option value="${x.id}">${x.name}</option>`).join('');
+}
+
+function getPos() {
+  return new Promise((res, rej) => {
+    if (!navigator.geolocation) { rej('이 기기에서는 GPS를 사용할 수 없습니다.'); return; }
+    navigator.geolocation.getCurrentPosition(
+      p => res({ lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy }),
+      e => rej('GPS 권한을 허용해주세요. (' + e.message + ')'),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  });
+}
+
+async function doClock(direction) {
+  const wid = +$('worker-sel').value;
+  const sid = +$('site-sel').value;
+  if (!wid || !sid) { setStatus('warn', '사람과 현장을 선택해주세요.'); return; }
+
+  setStatus('muted', '📡 GPS 위치 확인 중…');
+  $('btn-in').disabled = true; $('btn-out').disabled = true;
+  let pos;
+  try { pos = await getPos(); }
+  catch (e) { setStatus('err', e); $('btn-in').disabled=false; $('btn-out').disabled=false; return; }
+
+  $('gps-info').textContent = `위도 ${pos.lat.toFixed(5)} · 경도 ${pos.lng.toFixed(5)} · 정확도 ±${Math.round(pos.acc)}m`;
+
+  try {
+    const r = await fetch('/api/clock', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ worker_id: wid, site_id: sid, lat: pos.lat, lng: pos.lng, direction })
+    }).then(r => r.json());
+
+    if (r.ok && r.verified) {
+      setStatus('ok', `✅ ${direction === 'in' ? '출근' : '퇴근'} 완료
+        <div class="dist">현장과 거리 ${r.distance_m}m (허용 ${r.geofence_m}m)</div>`);
+    } else if (r.ok && !r.verified) {
+      setStatus('warn', `⚠️ ${direction === 'in' ? '출근' : '퇴근'} 기록은 저장됨 (현장 밖)
+        <div class="dist">현장과 거리 ${r.distance_m ?? '?'}m (허용 ${r.geofence_m}m)</div>
+        지오펜스 밖이므로 본사에 검토 요청됩니다.`);
+    } else {
+      setStatus('err', '❌ ' + (r.detail || '실패'));
+    }
+    refreshToday();
+  } catch (e) {
+    setStatus('err', '서버 통신 실패: ' + e);
+  } finally {
+    $('btn-in').disabled = false; $('btn-out').disabled = false;
+  }
+}
+
+function setStatus(kind, html) {
+  const el = $('status');
+  el.className = 'm-status ' + kind;
+  el.innerHTML = html;
+}
+
+async function refreshToday() {
+  const wid = +$('worker-sel').value;
+  if (!wid) return;
+  const all = await fetch('/api/clock/today').then(r => r.json());
+  const mine = all.find(r => r.worker_id === wid);
+  if (mine) {
+    $('today-record').style.display = 'block';
+    const inT = mine.clock_in ? mine.clock_in.split('T')[1] : '-';
+    const outT = mine.clock_out ? mine.clock_out.split('T')[1] : '-';
+    $('today-text').innerHTML =
+      `현장: <b>${mine.site_name}</b><br>` +
+      `출근 ${inT} ${mine.in_verified ? '✅' : '⚠️'} · ` +
+      `거리 ${mine.in_distance_m != null ? Math.round(mine.in_distance_m)+'m' : '-'}<br>` +
+      `퇴근 ${outT} ${mine.out_verified ? '✅' : (mine.clock_out ? '⚠️' : '')}`;
+  } else {
+    $('today-record').style.display = 'none';
+  }
+}
+
+$('btn-in').onclick = () => doClock('in');
+$('btn-out').onclick = () => doClock('out');
+$('worker-sel').onchange = refreshToday;
+
+load().then(refreshToday);
+</script>
+</body>
+</html>

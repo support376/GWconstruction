@@ -1,0 +1,14 @@
+# Render 배포 설정 (https://render.com)
+# 이 파일을 GitHub에 같이 올리면 Render가 자동 인식해서 한 번에 배포해줍니다.
+services:
+  - type: web
+    name: gw-construction-mgmt
+    runtime: python
+    plan: free
+    pythonVersion: "3.11"
+    buildCommand: pip install -r requirements.txt
+    startCommand: cd backend && uvicorn app:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"

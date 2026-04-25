@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GW 건설관리 시스템</title>
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="topnav-inner">
+    <div class="brand">GW 건설관리</div>
+    <div class="nav-links" id="nav-links">
+      <a class="nav-link" href="#/dashboard">대시보드</a>
+      <a class="nav-link" href="#/projects">프로젝트</a>
+      <a class="nav-link" href="#/board">배치 보드</a>
+      <a class="nav-link" href="#/workers">직원</a>
+      <a class="nav-link" href="#/sites">현장</a>
+      <a class="nav-link" href="#/map">지도</a>
+      <a class="nav-link" href="/m" target="_blank">모바일 출퇴근 ↗</a>
+      <a class="nav-link" href="/register" target="_blank">직원 가입 ↗</a>
+    </div>
+    <div class="right" id="now-time"></div>
+  </div>
+</nav>
+
+<div id="app" class="page"></div>
+
+<div id="modal-root"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
