@@ -862,9 +862,43 @@ def create_company(payload: CompanyIn, user: dict = Depends(require_login)):
         new_id = cur.lastrowid
     emit_event("CompanyCreated",
                actors={"company_id": new_id},
-               payload={"name": payload.name, "business_no": payload.business_no},
+               payload={"name": payload.name, "business_no": payload.business_no,
+                        "ceo": payload.ceo, "license_info": payload.license_info},
                created_by=user["id"], source="admin_ui")
     return {"id": new_id}
+
+@app.put("/api/companies/{cid}")
+def update_company(cid: int, payload: CompanyIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        existing = c.execute("SELECT * FROM companies WHERE id=?", (cid,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "company not found")
+        c.execute(
+            "UPDATE companies SET name=?, business_no=?, ceo=?, license_info=? WHERE id=?",
+            (payload.name, payload.business_no, payload.ceo, payload.license_info, cid)
+        )
+    emit_event("CompanyUpdated",
+               actors={"company_id": cid},
+               payload={"name": payload.name, "business_no": payload.business_no,
+                        "ceo": payload.ceo, "license_info": payload.license_info},
+               created_by=user["id"], source="admin_ui")
+    return {"ok": True}
+
+@app.delete("/api/companies/{cid}")
+def delete_company(cid: int, user: dict = Depends(require_login)):
+    with conn() as c:
+        # 의존성 확인 — 워커/현장이 이 법인을 참조 중이면 거부
+        worker_cnt = c.execute("SELECT COUNT(*) FROM workers WHERE company_id=?", (cid,)).fetchone()[0]
+        site_cnt = c.execute("SELECT COUNT(*) FROM sites WHERE company_id=?", (cid,)).fetchone()[0]
+        if worker_cnt or site_cnt:
+            raise HTTPException(400, f"이 법인을 참조 중인 직원 {worker_cnt}명, 현장 {site_cnt}건이 있습니다. 먼저 다른 법인으로 옮기거나 정리해주세요.")
+        c.execute("DELETE FROM companies WHERE id=?", (cid,))
+    emit_event("CompanyDeleted", actors={"company_id": cid},
+               created_by=user["id"], source="admin_ui")
+    # 관계 정리
+    remove_relations(subject_type='Org', subject_id=cid)
+    remove_relations(object_type='Org', object_id=cid)
+    return {"ok": True}
 
 # ----- 모바일 출퇴근 화면용 공개 API (최소 정보만) -----
 @app.get("/api/public/clock-options")

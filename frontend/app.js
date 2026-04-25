@@ -1380,7 +1380,12 @@ const EVENT_DESC = {
   WorkerUpdated:     { cat:'t-worker', label:'직원 수정',  fmt: e => `<b>${e.payload.name}</b> 정보 수정 — 일당 ${e.payload.daily_wage?fmt(e.payload.daily_wage)+'원':'-'}` },
   WorkerDeleted:     { cat:'t-worker', label:'직원 삭제',  fmt: e => `worker #${e.actors.worker_id} 삭제` },
   WorkerSelfRegistered:{cat:'t-worker',label:'자가 가입',  fmt: e => `<b>${e.payload.name}</b> (${e.payload.phone}) 폰에서 자가 가입` },
-  CompanyCreated:    { cat:'t-other',  label:'법인 등록',  fmt: e => `<b>${e.payload.name}</b> 법인 등록` },
+  CompanyCreated:    { cat:'t-other',  label:'법인 등록',  fmt: e => `<b>${e.payload.name}</b> 법인 등록${e.payload.business_no?` (${e.payload.business_no})`:''}` },
+  CompanyUpdated:    { cat:'t-other',  label:'법인 수정',  fmt: e => `<b>${e.payload.name}</b> 정보 수정` },
+  CompanyDeleted:    { cat:'t-other',  label:'법인 삭제',  fmt: e => `법인 #${e.actors.company_id} 삭제` },
+  TenderDiscovered:  { cat:'t-other',  label:'공고 발견',  fmt: e => `<b>${e.payload.title}</b> · ${e.payload.org_name||''} · 예산 ${e.payload.budget?'₩'+e.payload.budget.toLocaleString('ko-KR'):'-'}` },
+  TenderReviewed:    { cat:'t-other',  label:'공고 검토',  fmt: e => `<b>${e.payload.title}</b>: ${e.payload.from} → ${e.payload.to}` },
+  BidSubmitted:      { cat:'t-money',  label:'입찰 응찰',  fmt: e => `<b>${e.payload.title}</b> 응찰가 ${e.payload.bid_amount?'₩'+e.payload.bid_amount.toLocaleString('ko-KR'):'-'}` },
   AdminSignedUp:     { cat:'t-other',  label:'관리자 가입', fmt: e => `<b>${e.payload.name}</b> (${e.payload.username}, ${e.payload.role}) 관리자 가입` },
   ProcessStarted:    { cat:'t-other',  label:'프로세스 시작', fmt: e => `${(window.__procDefs||{})[e.payload.workflow]?.name || e.payload.workflow} — ${e.payload.subject_type} #${e.payload.subject_id} → "${e.payload.state}"` },
   ProcessAdvanced:   { cat:'t-other',  label:'프로세스 진행', fmt: e => `${(window.__procDefs||{})[e.payload.workflow]?.name || e.payload.workflow} — ${e.payload.subject_type} #${e.payload.subject_id}: ${e.payload.from} → <b>${e.payload.to}</b>${e.payload.manual?' (수동)':''}` },
@@ -1540,6 +1545,96 @@ route('/users', async () => {
     navigate();
   });
 });
+
+// ============================================================
+// 법인 관리
+// ============================================================
+route('/companies', async () => {
+  const companies = await api.get('/api/companies');
+  // 각 법인의 의존성 (워커·현장 카운트) 계산
+  const [workers, sites] = await Promise.all([
+    api.get('/api/workers'),
+    api.get('/api/sites'),
+  ]);
+  const workerCnt = {}, siteCnt = {};
+  workers.forEach(w => { if (w.company_id) workerCnt[w.company_id] = (workerCnt[w.company_id]||0) + 1; });
+  sites.forEach(s   => { if (s.company_id) siteCnt[s.company_id] = (siteCnt[s.company_id]||0) + 1; });
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">🏢 법인 관리</div>
+        <div class="page-sub">전문건설업 그룹사 — 법인을 추가·수정·삭제</div>
+      </div>
+      <button class="btn btn-primary" id="add-company">+ 법인 등록</button>
+    </div>
+    <div class="card">
+      <table class="table">
+        <thead><tr>
+          <th>법인명</th><th>사업자번호</th><th>대표</th><th>보유 면허</th>
+          <th style="text-align:right">소속 직원</th><th style="text-align:right">진행 현장</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${companies.length === 0 ? '<tr><td colspan="7" style="text-align:center; color:var(--text-muted)">등록된 법인 없음</td></tr>' :
+            companies.map(c => `<tr>
+              <td><b>${c.name}</b></td>
+              <td>${c.business_no || '-'}</td>
+              <td>${c.ceo || '-'}</td>
+              <td style="font-size:12px; color: var(--text-muted)">${c.license_info || '-'}</td>
+              <td style="text-align:right">${workerCnt[c.id] || 0}명</td>
+              <td style="text-align:right">${siteCnt[c.id] || 0}개</td>
+              <td>
+                <button class="btn btn-sm" data-edit="${c.id}">수정</button>
+                <button class="btn btn-sm btn-danger" data-del="${c.id}" data-name="${c.name}">삭제</button>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div class="diff-banner" style="margin-top:8px">
+      💡 <b>법인 단위 운영:</b> 직원·현장 등록 시 소속 법인을 선택하면, 대시보드/3시점/그래프에서 법인별 분리 집계가 자동으로 됩니다.
+      법인을 삭제하려면 그 법인을 참조하는 직원·현장을 다른 법인으로 옮긴 뒤 삭제 가능합니다.
+    </div>
+  `;
+
+  $('#add-company').onclick = () => companyModal(null);
+  $$('[data-edit]').forEach(b => b.onclick = () => {
+    const c = companies.find(x => x.id == b.dataset.edit);
+    companyModal(c);
+  });
+  $$('[data-del]').forEach(b => b.onclick = async () => {
+    if (!confirm(`"${b.dataset.name}" 법인을 삭제하시겠습니까?`)) return;
+    try {
+      await api.del('/api/companies/' + b.dataset.del);
+      navigate();
+    } catch (e) { alert('삭제 실패: 직원·현장이 참조 중입니다. 먼저 정리해주세요.'); }
+  });
+});
+
+function companyModal(c) {
+  const isNew = !c;
+  modal(isNew ? '법인 등록' : '법인 수정', `
+    <div class="form-row"><label>법인명 *</label><input id="f-name" value="${c?.name || ''}" placeholder="예: (주)지더블유종합건설"></div>
+    <div class="form-grid">
+      <div class="form-row"><label>사업자번호</label><input id="f-biz" value="${c?.business_no || ''}" placeholder="123-45-67890"></div>
+      <div class="form-row"><label>대표자</label><input id="f-ceo" value="${c?.ceo || ''}" placeholder="홍길동"></div>
+    </div>
+    <div class="form-row"><label>보유 면허·업종</label>
+      <textarea id="f-lic" rows="3" placeholder="예: 토목공사업, 건축공사업, 철근콘크리트공사업">${c?.license_info || ''}</textarea>
+    </div>
+  `, async () => {
+    const payload = {
+      name: $('#f-name').value.trim(),
+      business_no: $('#f-biz').value.trim(),
+      ceo: $('#f-ceo').value.trim(),
+      license_info: $('#f-lic').value.trim(),
+    };
+    if (!payload.name) { alert('법인명을 입력하세요'); return false; }
+    if (isNew) await api.post('/api/companies', payload);
+    else      await api.put('/api/companies/' + c.id, payload);
+    navigate();
+  });
+}
 
 // ============================================================
 // 나라장터 입찰 분석 (Phase 6)
