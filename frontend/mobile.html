@@ -5,6 +5,32 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>현장 출퇴근</title>
 <link rel="stylesheet" href="/static/styles.css">
+<style>
+  .worker-banner {
+    background: #e7f6ec; border: 1px solid #bce5c5;
+    border-radius: 10px; padding: 10px 14px;
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px;
+  }
+  .worker-banner .who { font-weight: 700; color: #15803d; font-size: 14px;}
+  .worker-banner .role { color: #707682; font-size: 11px; margin-top: 2px;}
+  .worker-banner .switch {
+    background: transparent; border: 1px solid #bce5c5; color: #15803d;
+    padding: 4px 10px; border-radius: 6px; font-size: 11px; cursor: pointer;
+  }
+  .ident-box input {
+    width: 100%; padding: 12px 14px; border: 1px solid var(--border);
+    border-radius: 8px; font-size: 16px; font-family: inherit;
+  }
+  .ident-box .submit {
+    width: 100%; padding: 14px; margin-top: 12px; font-size: 15px; font-weight: 700;
+    background: var(--primary); color: #fff; border: none; border-radius: 10px;
+    font-family: inherit;
+  }
+  .ident-box .submit:disabled { opacity: 0.5; }
+  .err { background: #fbe9ea; color: #b3373d; padding: 10px 14px;
+         border-radius: 8px; font-size: 13px; margin-top: 10px; }
+</style>
 </head>
 <body>
 
@@ -14,46 +40,113 @@
     <div class="sub">현장 반경 안에서만 출근으로 인정됩니다</div>
   </div>
 
-  <div class="m-card">
-    <label>본인 선택</label>
-    <select id="worker-sel"></select>
-  </div>
-
-  <div class="m-card">
-    <label>현장 선택</label>
-    <select id="site-sel"></select>
-  </div>
-
-  <div class="m-card">
-    <div class="m-actions">
-      <button class="in" id="btn-in">출근</button>
-      <button class="out" id="btn-out">퇴근</button>
+  <!-- 본인 인증 (처음 화면) -->
+  <div class="m-card ident-box" id="ident-card">
+    <label style="font-size:12px; font-weight:600; color:var(--text-muted); display:block; margin-bottom:8px;">
+      본인 확인 — 가입할 때 입력한 전화번호
+    </label>
+    <input id="f-phone" type="tel" placeholder="010-1234-5678" autocomplete="tel" inputmode="tel">
+    <button class="submit" id="btn-identify">본인 확인하기</button>
+    <div id="ident-err"></div>
+    <div style="text-align:center; margin-top:12px; font-size:11.5px; color:var(--text-muted);">
+      등록 안 됐다면 → <a href="/register" style="color:var(--primary)">신규 가입</a>
     </div>
-    <div id="status" class="m-status muted">아래 버튼을 누르면 GPS 위치를 받아 현장과 거리를 확인합니다.</div>
-    <div class="gps-info" id="gps-info"></div>
   </div>
 
-  <div class="m-card" id="today-record" style="display:none">
-    <label>오늘 기록</label>
-    <div id="today-text" style="font-size:13px;"></div>
-  </div>
+  <!-- 출퇴근 화면 (본인 확인 후) -->
+  <div id="clock-section" style="display:none">
+    <div class="worker-banner">
+      <div>
+        <div class="who" id="me-name"></div>
+        <div class="role" id="me-role"></div>
+      </div>
+      <button class="switch" id="btn-switch">다른 사람</button>
+    </div>
 
-  <div style="text-align:center; margin-top:14px; font-size:11.5px; color:var(--text-muted);">
-    아직 등록 안 됐다면 → <a href="/register" style="color:var(--primary)">신규 직원 등록</a>
+    <div class="m-card">
+      <label>현장 선택</label>
+      <select id="site-sel"></select>
+    </div>
+
+    <div class="m-card">
+      <div class="m-actions">
+        <button class="in" id="btn-in">출근</button>
+        <button class="out" id="btn-out">퇴근</button>
+      </div>
+      <div id="status" class="m-status muted">아래 버튼을 누르면 GPS 위치를 받아 현장과 거리를 확인합니다.</div>
+      <div class="gps-info" id="gps-info"></div>
+    </div>
+
+    <div style="text-align:center; margin-top:14px; font-size:11.5px; color:var(--text-muted);">
+      문제 있으면 본사로 연락주세요.
+    </div>
   </div>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
-let workers = [], sites = [];
+let me = null;
+let sites = [];
 
-async function load() {
+function setStatus(kind, html) {
+  const el = $('status');
+  el.className = 'm-status ' + kind;
+  el.innerHTML = html;
+}
+
+async function loadSites() {
   const opts = await fetch('/api/public/clock-options').then(r => r.json());
-  workers = opts.workers; sites = opts.sites;
-  $('worker-sel').innerHTML = workers.map(x =>
-    `<option value="${x.id}">${x.name} · ${x.job_role || x.worker_type}</option>`).join('');
+  sites = opts.sites;
   $('site-sel').innerHTML = sites.map(x =>
     `<option value="${x.id}">${x.name}</option>`).join('');
+}
+
+async function checkIdentity() {
+  const r = await fetch('/api/worker/me').then(r => r.json());
+  if (r.identified) {
+    me = r;
+    $('ident-card').style.display = 'none';
+    $('clock-section').style.display = 'block';
+    $('me-name').textContent = me.name + ' 님';
+    $('me-role').textContent = (me.job_role || (me.worker_type === 'office' ? '사무직' : '일용직'));
+    await loadSites();
+  } else {
+    me = null;
+    $('ident-card').style.display = 'block';
+    $('clock-section').style.display = 'none';
+  }
+}
+
+async function doIdentify() {
+  const phone = $('f-phone').value.trim();
+  $('ident-err').innerHTML = '';
+  $('btn-identify').disabled = true;
+  $('btn-identify').textContent = '확인 중…';
+  try {
+    const r = await fetch('/api/worker/identify', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ phone })
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      $('ident-err').innerHTML = '<div class="err">' + (data.detail || '확인 실패') + '</div>';
+      $('btn-identify').disabled = false;
+      $('btn-identify').textContent = '본인 확인하기';
+      return;
+    }
+    await checkIdentity();
+  } catch (e) {
+    $('ident-err').innerHTML = '<div class="err">서버 통신 실패: ' + e + '</div>';
+    $('btn-identify').disabled = false;
+    $('btn-identify').textContent = '본인 확인하기';
+  }
+}
+
+async function doSwitch() {
+  if (!confirm('다른 사람으로 바꿔서 출퇴근하시겠습니까?')) return;
+  await fetch('/api/worker/logout', { method: 'POST' });
+  $('f-phone').value = '';
+  await checkIdentity();
 }
 
 function getPos() {
@@ -68,9 +161,9 @@ function getPos() {
 }
 
 async function doClock(direction) {
-  const wid = +$('worker-sel').value;
+  if (!me) return;
   const sid = +$('site-sel').value;
-  if (!wid || !sid) { setStatus('warn', '사람과 현장을 선택해주세요.'); return; }
+  if (!sid) { setStatus('warn', '현장을 선택해주세요.'); return; }
 
   setStatus('muted', '📡 GPS 위치 확인 중…');
   $('btn-in').disabled = true; $('btn-out').disabled = true;
@@ -83,20 +176,23 @@ async function doClock(direction) {
   try {
     const r = await fetch('/api/clock', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ worker_id: wid, site_id: sid, lat: pos.lat, lng: pos.lng, direction })
-    }).then(r => r.json());
-
-    if (r.ok && r.verified) {
-      setStatus('ok', `✅ ${direction === 'in' ? '출근' : '퇴근'} 완료
-        <div class="dist">현장과 거리 ${r.distance_m}m (허용 ${r.geofence_m}m)</div>`);
-    } else if (r.ok && !r.verified) {
-      setStatus('warn', `⚠️ ${direction === 'in' ? '출근' : '퇴근'} 기록은 저장됨 (현장 밖)
-        <div class="dist">현장과 거리 ${r.distance_m ?? '?'}m (허용 ${r.geofence_m}m)</div>
-        지오펜스 밖이므로 본사에 검토 요청됩니다.`);
-    } else {
-      setStatus('err', '❌ ' + (r.detail || '실패'));
+      body: JSON.stringify({ worker_id: me.id, site_id: sid, lat: pos.lat, lng: pos.lng, direction })
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      setStatus('err', '❌ ' + (data.detail || '실패'));
+      $('btn-in').disabled = false; $('btn-out').disabled = false;
+      return;
     }
-    refreshToday();
+
+    if (data.verified) {
+      setStatus('ok', `✅ ${me.name} 님 ${direction === 'in' ? '출근' : '퇴근'} 완료
+        <div class="dist">현장과 거리 ${data.distance_m}m (허용 ${data.geofence_m}m)</div>`);
+    } else {
+      setStatus('warn', `⚠️ ${direction === 'in' ? '출근' : '퇴근'} 기록은 저장됨 (현장 밖)
+        <div class="dist">현장과 거리 ${data.distance_m ?? '?'}m (허용 ${data.geofence_m}m)</div>
+        지오펜스 밖이므로 본사에 검토 요청됩니다.`);
+    }
   } catch (e) {
     setStatus('err', '서버 통신 실패: ' + e);
   } finally {
@@ -104,39 +200,21 @@ async function doClock(direction) {
   }
 }
 
-function setStatus(kind, html) {
-  const el = $('status');
-  el.className = 'm-status ' + kind;
-  el.innerHTML = html;
-}
-
-async function refreshToday() {
-  const wid = +$('worker-sel').value;
-  if (!wid) return;
-  // /api/clock/today 는 관리자 전용이라 일반 사용자는 못 봄.
-  // 대신 출/퇴근 결과 자체를 응답에서 받아 표시하므로 여기서는 별도 조회 안 함.
-  return;
-  const all = []; // 비활성: 위에서 return 됨
-  const mine = all.find(r => r.worker_id === wid);
-  if (mine) {
-    $('today-record').style.display = 'block';
-    const inT = mine.clock_in ? mine.clock_in.split('T')[1] : '-';
-    const outT = mine.clock_out ? mine.clock_out.split('T')[1] : '-';
-    $('today-text').innerHTML =
-      `현장: <b>${mine.site_name}</b><br>` +
-      `출근 ${inT} ${mine.in_verified ? '✅' : '⚠️'} · ` +
-      `거리 ${mine.in_distance_m != null ? Math.round(mine.in_distance_m)+'m' : '-'}<br>` +
-      `퇴근 ${outT} ${mine.out_verified ? '✅' : (mine.clock_out ? '⚠️' : '')}`;
-  } else {
-    $('today-record').style.display = 'none';
-  }
-}
-
+// 자동 하이픈
+$('f-phone').addEventListener('input', e => {
+  let v = e.target.value.replace(/\D/g, '');
+  if (v.length > 11) v = v.slice(0,11);
+  if (v.length >= 8) e.target.value = v.slice(0,3) + '-' + v.slice(3, v.length-4) + '-' + v.slice(-4);
+  else if (v.length >= 4) e.target.value = v.slice(0,3) + '-' + v.slice(3);
+  else e.target.value = v;
+});
+$('f-phone').addEventListener('keydown', e => { if (e.key === 'Enter') doIdentify(); });
+$('btn-identify').onclick = doIdentify;
+$('btn-switch').onclick = doSwitch;
 $('btn-in').onclick = () => doClock('in');
 $('btn-out').onclick = () => doClock('out');
-$('worker-sel').onchange = refreshToday;
 
-load().then(refreshToday);
+checkIdentity();
 </script>
 </body>
 </html>

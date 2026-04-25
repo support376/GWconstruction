@@ -816,6 +816,75 @@ function projectCardHtml(p) {
 }
 
 // ============================================================
+// 사용자 관리 (admin 전용)
+// ============================================================
+route('/users', async () => {
+  let users;
+  try { users = await api.get('/api/users'); }
+  catch (e) {
+    $('#app').innerHTML = '<div class="card card-pad">관리자 권한이 필요합니다.</div>';
+    return;
+  }
+  if (!Array.isArray(users)) {
+    $('#app').innerHTML = '<div class="card card-pad">' + (users.detail || '권한 없음') + '</div>';
+    return;
+  }
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">사용자 관리</div>
+        <div class="page-sub">본사·현장 관리 계정. 관리자만 접근 가능</div>
+      </div>
+    </div>
+    <div class="card">
+      <table class="table">
+        <thead><tr>
+          <th>이름</th><th>아이디</th><th>역할</th><th>가입일</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${users.map(u => `<tr>
+            <td><b>${u.name || '-'}</b></td>
+            <td>${u.username}</td>
+            <td>
+              <select data-role="${u.id}" style="padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-size:12px;">
+                <option value="admin" ${u.role==='admin'?'selected':''}>관리자</option>
+                <option value="manager" ${u.role==='manager'?'selected':''}>매니저</option>
+              </select>
+            </td>
+            <td style="font-size:11px; color:var(--text-muted)">${(u.created_at||'').split('T')[0]}</td>
+            <td>
+              <button class="btn btn-sm" data-pw="${u.id}" data-name="${u.name||u.username}">비번 재설정</button>
+              <button class="btn btn-sm btn-danger" data-del="${u.id}" data-name="${u.name||u.username}">삭제</button>
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div class="diff-banner" style="margin-top:8px">
+      💡 새 관리자 추가: 가입 페이지(<a href="/signup" target="_blank">/signup</a>) 링크를 본사 직원에게 공유하세요.
+      초대 코드 보호가 필요하면 Render 환경변수 <code>ADMIN_INVITE_CODE</code> 를 설정하세요.
+    </div>
+  `;
+
+  $$('[data-role]').forEach(sel => sel.onchange = async e => {
+    await api.put('/api/users/' + sel.dataset.role, { role: e.target.value });
+  });
+  $$('[data-pw]').forEach(b => b.onclick = async () => {
+    const newpw = prompt(b.dataset.name + ' 의 새 비밀번호 (6자 이상):');
+    if (!newpw) return;
+    if (newpw.length < 6) { alert('6자 이상이어야 합니다'); return; }
+    await api.put('/api/users/' + b.dataset.pw, { new_password: newpw });
+    alert('재설정 완료');
+  });
+  $$('[data-del]').forEach(b => b.onclick = async () => {
+    if (!confirm(b.dataset.name + ' 계정을 삭제할까요?')) return;
+    await api.del('/api/users/' + b.dataset.del);
+    navigate();
+  });
+});
+
+// ============================================================
 // 시작 — 로그인 체크 후 진입
 // ============================================================
 (async () => {
@@ -825,13 +894,17 @@ function projectCardHtml(p) {
       location.href = '/login';
       return;
     }
-    // 우상단에 사용자명/로그아웃 표시
     const right = document.querySelector('.topnav .right');
     if (right) {
+      const roleLabel = me.role === 'admin' ? '관리자' : '매니저';
       right.innerHTML = `
-        <span style="margin-right:10px">${me.name || me.username} (${me.role})</span>
+        <span style="margin-right:10px">${me.name || me.username} <span style="opacity:0.7">(${roleLabel})</span></span>
         <a href="#" onclick="logout(); return false;" style="color:rgba(255,255,255,0.85); text-decoration: underline; font-size: 12px;">로그아웃</a>
       `;
+    }
+    if (me.role === 'admin') {
+      const navUsers = document.getElementById('nav-users');
+      if (navUsers) navUsers.style.display = '';
     }
   } catch (e) {
     location.href = '/login';

@@ -188,6 +188,15 @@ class LoginIn(BaseModel):
     username: str
     password: str
 
+class WorkerIdentifyIn(BaseModel):
+    phone: str
+
+class SignupIn(BaseModel):
+    username: str
+    password: str
+    name: str
+    invite_code: Optional[str] = None
+
 class PasswordChangeIn(BaseModel):
     current_password: str
     new_password: str
@@ -310,6 +319,137 @@ def me(request: Request):
         request.session.clear()
         return {"authenticated": False}
     return {"authenticated": True, **dict(u)}
+
+# ----- 관리자/매니저 자가 가입 -----
+@app.post("/api/signup")
+def signup(payload: SignupIn, request: Request):
+    """본사 직원이 직접 계정 생성. 환경변수 ADMIN_INVITE_CODE 가 설정돼 있으면 일치해야 함.
+    설정 안 돼 있으면 누구나 가입 가능 (프로토타입 단계)."""
+    username = (payload.username or "").strip().lower()
+    password = payload.password or ""
+    name = (payload.name or "").strip()
+    if len(username) < 3:
+        raise HTTPException(400, "아이디는 3자 이상이어야 합니다.")
+    if not username.replace('_','').replace('.','').isalnum():
+        raise HTTPException(400, "아이디는 영문·숫자·_·. 만 사용 가능합니다.")
+    if len(password) < 6:
+        raise HTTPException(400, "비밀번호는 6자 이상이어야 합니다.")
+    if len(name) < 2:
+        raise HTTPException(400, "이름을 입력해주세요.")
+
+    invite_code_required = os.environ.get("ADMIN_INVITE_CODE", "")
+    if invite_code_required and (payload.invite_code or "") != invite_code_required:
+        raise HTTPException(403, "초대 코드가 맞지 않습니다. 본사에 문의해주세요.")
+
+    with conn() as c:
+        dup = c.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if dup:
+            raise HTTPException(409, "이미 사용 중인 아이디입니다.")
+        # 첫 가입자는 admin, 나머지는 manager
+        n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        role = "admin" if n == 0 else "manager"
+        cur = c.execute("INSERT INTO users(username,password_hash,name,role) VALUES(?,?,?,?)",
+                        (username, hash_pw(password), name, role))
+        new_id = cur.lastrowid
+    # 가입 즉시 로그인 처리
+    request.session["user_id"] = new_id
+    request.session["username"] = username
+    request.session["role"] = role
+    return {"ok": True, "id": new_id, "username": username, "name": name, "role": role}
+
+@app.get("/api/signup-config")
+def signup_config():
+    """가입 화면이 초대 코드를 보여줄지 결정."""
+    return {"invite_required": bool(os.environ.get("ADMIN_INVITE_CODE", ""))}
+
+# ----- 사용자 관리 (admin 전용) -----
+@app.get("/api/users")
+def list_users(user: dict = Depends(require_login)):
+    if user.get("role") != "admin":
+        raise HTTPException(403, "관리자 전용입니다.")
+    with conn() as c:
+        return rows(c.execute(
+            "SELECT id, username, name, role, company_id, created_at FROM users ORDER BY id"
+        ).fetchall())
+
+class UserUpdateIn(BaseModel):
+    role: Optional[str] = None
+    name: Optional[str] = None
+    new_password: Optional[str] = None
+
+@app.put("/api/users/{uid}")
+def update_user(uid: int, payload: UserUpdateIn, user: dict = Depends(require_login)):
+    if user.get("role") != "admin":
+        raise HTTPException(403, "관리자 전용입니다.")
+    fields, vals = [], []
+    if payload.role and payload.role in ("admin", "manager"):
+        fields.append("role=?"); vals.append(payload.role)
+    if payload.name is not None:
+        fields.append("name=?"); vals.append(payload.name)
+    if payload.new_password:
+        if len(payload.new_password) < 6:
+            raise HTTPException(400, "비밀번호는 6자 이상이어야 합니다.")
+        fields.append("password_hash=?"); vals.append(hash_pw(payload.new_password))
+    if not fields:
+        return {"ok": True}
+    vals.append(uid)
+    with conn() as c:
+        c.execute(f"UPDATE users SET {','.join(fields)} WHERE id=?", vals)
+    return {"ok": True}
+
+@app.delete("/api/users/{uid}")
+def delete_user(uid: int, user: dict = Depends(require_login)):
+    if user.get("role") != "admin":
+        raise HTTPException(403, "관리자 전용입니다.")
+    if uid == user["id"]:
+        raise HTTPException(400, "본인 계정은 삭제할 수 없습니다.")
+    with conn() as c:
+        c.execute("DELETE FROM users WHERE id=?", (uid,))
+    return {"ok": True}
+
+# ----- 워커(폰) 본인인증 -----
+def normalize_phone(phone: str) -> str:
+    return ''.join(ch for ch in (phone or "") if ch.isdigit())
+
+@app.post("/api/worker/identify")
+def worker_identify(payload: WorkerIdentifyIn, request: Request):
+    """폰번호로 본인 확인. 일치하면 세션에 worker_id 저장."""
+    digits = normalize_phone(payload.phone)
+    if len(digits) < 10:
+        raise HTTPException(400, "전화번호를 010-XXXX-XXXX 형식으로 입력해주세요.")
+    with conn() as c:
+        rows_ = c.execute(
+            "SELECT id, name, phone, worker_type, job_role FROM workers").fetchall()
+    me = None
+    for r in rows_:
+        if normalize_phone(r["phone"]) == digits:
+            me = dict(r); break
+    if not me:
+        raise HTTPException(404, "등록된 번호가 아닙니다. 신규라면 가입을 먼저 해주세요.")
+    request.session["worker_id"] = me["id"]
+    request.session["worker_name"] = me["name"]
+    return {"ok": True, **me}
+
+@app.get("/api/worker/me")
+def worker_me(request: Request):
+    wid = request.session.get("worker_id")
+    if not wid:
+        return {"identified": False}
+    with conn() as c:
+        r = c.execute(
+            "SELECT id, name, phone, worker_type, job_role FROM workers WHERE id=?",
+            (wid,)).fetchone()
+    if not r:
+        request.session.pop("worker_id", None)
+        request.session.pop("worker_name", None)
+        return {"identified": False}
+    return {"identified": True, **dict(r)}
+
+@app.post("/api/worker/logout")
+def worker_logout(request: Request):
+    request.session.pop("worker_id", None)
+    request.session.pop("worker_name", None)
+    return {"ok": True}
 
 @app.post("/api/me/password")
 def change_password(payload: PasswordChangeIn, user: dict = Depends(require_login)):
@@ -509,7 +649,14 @@ def copy_deployments(src_kind: str = Body(...), dst_kind: str = Body(...), date:
 
 # ----- Clock in/out (mobile, GPS) -----
 @app.post("/api/clock")
-def clock(payload: ClockIn):
+def clock(payload: ClockIn, request: Request):
+    # 세션의 worker_id 만 신뢰. 본인인증 안 됐으면 거부.
+    session_wid = request.session.get("worker_id")
+    if not session_wid:
+        raise HTTPException(401, "본인인증이 필요합니다. /m 에서 전화번호로 인증해주세요.")
+    # body 의 worker_id 는 무시하고 세션값으로 강제
+    payload.worker_id = session_wid
+
     with conn() as c:
         site = c.execute("SELECT * FROM sites WHERE id=?", (payload.site_id,)).fetchone()
         if not site:
@@ -701,6 +848,10 @@ def register_page():
 @app.get("/login")
 def login_page():
     return FileResponse(os.path.join(FRONTEND_DIR, "login.html"))
+
+@app.get("/signup")
+def signup_page():
+    return FileResponse(os.path.join(FRONTEND_DIR, "signup.html"))
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
