@@ -12,31 +12,68 @@
 </head>
 <body>
 
-<nav class="topnav">
-  <div class="topnav-inner">
-    <div class="brand">GW 건설관리</div>
-    <div class="nav-links" id="nav-links">
-      <a class="nav-link" href="#/morning">아침요약</a>
-      <a class="nav-link" href="#/dashboard">대시보드</a>
-      <a class="nav-link" href="#/projects">프로젝트</a>
-      <a class="nav-link" href="#/board">배치 보드</a>
-      <a class="nav-link" href="#/workers">직원</a>
-      <a class="nav-link" href="#/sites">현장</a>
-      <a class="nav-link" href="#/map">지도</a>
-      <a class="nav-link" href="#/timeline">타임라인</a>
-      <a class="nav-link" href="#/lens">3시점</a>
-      <a class="nav-link" href="#/processes">프로세스</a>
-      <a class="nav-link" href="#/graph">그래프</a>
-      <a class="nav-link" href="#/inbox" style="position:relative">📬 알림 <span id="notif-badge" style="display:none; background:#e0464d; color:#fff; border-radius:10px; padding:1px 6px; font-size:10px; margin-left:2px;"></span></a>
-      <a class="nav-link" href="#/users" id="nav-users" style="display:none">사용자</a>
-      <a class="nav-link" href="/m" target="_blank">모바일 출퇴근 ↗</a>
-      <a class="nav-link" href="/register" target="_blank">직원 가입 ↗</a>
+<aside class="sidebar" id="sidebar">
+  <div class="sb-brand">
+    <span class="logo">GW</span>
+    <div>
+      <div class="title">건설관리</div>
+      <div class="sub" id="sb-now"></div>
     </div>
-    <div class="right" id="now-time"></div>
   </div>
-</nav>
 
-<div id="app" class="page"></div>
+  <nav class="sb-nav">
+    <div class="sb-section">운영</div>
+    <a class="sb-item" href="#/morning">🌅 아침 요약</a>
+    <a class="sb-item" href="#/dashboard">📊 대시보드</a>
+    <a class="sb-item" href="#/projects">📋 프로젝트</a>
+    <a class="sb-item" href="#/board">🎯 배치 보드</a>
+
+    <div class="sb-section">데이터</div>
+    <a class="sb-item" href="#/workers">👷 직원</a>
+    <a class="sb-item" href="#/sites">🏗 현장</a>
+    <a class="sb-item" href="#/map">🗺 지도</a>
+
+    <div class="sb-section">분석 (디지털 트윈)</div>
+    <a class="sb-item" href="#/lens">🔄 3시점</a>
+    <a class="sb-item" href="#/timeline">📈 타임라인</a>
+    <a class="sb-item" href="#/processes">⚙️ 프로세스</a>
+    <a class="sb-item" href="#/graph">🔗 그래프</a>
+
+    <div class="sb-section">입찰 (나라장터)</div>
+    <a class="sb-item" href="#/procurement">📑 공고 분석</a>
+    <a class="sb-item" href="#/my-bids">🏆 우리 입찰</a>
+    <a class="sb-item" href="#/competitors">👁 경쟁사</a>
+
+    <div class="sb-section">관리</div>
+    <a class="sb-item" href="#/inbox">
+      <span>📬 알림</span>
+      <span id="notif-badge" class="sb-badge" style="display:none"></span>
+    </a>
+    <a class="sb-item admin-only" href="#/users" id="nav-users" style="display:none">👥 사용자</a>
+  </nav>
+
+  <div class="sb-foot">
+    <div class="sb-share">
+      <div class="lbl">🔗 공유 링크</div>
+      <a href="/m" target="_blank">📱 폰 출퇴근 (직원용) ↗</a>
+      <a href="/register" target="_blank">✍️ 신규 직원 가입 ↗</a>
+    </div>
+    <div class="sb-user" id="sb-user">
+      <div class="avatar">?</div>
+      <div class="info">
+        <div class="name">로딩…</div>
+        <div class="role">—</div>
+      </div>
+      <a href="#" class="logout" onclick="logout(); return false;" title="로그아웃">⏻</a>
+    </div>
+  </div>
+
+  <button class="sb-toggle" id="sb-toggle" title="사이드바 토글">☰</button>
+</aside>
+
+<main class="main">
+  <div id="app" class="page"></div>
+</main>
 
 <div id="modal-root"></div>
 

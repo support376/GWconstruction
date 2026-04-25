@@ -48,7 +48,8 @@ async function geocodeAddress(addr) {
 
 function tickClock() {
   const d = new Date();
-  $('#now-time').textContent = d.toLocaleString('ko-KR', { hour12: false });
+  const el = $('#sb-now');
+  if (el) el.textContent = d.toLocaleString('ko-KR', { hour12: false }).replace(/\..*/, '');
 }
 setInterval(tickClock, 1000); tickClock();
 
@@ -84,10 +85,12 @@ function modal(title, bodyHtml, onSave) {
 const routes = {};
 function route(path, fn) { routes[path] = fn; }
 async function navigate() {
-  const hash = location.hash.replace(/^#/, '') || '/dashboard';
-  $$('.nav-link').forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + hash));
-  const fn = routes[hash] || routes['/dashboard'];
+  const hash = location.hash.replace(/^#/, '') || '/morning';
+  $$('.sb-item').forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + hash));
+  const fn = routes[hash] || routes['/morning'];
   $('#app').innerHTML = '<div class="card card-pad">로딩 중…</div>';
+  // 모바일에서 사이드바 자동 닫기
+  document.getElementById('sidebar')?.classList.remove('open');
   try { await fn(); } catch (e) { $('#app').innerHTML = '<div class="card card-pad">오류: ' + e + '</div>'; }
 }
 window.addEventListener('hashchange', navigate);
@@ -1539,6 +1542,238 @@ route('/users', async () => {
 });
 
 // ============================================================
+// 나라장터 입찰 분석 (Phase 6)
+// ============================================================
+let procFilter = { review_status: '', q: '', days_to_deadline: '' };
+
+function _daysFromNow(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Math.ceil((d - new Date()) / 86400000);
+}
+
+route('/procurement', async () => {
+  await renderProcurement();
+});
+
+async function renderProcurement() {
+  const dash = await api.get('/api/procurement/dashboard');
+  const params = new URLSearchParams();
+  if (procFilter.review_status) params.set('review_status', procFilter.review_status);
+  if (procFilter.q) params.set('q', procFilter.q);
+  if (procFilter.days_to_deadline) params.set('days_to_deadline', procFilter.days_to_deadline);
+  const tenders = await api.get('/api/procurement/tenders' + (params.toString() ? '?' + params : ''));
+  const k = dash.kpi;
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">📑 나라장터 공고 분석</div>
+        <div class="page-sub">놓치지 않게 — ${tenders.length}건 표시 · 신규 ${k.new_unreviewed} · 마감 3일내 ${k.deadline_3d} · 입찰 진행 ${k.bidding_count}</div>
+      </div>
+      <button class="btn btn-primary" id="sync-btn">🔄 새 공고 받아오기</button>
+    </div>
+
+    <div class="stat-grid">
+      <div class="stat warning"><div class="label">미검토 신규</div><div class="value">${k.new_unreviewed}</div><div class="delta">반드시 검토</div></div>
+      <div class="stat ${k.deadline_3d>0?'warning':''}"><div class="label">마감 3일 내</div><div class="value">${k.deadline_3d}</div><div class="delta">즉시 결정</div></div>
+      <div class="stat accent"><div class="label">입찰 진행 중</div><div class="value">${k.bidding_count}</div></div>
+      <div class="stat success"><div class="label">최근 90일 낙찰률</div><div class="value">${k.win_rate_90d}%</div><div class="delta">${k.my_bids_total_90d}건 응찰</div></div>
+    </div>
+
+    <div class="proc-filter-bar">
+      <input id="pf-q" type="text" placeholder="공고명·발주기관 검색" value="${procFilter.q}" style="min-width:200px">
+      <span class="pill ${!procFilter.review_status?'active':''}" data-rs="">전체</span>
+      <span class="pill ${procFilter.review_status==='new'?'active':''}" data-rs="new">신규</span>
+      <span class="pill ${procFilter.review_status==='interested'?'active':''}" data-rs="interested">관심</span>
+      <span class="pill ${procFilter.review_status==='bidding'?'active':''}" data-rs="bidding">입찰 중</span>
+      <span class="pill ${procFilter.review_status==='skipped'?'active':''}" data-rs="skipped">패스</span>
+      <span class="pill ${procFilter.review_status==='won'?'active':''}" data-rs="won">낙찰</span>
+      <span class="pill ${procFilter.review_status==='lost'?'active':''}" data-rs="lost">탈락</span>
+      <select id="pf-deadline">
+        <option value="">전체 기간</option>
+        <option value="3" ${procFilter.days_to_deadline=='3'?'selected':''}>마감 3일 내</option>
+        <option value="7" ${procFilter.days_to_deadline=='7'?'selected':''}>마감 7일 내</option>
+        <option value="14" ${procFilter.days_to_deadline=='14'?'selected':''}>마감 14일 내</option>
+      </select>
+    </div>
+
+    <div id="tender-list">
+      ${tenders.length === 0 ? '<div class="card card-pad" style="text-align:center; color:var(--text-muted)">조건에 맞는 공고 없음. 위 "새 공고 받아오기"로 동기화해보세요.</div>' :
+        tenders.map(tenderCardHtml).join('')}
+    </div>
+  `;
+
+  $('#sync-btn').onclick = async () => {
+    $('#sync-btn').textContent = '동기화 중…';
+    $('#sync-btn').disabled = true;
+    try {
+      const r = await fetch('/api/procurement/sync', { method:'POST' }).then(r => r.json());
+      if (r.mode === 'mock') alert(`샘플 ${r.inserted}건 추가됨 (총 ${r.total_now}건). 실제 나라장터 연동은 G2B_API_KEY 환경변수 필요.`);
+      else alert(`${r.inserted||0}건 추가됨`);
+    } catch (e) { alert('실패: ' + e); }
+    renderProcurement();
+  };
+  $('#pf-q').oninput = e => { procFilter.q = e.target.value; clearTimeout(window._pfTo); window._pfTo = setTimeout(renderProcurement, 350); };
+  $('#pf-deadline').onchange = e => { procFilter.days_to_deadline = e.target.value; renderProcurement(); };
+  $$('.proc-filter-bar .pill').forEach(p => p.onclick = () => {
+    procFilter.review_status = p.dataset.rs; renderProcurement();
+  });
+  bindReviewPills();
+}
+
+function tenderCardHtml(t) {
+  const days = _daysFromNow(t.deadline);
+  let dlClass = '', dlLabel = '';
+  if (t.status === 'closed') { dlClass = 'closed'; dlLabel = '마감됨'; }
+  else if (days === null) { dlLabel = '-'; }
+  else if (days < 0) { dlClass = 'closed'; dlLabel = `${-days}일 지남`; }
+  else if (days <= 3) { dlClass = 'urgent'; dlLabel = `D-${days} 마감임박`; }
+  else if (days <= 7) { dlClass = 'soon'; dlLabel = `D-${days}`; }
+  else { dlLabel = `D-${days}`; }
+  const cardCls = (days !== null && days <= 3 && t.status==='open' ? 'deadline-urgent' :
+                   days !== null && days <= 7 && t.status==='open' ? 'deadline-soon' : '') +
+                  ' review-' + (t.review_status||'new');
+  return `<div class="tender-card ${cardCls}" data-tid="${t.id}">
+    <div>
+      <div class="title">${t.title}${t.raw_url?` <a href="${t.raw_url}" target="_blank" style="font-size:11px; color:var(--primary)">↗</a>`:''}</div>
+      <div class="org">${t.org_name||'-'} · ${t.category||'-'} · ${t.region||'-'}</div>
+      <div class="meta">
+        <span>마감 <b>${(t.deadline||'').slice(0,16).replace('T',' ')}</b></span>
+        ${t.license_required ? `<span>면허: ${t.license_required}</span>` : ''}
+        ${t.award_company ? `<span style="color:#a35907">낙찰: <b>${t.award_company}</b> ${fmtMoney(t.award_amount||0)}</span>` : ''}
+      </div>
+      <div class="review-pills">
+        <button class="review-pill ${t.review_status==='interested'?'active':''}" data-rs="interested" data-tid="${t.id}">⭐ 관심</button>
+        <button class="review-pill ${t.review_status==='bidding'?'active':''}" data-rs="bidding" data-tid="${t.id}">📝 입찰 진행</button>
+        <button class="review-pill skip ${t.review_status==='skipped'?'active':''}" data-rs="skipped" data-tid="${t.id}">패스</button>
+        ${t.review_status==='bidding' ? `<button class="review-pill win" data-rs="won" data-tid="${t.id}">✅ 낙찰</button><button class="review-pill lose" data-rs="lost" data-tid="${t.id}">❌ 탈락</button>` : ''}
+      </div>
+    </div>
+    <div style="text-align:right">
+      <div class="budget">${fmtMoney(t.budget||0)}</div>
+      <div class="deadline-tag ${dlClass}">${dlLabel}</div>
+    </div>
+    <div></div>
+  </div>`;
+}
+
+function bindReviewPills() {
+  $$('.review-pill').forEach(p => p.onclick = async (e) => {
+    e.stopPropagation();
+    const tid = +p.dataset.tid;
+    const rs = p.dataset.rs;
+    await api.post('/api/procurement/tender/'+tid+'/review', { review_status: rs });
+    renderProcurement();
+  });
+}
+
+route('/my-bids', async () => {
+  const bids = await api.get('/api/procurement/my-bids');
+  const won = bids.filter(b => b.result === 'won').length;
+  const total = bids.length;
+  const won_amt = bids.filter(b => b.result === 'won').reduce((s,b) => s + (b.bid_amount||0), 0);
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">🏆 우리 회사 입찰 이력</div>
+        <div class="page-sub">총 ${total}건 응찰 · ${won}건 낙찰 · 누적 낙찰액 ${fmtMoney(won_amt)}</div>
+      </div>
+    </div>
+    <div class="card">
+      <table class="table">
+        <thead><tr><th>공고</th><th>발주기관</th><th>법인</th><th style="text-align:right">응찰가</th><th style="text-align:right">낙찰가</th><th>결과</th><th>응찰일</th></tr></thead>
+        <tbody>
+          ${bids.length === 0 ? '<tr><td colspan="7" style="text-align:center; color:var(--text-muted)">응찰 이력 없음</td></tr>' :
+            bids.map(b => {
+              const result = b.result === 'won' ? '<span class="badge badge-green">✅ 낙찰</span>' :
+                             b.result === 'lost' ? '<span class="badge badge-red">❌ 탈락</span>' :
+                             b.result === 'cancelled' ? '<span class="badge badge-gray">취소</span>' :
+                             '<span class="badge badge-orange">대기</span>';
+              return `<tr>
+                <td><b>${b.tender_title||'#'+b.tender_id}</b></td>
+                <td>${b.org_name||'-'}</td>
+                <td>${b.company_name||'-'}</td>
+                <td style="text-align:right">${fmtMoney(b.bid_amount||0)}</td>
+                <td style="text-align:right">${b.award_amount?fmtMoney(b.award_amount):'-'}</td>
+                <td>${result}</td>
+                <td style="font-size:11px; color:var(--text-muted)">${(b.bid_at||'').slice(0,10)}</td>
+              </tr>`;
+            }).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+});
+
+route('/competitors', async () => {
+  const comps = await api.get('/api/procurement/competitors');
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">👁 경쟁사 추적</div>
+        <div class="page-sub">${comps.length}개 회사 모니터링 — 어디 입찰하는지 감지</div>
+      </div>
+      <button class="btn btn-primary" id="add-comp">+ 경쟁사 추가</button>
+    </div>
+    <div class="card">
+      <table class="table">
+        <thead><tr><th>회사명</th><th>사업자번호</th><th>비고</th><th>응찰 감지</th><th>최근</th><th></th></tr></thead>
+        <tbody>
+          ${comps.length === 0 ? '<tr><td colspan="6" style="text-align:center; color:var(--text-muted)">경쟁사 등록 후 자동 추적됩니다</td></tr>' :
+            comps.map(c => `<tr>
+              <td><b>${c.name}</b></td>
+              <td>${c.business_no||'-'}</td>
+              <td style="font-size:12px; color:var(--text-muted)">${c.note||''}</td>
+              <td><b>${c.bid_count||0}건</b></td>
+              <td style="font-size:11px; color:var(--text-muted)">${c.last_seen?c.last_seen.slice(0,10):'-'}</td>
+              <td>
+                <button class="btn btn-sm" data-view="${c.id}">활동 보기</button>
+                <button class="btn btn-sm btn-danger" data-del="${c.id}">삭제</button>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div id="comp-detail" style="margin-top:16px"></div>
+  `;
+  $('#add-comp').onclick = () => {
+    const name = prompt('경쟁사 회사명:');
+    if (!name) return;
+    const biz = prompt('사업자번호 (선택, 예: 123-45-67890):') || '';
+    const note = prompt('메모 (선택):') || '';
+    api.post('/api/procurement/competitors', { name, business_no: biz, note }).then(navigate);
+  };
+  $$('[data-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('삭제하시겠습니까?')) return;
+    await api.del('/api/procurement/competitors/'+b.dataset.del);
+    navigate();
+  });
+  $$('[data-view]').forEach(b => b.onclick = async () => {
+    const data = await api.get('/api/procurement/competitors/'+b.dataset.view+'/activity');
+    $('#comp-detail').innerHTML = `
+      <div class="card">
+        <div class="card-head"><h3>${data.competitor.name} — 응찰 ${data.bids.length}건</h3></div>
+        <table class="table">
+          <thead><tr><th>공고</th><th>발주기관</th><th style="text-align:right">예산</th><th style="text-align:right">응찰가</th><th>결과</th><th>감지일</th></tr></thead>
+          <tbody>
+            ${data.bids.length === 0 ? '<tr><td colspan="6" style="text-align:center; color:var(--text-muted)">감지된 응찰 없음</td></tr>' :
+              data.bids.map(b => `<tr>
+                <td><b>${b.title}</b></td>
+                <td>${b.org_name||'-'}</td>
+                <td style="text-align:right">${fmtMoney(b.budget||0)}</td>
+                <td style="text-align:right">${fmtMoney(b.bid_amount||0)}</td>
+                <td>${b.result==='won'?'<span class="badge badge-green">낙찰</span>':b.result==='lost'?'<span class="badge badge-red">탈락</span>':'<span class="badge badge-gray">미정</span>'}</td>
+                <td style="font-size:11px; color:var(--text-muted)">${(b.detected_at||'').slice(0,10)}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+  });
+});
+
+// ============================================================
 // 시작 — 로그인 체크 후 진입
 // ============================================================
 (async () => {
@@ -1548,18 +1783,22 @@ route('/users', async () => {
       location.href = '/login';
       return;
     }
-    const right = document.querySelector('.topnav .right');
-    if (right) {
-      const roleLabel = me.role === 'admin' ? '관리자' : '매니저';
-      right.innerHTML = `
-        <span style="margin-right:10px">${me.name || me.username} <span style="opacity:0.7">(${roleLabel})</span></span>
-        <a href="#" onclick="logout(); return false;" style="color:rgba(255,255,255,0.85); text-decoration: underline; font-size: 12px;">로그아웃</a>
-      `;
+    const roleLabel = me.role === 'admin' ? '관리자' : '매니저';
+    const sbUser = document.getElementById('sb-user');
+    if (sbUser) {
+      const initial = (me.name || me.username || '?').slice(0,1).toUpperCase();
+      sbUser.querySelector('.avatar').textContent = initial;
+      sbUser.querySelector('.info .name').textContent = me.name || me.username;
+      sbUser.querySelector('.info .role').textContent = roleLabel + ' · ' + me.username;
     }
     if (me.role === 'admin') {
       const navUsers = document.getElementById('nav-users');
       if (navUsers) navUsers.style.display = '';
     }
+    // 사이드바 토글 (모바일)
+    document.getElementById('sb-toggle')?.addEventListener('click', () => {
+      document.getElementById('sidebar')?.classList.toggle('open');
+    });
   } catch (e) {
     location.href = '/login';
     return;

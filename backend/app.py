@@ -81,6 +81,69 @@ CREATE TABLE IF NOT EXISTS deployments (
   note TEXT,
   UNIQUE(worker_id, date, kind)
 );
+-- 나라장터 입찰 분석 (Phase 6)
+CREATE TABLE IF NOT EXISTS tenders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_no TEXT UNIQUE,                  -- 공고번호 (나라장터)
+  title TEXT NOT NULL,
+  org_name TEXT,                          -- 발주기관
+  category TEXT,                          -- 공사 종류 (전기·토목·건축·기계설비 등)
+  license_required TEXT,                  -- 필요 면허 (텍스트)
+  budget INTEGER DEFAULT 0,               -- 추정가격
+  region TEXT,                            -- 지역
+  site_address TEXT,
+  posted_at TEXT,                         -- 공고일
+  deadline TEXT,                          -- 입찰 마감
+  bid_open_at TEXT,                       -- 개찰일
+  contact TEXT,
+  status TEXT DEFAULT 'open',             -- 'open'|'closed'|'awarded'|'cancelled'
+  award_company TEXT,                     -- 낙찰사
+  award_amount INTEGER,
+  source TEXT DEFAULT 'g2b',              -- 'g2b'|'manual'|'mock'
+  raw_url TEXT,                           -- 원본 공고 URL
+  raw_data TEXT,                          -- 원본 JSON
+  synced_at TEXT DEFAULT (datetime('now')),
+  review_status TEXT DEFAULT 'new',       -- 'new'|'interested'|'bidding'|'skipped'|'won'|'lost'
+  review_note TEXT,
+  reviewed_by INTEGER REFERENCES users(id),
+  reviewed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS tender_status ON tenders(status, deadline);
+CREATE INDEX IF NOT EXISTS tender_review ON tenders(review_status);
+
+CREATE TABLE IF NOT EXISTS my_bids (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id INTEGER REFERENCES tenders(id),
+  company_id INTEGER REFERENCES companies(id),
+  bid_amount INTEGER,
+  bid_at TEXT DEFAULT (datetime('now')),
+  result TEXT DEFAULT 'pending',          -- 'pending'|'won'|'lost'|'cancelled'
+  result_at TEXT,
+  note TEXT,
+  submitted_by INTEGER REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS competitors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  business_no TEXT UNIQUE,
+  note TEXT,
+  watched INTEGER DEFAULT 1,
+  added_at TEXT DEFAULT (datetime('now')),
+  added_by INTEGER REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS competitor_bids (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  competitor_id INTEGER REFERENCES competitors(id),
+  tender_id INTEGER REFERENCES tenders(id),
+  bid_amount INTEGER,
+  result TEXT,                            -- 'won'|'lost'|'unknown'
+  detected_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(competitor_id, tender_id)
+);
+CREATE INDEX IF NOT EXISTS comp_bid_detect ON competitor_bids(detected_at);
+
 CREATE TABLE IF NOT EXISTS process_instances (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   workflow TEXT NOT NULL,                  -- 'sales'|'hr_onboarding'|'daily_ops'|...
@@ -562,6 +625,35 @@ def _auto_seed_if_empty():
     except Exception as e:
         print(f"[startup] auto-seed skipped: {e}")
 
+def _seed_mock_competitor_bids():
+    """경쟁사 + 일부 입찰 기록 시연 데이터."""
+    try:
+        with conn() as c:
+            if c.execute("SELECT COUNT(*) FROM competitors").fetchone()[0] > 0:
+                return
+            samples = [
+                ("(주)대형건설", "111-22-33333", "원도급사. 대형 토목 위주."),
+                ("진양건설(주)", "222-33-44444", "전문건설업, 콘크리트 강함."),
+                ("(주)녹색이엔지", "333-44-55555", "기계설비 전문."),
+            ]
+            for name, biz, note in samples:
+                c.execute("INSERT INTO competitors(name,business_no,note) VALUES(?,?,?)",
+                          (name, biz, note))
+            # 가능하면 mock tender 와 매핑
+            tids = [r[0] for r in c.execute("SELECT id FROM tenders LIMIT 5").fetchall()]
+            cids = [r[0] for r in c.execute("SELECT id FROM competitors").fetchall()]
+            if tids and cids:
+                for ti, t in enumerate(tids[:3]):
+                    cid = cids[ti % len(cids)]
+                    try:
+                        c.execute(
+                            "INSERT OR IGNORE INTO competitor_bids(competitor_id,tender_id,bid_amount,result) "
+                            "VALUES(?,?,?,?)",
+                            (cid, t, 800000000 + ti*100000000, 'unknown'))
+                    except Exception: pass
+    except Exception as e:
+        print(f"[mock_competitors] {e}")
+
 @app.on_event("startup")
 def _startup():
     init_db()
@@ -569,6 +661,13 @@ def _startup():
     _auto_seed_if_empty()
     _backfill_relations()
     _backfill_processes()
+    # 시연용 나라장터 mock — DB 비어있을 때만
+    try:
+        with conn() as c:
+            if c.execute("SELECT COUNT(*) FROM tenders").fetchone()[0] == 0:
+                _seed_mock_tenders()
+                _seed_mock_competitor_bids()
+    except Exception as e: print(f"[startup mock tenders] {e}")
     _evaluate_rules()
 
 # ----- Auth -----
@@ -1508,6 +1607,304 @@ def _backfill_processes():
     except Exception as e:
         print(f"[backfill_processes] {e}")
 
+# ----- 나라장터 입찰 분석 (Phase 6) -----
+class TenderReviewIn(BaseModel):
+    review_status: str
+    review_note: Optional[str] = None
+
+class MyBidIn(BaseModel):
+    tender_id: int
+    company_id: Optional[int] = None
+    bid_amount: int
+    note: Optional[str] = None
+
+class CompetitorIn(BaseModel):
+    name: str
+    business_no: Optional[str] = None
+    note: Optional[str] = None
+
+@app.get("/api/procurement/tenders")
+def list_tenders(
+    review_status: Optional[str] = None,
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    days_to_deadline: Optional[int] = None,
+    _: dict = Depends(require_login),
+):
+    sql = "SELECT * FROM tenders WHERE 1=1"
+    args = []
+    if review_status:
+        sql += " AND review_status=?"; args.append(review_status)
+    if status:
+        sql += " AND status=?"; args.append(status)
+    if q:
+        sql += " AND (title LIKE ? OR org_name LIKE ?)"
+        args += [f"%{q}%", f"%{q}%"]
+    if days_to_deadline is not None:
+        sql += " AND date(deadline) BETWEEN date('now') AND date('now', '+' || ? || ' days')"
+        args.append(days_to_deadline)
+    sql += " ORDER BY deadline ASC NULLS LAST LIMIT 200"
+    # SQLite는 NULLS LAST 미지원 — workaround
+    sql = sql.replace("ASC NULLS LAST", "")
+    sql = sql.replace("ORDER BY deadline",
+                       "ORDER BY (CASE WHEN deadline IS NULL THEN 1 ELSE 0 END), deadline")
+    with conn() as c:
+        return rows(c.execute(sql, args).fetchall())
+
+@app.get("/api/procurement/tender/{tid}")
+def get_tender(tid: int, _: dict = Depends(require_login)):
+    with conn() as c:
+        t = c.execute("SELECT * FROM tenders WHERE id=?", (tid,)).fetchone()
+        if not t:
+            raise HTTPException(404, "tender not found")
+        my_bids = rows(c.execute(
+            "SELECT mb.*, comp.name AS company_name FROM my_bids mb "
+            "LEFT JOIN companies comp ON mb.company_id=comp.id WHERE mb.tender_id=?",
+            (tid,)).fetchall())
+        comp_bids = rows(c.execute(
+            "SELECT cb.*, c.name AS competitor_name FROM competitor_bids cb "
+            "JOIN competitors c ON cb.competitor_id=c.id WHERE cb.tender_id=?",
+            (tid,)).fetchall())
+    return {"tender": dict(t), "my_bids": my_bids, "competitor_bids": comp_bids}
+
+@app.post("/api/procurement/tender/{tid}/review")
+def review_tender(tid: int, payload: TenderReviewIn, user: dict = Depends(require_login)):
+    valid = ['new', 'interested', 'bidding', 'skipped', 'won', 'lost']
+    if payload.review_status not in valid:
+        raise HTTPException(400, "invalid review status")
+    with conn() as c:
+        t = c.execute("SELECT title, review_status FROM tenders WHERE id=?", (tid,)).fetchone()
+        if not t:
+            raise HTTPException(404, "tender not found")
+        c.execute(
+            "UPDATE tenders SET review_status=?, review_note=?, reviewed_by=?, reviewed_at=datetime('now') WHERE id=?",
+            (payload.review_status, payload.review_note, user["id"], tid)
+        )
+    emit_event("TenderReviewed",
+               actors={"user_id": user["id"]},
+               payload={"tender_id": tid, "title": t["title"],
+                        "from": t["review_status"], "to": payload.review_status,
+                        "note": payload.review_note},
+               created_by=user["id"], source="admin_ui")
+    return {"ok": True}
+
+@app.post("/api/procurement/my-bids")
+def add_my_bid(payload: MyBidIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        t = c.execute("SELECT title FROM tenders WHERE id=?", (payload.tender_id,)).fetchone()
+        if not t: raise HTTPException(404, "tender not found")
+        cur = c.execute(
+            "INSERT INTO my_bids(tender_id,company_id,bid_amount,note,submitted_by) "
+            "VALUES(?,?,?,?,?)",
+            (payload.tender_id, payload.company_id, payload.bid_amount, payload.note, user["id"])
+        )
+        c.execute("UPDATE tenders SET review_status='bidding' WHERE id=? AND review_status IN ('new','interested')",
+                  (payload.tender_id,))
+    emit_event("BidSubmitted",
+               actors={"user_id": user["id"], "company_id": payload.company_id},
+               payload={"tender_id": payload.tender_id, "title": t["title"],
+                        "bid_amount": payload.bid_amount},
+               financial={"amount": payload.bid_amount, "account": f"입찰응찰/{t['title']}",
+                          "kind": "bid"},
+               created_by=user["id"], source="admin_ui")
+    return {"id": cur.lastrowid}
+
+@app.get("/api/procurement/my-bids")
+def list_my_bids(_: dict = Depends(require_login)):
+    with conn() as c:
+        return rows(c.execute(
+            """SELECT mb.*, t.title AS tender_title, t.org_name, t.deadline,
+                      t.status AS tender_status, t.award_company, t.award_amount,
+                      comp.name AS company_name
+               FROM my_bids mb JOIN tenders t ON mb.tender_id=t.id
+               LEFT JOIN companies comp ON mb.company_id=comp.id
+               ORDER BY mb.bid_at DESC"""
+        ).fetchall())
+
+@app.get("/api/procurement/competitors")
+def list_competitors(_: dict = Depends(require_login)):
+    with conn() as c:
+        comps = rows(c.execute("SELECT * FROM competitors ORDER BY name").fetchall())
+        for c_ in comps:
+            cnt = c.execute(
+                "SELECT COUNT(*), MAX(detected_at) FROM competitor_bids WHERE competitor_id=?",
+                (c_['id'],)).fetchone()
+            c_['bid_count'] = cnt[0]
+            c_['last_seen'] = cnt[1]
+    return comps
+
+@app.post("/api/procurement/competitors")
+def add_competitor(payload: CompetitorIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        try:
+            cur = c.execute(
+                "INSERT INTO competitors(name, business_no, note, added_by) VALUES(?,?,?,?)",
+                (payload.name, payload.business_no, payload.note, user["id"])
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "이미 등록된 사업자번호입니다")
+    return {"id": cur.lastrowid}
+
+@app.delete("/api/procurement/competitors/{cid}")
+def delete_competitor(cid: int, _: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute("DELETE FROM competitor_bids WHERE competitor_id=?", (cid,))
+        c.execute("DELETE FROM competitors WHERE id=?", (cid,))
+    return {"ok": True}
+
+@app.get("/api/procurement/competitors/{cid}/activity")
+def competitor_activity(cid: int, _: dict = Depends(require_login)):
+    with conn() as c:
+        comp = c.execute("SELECT * FROM competitors WHERE id=?", (cid,)).fetchone()
+        if not comp: raise HTTPException(404, "competitor not found")
+        bids = rows(c.execute(
+            """SELECT cb.*, t.title, t.org_name, t.budget, t.deadline, t.status AS tender_status,
+                      t.award_company, t.award_amount
+               FROM competitor_bids cb JOIN tenders t ON cb.tender_id=t.id
+               WHERE cb.competitor_id=? ORDER BY cb.detected_at DESC""",
+            (cid,)).fetchall())
+    return {"competitor": dict(comp), "bids": bids}
+
+@app.get("/api/procurement/dashboard")
+def procurement_dashboard(_: dict = Depends(require_login)):
+    """대표용 종합 대시보드 — 놓친 게 없는지 한눈에."""
+    today = date.today().isoformat()
+    with conn() as c:
+        # 카운터
+        new_unreviewed = c.execute(
+            "SELECT COUNT(*) FROM tenders WHERE review_status='new' AND status='open'").fetchone()[0]
+        deadline_3d = c.execute(
+            "SELECT COUNT(*) FROM tenders WHERE status='open' AND review_status IN ('new','interested') "
+            "AND date(deadline) BETWEEN date('now') AND date('now','+3 days')").fetchone()[0]
+        bidding_count = c.execute(
+            "SELECT COUNT(*) FROM tenders WHERE review_status='bidding'").fetchone()[0]
+        won_30d = c.execute(
+            "SELECT COUNT(*) FROM tenders WHERE review_status='won' AND reviewed_at >= date('now','-30 days')"
+        ).fetchone()[0]
+        lost_30d = c.execute(
+            "SELECT COUNT(*) FROM tenders WHERE review_status='lost' AND reviewed_at >= date('now','-30 days')"
+        ).fetchone()[0]
+        # 마감 임박 + 미검토
+        urgent = rows(c.execute(
+            "SELECT id, title, org_name, budget, deadline, review_status FROM tenders "
+            "WHERE status='open' AND review_status='new' "
+            "AND date(deadline) BETWEEN date('now') AND date('now','+7 days') "
+            "ORDER BY deadline ASC LIMIT 20").fetchall())
+        # 우리가 관심 표시한 진행 중 공고
+        interested = rows(c.execute(
+            "SELECT id, title, org_name, budget, deadline FROM tenders "
+            "WHERE review_status='interested' AND status='open' ORDER BY deadline ASC LIMIT 20"
+        ).fetchall())
+        # 최근 경쟁사 활동
+        competitor_recent = rows(c.execute(
+            """SELECT cb.*, c.name AS competitor_name, t.title AS tender_title,
+                      t.org_name, t.budget
+               FROM competitor_bids cb JOIN competitors c ON cb.competitor_id=c.id
+               JOIN tenders t ON cb.tender_id=t.id
+               WHERE cb.detected_at >= datetime('now','-30 days')
+               ORDER BY cb.detected_at DESC LIMIT 30"""
+        ).fetchall())
+        # 낙찰률 최근 90일
+        my_bids_total = c.execute(
+            "SELECT COUNT(*) FROM my_bids WHERE bid_at >= date('now','-90 days')").fetchone()[0]
+        my_bids_won = c.execute(
+            "SELECT COUNT(*) FROM my_bids WHERE result='won' AND bid_at >= date('now','-90 days')").fetchone()[0]
+    return {
+        "as_of": today,
+        "kpi": {
+            "new_unreviewed": new_unreviewed,
+            "deadline_3d": deadline_3d,
+            "bidding_count": bidding_count,
+            "won_30d": won_30d, "lost_30d": lost_30d,
+            "win_rate_90d": round(my_bids_won / my_bids_total * 100, 1) if my_bids_total else 0,
+            "my_bids_total_90d": my_bids_total,
+        },
+        "urgent_unreviewed": urgent,
+        "interested_pipeline": interested,
+        "competitor_recent": competitor_recent,
+    }
+
+# ---- 나라장터 sync (실제 OpenAPI 또는 mock) ----
+@app.post("/api/procurement/sync")
+def sync_tenders(_: dict = Depends(require_login)):
+    """나라장터 OpenAPI 에서 새 공고 가져오기.
+    환경변수 G2B_API_KEY 가 있으면 실제 API, 없으면 mock 데이터로 시연."""
+    api_key = os.environ.get("G2B_API_KEY", "").strip()
+    if not api_key:
+        return _seed_mock_tenders()
+    # TODO: 실제 나라장터 OpenAPI 호출
+    # https://www.data.go.kr/data/15129394/openapi.do (입찰공고정보)
+    # 키 받으면 여기에 requests.get(...) 구현
+    raise HTTPException(501, "G2B_API_KEY 환경변수 + 실제 API 호출 코드 필요. "
+                              "지금은 /api/procurement/sync-mock 으로 샘플 공고를 추가할 수 있습니다.")
+
+def _seed_mock_tenders():
+    """API 키 없을 때 시연용 샘플 공고."""
+    samples = [
+        {"tender_no":"20260425-001","title":"OO시 도로 보수 공사","org_name":"OO시청",
+         "category":"도로공사","license_required":"토목공사업",
+         "budget":850000000,"region":"서울","site_address":"서울 OO구",
+         "deadline":(date.today() + __import__('datetime').timedelta(days=2)).isoformat()+"T17:00",
+         "bid_open_at":(date.today() + __import__('datetime').timedelta(days=3)).isoformat()+"T10:00",
+         "raw_url":"https://www.g2b.go.kr/"},
+        {"tender_no":"20260425-002","title":"공공도서관 신축 — 골조 공사","org_name":"교육청",
+         "category":"건축공사","license_required":"건축공사업, 철근콘크리트공사업",
+         "budget":3200000000,"region":"경기","site_address":"수원시",
+         "deadline":(date.today() + __import__('datetime').timedelta(days=5)).isoformat()+"T17:00",
+         "raw_url":"https://www.g2b.go.kr/"},
+        {"tender_no":"20260425-003","title":"공항 격납고 설비 공사","org_name":"한국공항공사",
+         "category":"기계설비","license_required":"기계설비공사업",
+         "budget":1800000000,"region":"인천","site_address":"인천공항",
+         "deadline":(date.today() + __import__('datetime').timedelta(days=10)).isoformat()+"T17:00",
+         "raw_url":"https://www.g2b.go.kr/"},
+        {"tender_no":"20260425-004","title":"OO대학교 체육관 리모델링","org_name":"OO대학교",
+         "category":"건축공사","license_required":"건축공사업",
+         "budget":1500000000,"region":"서울","site_address":"서울 OO구",
+         "deadline":(date.today() + __import__('datetime').timedelta(days=1)).isoformat()+"T17:00",
+         "raw_url":"https://www.g2b.go.kr/"},
+        {"tender_no":"20260425-005","title":"하수처리장 증설 — 토목","org_name":"환경부",
+         "category":"토목공사","license_required":"토목공사업",
+         "budget":5500000000,"region":"부산","site_address":"부산 OO구",
+         "deadline":(date.today() + __import__('datetime').timedelta(days=14)).isoformat()+"T17:00",
+         "raw_url":"https://www.g2b.go.kr/"},
+        {"tender_no":"20260420-007","title":"군부대 막사 신축 — 1차","org_name":"국방부",
+         "category":"건축공사","license_required":"건축공사업",
+         "budget":2100000000,"region":"경기","site_address":"포천시",
+         "deadline":(date.today() - __import__('datetime').timedelta(days=2)).isoformat()+"T17:00",
+         "status":"closed",
+         "award_company":"(주)대형건설","award_amount":2050000000,
+         "raw_url":"https://www.g2b.go.kr/"},
+    ]
+    inserted = 0
+    with conn() as c:
+        for s in samples:
+            try:
+                c.execute(
+                    """INSERT OR IGNORE INTO tenders(tender_no,title,org_name,category,license_required,
+                       budget,region,site_address,posted_at,deadline,bid_open_at,
+                       status,award_company,award_amount,source,raw_url)
+                       VALUES(?,?,?,?,?,?,?,?,datetime('now'),?,?,?,?,?,?,?)""",
+                    (s.get("tender_no"), s.get("title"), s.get("org_name"), s.get("category"),
+                     s.get("license_required"), s.get("budget"), s.get("region"), s.get("site_address"),
+                     s.get("deadline"), s.get("bid_open_at"),
+                     s.get("status", "open"), s.get("award_company"), s.get("award_amount"),
+                     "mock", s.get("raw_url"))
+                )
+                if c.execute("SELECT changes()").fetchone()[0]:
+                    inserted += 1
+                    emit_event("TenderDiscovered",
+                               payload={"tender_no": s.get("tender_no"), "title": s.get("title"),
+                                        "org_name": s.get("org_name"), "budget": s.get("budget"),
+                                        "deadline": s.get("deadline")},
+                               source="system")
+            except Exception as e:
+                print(f"[mock_seed] {e}")
+    return {"ok": True, "mode": "mock", "inserted": inserted, "total_now": _count_tenders()}
+
+def _count_tenders():
+    with conn() as c:
+        return c.execute("SELECT COUNT(*) FROM tenders").fetchone()[0]
+
 # ----- Notifications + Rules Engine (Phase 5) -----
 def _upsert_notification(unique_key, rule_type, severity, title, message=None, link=None,
                          related_type=None, related_id=None):
@@ -1609,6 +2006,45 @@ def _evaluate_rules():
                     f"{s['name']} 현장 — 착공 60일 넘었는데 기성 청구 0회",
                     "기성 청구 사이클을 시작해야 자금 흐름이 정상화됩니다.",
                     '#/lens', 'Place', s['id'])
+
+            # === RULE 8~10: 나라장터 (Phase 6) ===
+            # 미검토 새 공고 (열린 것만)
+            for t in c.execute(
+                "SELECT id, title FROM tenders WHERE review_status='new' AND status='open' "
+                "AND date(deadline) >= date('now')").fetchall():
+                _upsert_notification(
+                    f"tender_unreviewed_{t['id']}", 'tender_unreviewed', 'info',
+                    f"새 공고 미검토: {t['title']}",
+                    "검토 후 입찰 여부 결정해주세요.", '#/procurement', 'Tender', t['id'])
+            c.execute("UPDATE notifications SET resolved=1, resolved_at=datetime('now') "
+                      "WHERE rule_type='tender_unreviewed' AND resolved=0 AND related_entity_id IN ("
+                      "  SELECT id FROM tenders WHERE review_status != 'new' OR status != 'open')")
+
+            # 마감 3일 이내 + 관심·신규 미결정
+            for t in c.execute(
+                "SELECT id, title, deadline FROM tenders WHERE status='open' "
+                "AND review_status IN ('new','interested') "
+                "AND date(deadline) BETWEEN date('now') AND date('now','+3 days')").fetchall():
+                _upsert_notification(
+                    f"tender_deadline_{t['id']}", 'tender_deadline', 'urgent',
+                    f"⏰ 입찰 마감 임박: {t['title']}",
+                    f"마감일 {t['deadline']} — 빠르게 결정 필요",
+                    '#/procurement', 'Tender', t['id'])
+            c.execute("UPDATE notifications SET resolved=1, resolved_at=datetime('now') "
+                      "WHERE rule_type='tender_deadline' AND resolved=0 AND related_entity_id IN ("
+                      "  SELECT id FROM tenders WHERE status != 'open' OR review_status NOT IN ('new','interested') "
+                      "  OR date(deadline) < date('now'))")
+
+            # 경쟁사 활동 감지 (24시간 내)
+            for r in c.execute(
+                """SELECT cb.competitor_id AS cid, c.name AS cname, t.title AS ttitle, t.id AS tid
+                   FROM competitor_bids cb JOIN competitors c ON cb.competitor_id=c.id
+                   JOIN tenders t ON cb.tender_id=t.id
+                   WHERE cb.detected_at >= datetime('now','-1 day')""").fetchall():
+                _upsert_notification(
+                    f"comp_bid_{r['cid']}_{r['tid']}", 'competitor_activity', 'info',
+                    f"👁 경쟁사 활동: {r['cname']} → {r['ttitle']}",
+                    "경쟁사가 입찰에 응찰했습니다.", '#/competitors', 'Tender', r['tid'])
 
             # === RULE 7: 자가가입 신규 (24시간 안) — 알림용 ===
             yesterday = (today_d - __import__('datetime').timedelta(days=1)).isoformat()
