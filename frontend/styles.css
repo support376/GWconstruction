@@ -610,6 +610,99 @@ body { display: flex; min-height: 100vh; }
 .proc-filter-bar .pill.active { background: var(--primary); color: #fff; border-color: var(--primary);}
 .proc-filter-bar .pill .cnt { opacity: 0.7; margin-left: 4px;}
 
+/* ===== Weekly Board ===== */
+.wb-controls {
+  display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap;
+}
+.wb-controls .nav-btn {
+  padding: 6px 12px; border: 1px solid var(--border); background: #fff;
+  border-radius: 6px; font-size: 13px; font-family: inherit; cursor: pointer;
+}
+.wb-controls .nav-btn:hover { border-color: var(--primary); color: var(--primary);}
+.wb-mode-tabs {
+  display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+}
+.wb-mode-tabs button {
+  padding: 6px 14px; border: none; background: #fff; font-family: inherit;
+  font-size: 12px; cursor: pointer; color: var(--text-muted);
+  border-right: 1px solid var(--border);
+}
+.wb-mode-tabs button:last-child { border-right: none;}
+.wb-mode-tabs button.active { background: var(--primary); color: #fff;}
+
+.wb-table-wrap { overflow-x: auto; background: #fff; border: 1px solid var(--border); border-radius: 10px;}
+.wb-grid {
+  display: grid; min-width: 100%;
+}
+.wb-grid .cell {
+  padding: 8px 10px; border-right: 1px solid #eef0f4; border-bottom: 1px solid #eef0f4;
+  font-size: 12px; min-height: 38px;
+}
+.wb-grid .cell.row-head {
+  font-weight: 600; background: #fafbfc;
+  position: sticky; left: 0; z-index: 2;
+}
+.wb-grid .cell.col-head {
+  background: #f7f8fa; font-weight: 700; color: var(--text-muted);
+  text-align: center; font-size: 11px; padding: 8px 4px;
+  position: sticky; top: 0; z-index: 1;
+}
+.wb-grid .cell.col-head.today { background: #e7f6ec; color: #15803d; }
+.wb-grid .cell.col-head.weekend { background: #fef0e0; color: #a35907; }
+.wb-grid .cell.day-cell { cursor: pointer; transition: background 0.1s;}
+.wb-grid .cell.day-cell:hover { background: #eef3fc; }
+.wb-grid .cell.day-cell.today { background: #f0f8f3; }
+.wb-grid .cell.day-cell.weekend { background: #fafbfc; }
+.wb-grid .cell.day-cell.assigned {
+  background: #eef3fc; color: #2a4a8a; font-weight: 600;
+}
+.wb-grid .cell.day-cell.assigned.weekend { background: #f5f0eb;}
+.wb-cell-empty { color: #c0c5d0; font-size: 11px;}
+.wb-cell-count {
+  font-size: 11px; color: var(--text-muted); margin-top: 1px;
+}
+
+.wb-edit-modal-list {
+  max-height: 240px; overflow-y: auto; margin-bottom: 12px;
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px;
+}
+.wb-edit-row {
+  padding: 6px 10px; cursor: pointer; border-radius: 4px;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.wb-edit-row:hover { background: #eef3fc;}
+.wb-edit-row .cur { font-size: 10.5px; color: var(--text-muted);}
+
+/* ===== Role-based dashboard cards ===== */
+.role-hero {
+  border-radius: 12px; padding: 22px 26px; margin-bottom: 16px; color: #fff;
+}
+.role-hero.ops { background: linear-gradient(135deg, #4d7c2c, #2e5018);}
+.role-hero.admin { background: linear-gradient(135deg, #9f3653, #6b2237);}
+.role-hero.finance { background: linear-gradient(135deg, #2d3e90, #1a256b);}
+.role-hero h2 { font-size: 18px; font-weight: 700;}
+.role-hero .sub { font-size: 12px; opacity: 0.85; margin-top: 4px;}
+.role-hero .quick {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px; margin-top: 16px;
+}
+.role-hero .quick > div .label { font-size: 11px; opacity: 0.75;}
+.role-hero .quick > div .value { font-size: 22px; font-weight: 800; margin-top: 2px;}
+.role-hero .quick > div .delta { font-size: 11px; opacity: 0.85;}
+
+.role-actions {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px; margin-bottom: 16px;
+}
+.role-actions a {
+  background: #fff; border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; text-decoration: none; color: var(--text);
+  display: flex; align-items: center; gap: 10px; transition: all 0.1s;
+}
+.role-actions a:hover { border-color: var(--primary); transform: translateY(-1px); box-shadow: 0 2px 6px rgba(0,0,0,0.05);}
+.role-actions a .ico { font-size: 22px;}
+.role-actions a .desc { font-size: 11px; color: var(--text-muted); margin-top: 1px;}
+
 /* ===== Project (큰 카드) ===== */
 .project-card {
   background: var(--card);

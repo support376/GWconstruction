@@ -1074,6 +1074,25 @@ def register_worker(payload: RegisterIn):
     return {"ok": True, "id": new_id, "name": name}
 
 # ----- Deployments -----
+@app.get("/api/deployments/range")
+def list_deployments_range(
+    start: str = Query(...), end: str = Query(...),
+    kind: Optional[str] = None,
+    _: dict = Depends(require_login)
+):
+    """기간 범위의 모든 배치 — 주간 보드용."""
+    sql = """SELECT d.*, w.name AS worker_name, w.worker_type, w.daily_wage,
+             w.job_role, s.name AS site_name FROM deployments d
+             JOIN workers w ON d.worker_id=w.id
+             JOIN sites s ON d.site_id=s.id
+             WHERE d.date BETWEEN ? AND ?"""
+    args = [start, end]
+    if kind:
+        sql += " AND d.kind=?"; args.append(kind)
+    sql += " ORDER BY d.date, s.name, w.name"
+    with conn() as c:
+        return rows(c.execute(sql, args).fetchall())
+
 @app.get("/api/deployments")
 def list_deployments(date: str = Query(...), kind: Optional[str] = None,
                      _: dict = Depends(require_login)):

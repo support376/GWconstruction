@@ -1547,6 +1547,434 @@ route('/users', async () => {
 });
 
 // ============================================================
+// 주간 배치 보드 (다일자 미리 계획)
+// ============================================================
+let wbState = { weekStart: null, mode: 'worker', kind: 'plan', days: 7 };
+
+function _ymd(d) { return d.toISOString().slice(0,10); }
+function _addDays(date_str, n) {
+  const d = new Date(date_str + 'T00:00:00');
+  d.setDate(d.getDate() + n);
+  return _ymd(d);
+}
+function _weekStart(date_str) {
+  const d = new Date(date_str + 'T00:00:00');
+  // 월요일 시작 (한국)
+  const dow = d.getDay() || 7;
+  d.setDate(d.getDate() - (dow - 1));
+  return _ymd(d);
+}
+
+route('/board-week', async () => {
+  if (!wbState.weekStart) wbState.weekStart = _weekStart(today());
+  await renderWeekBoard();
+});
+
+async function renderWeekBoard() {
+  const start = wbState.weekStart;
+  const end = _addDays(start, wbState.days - 1);
+  const [workers, sites, deployments] = await Promise.all([
+    api.get('/api/workers'),
+    api.get('/api/sites?active_only=true'),
+    api.get(`/api/deployments/range?start=${start}&end=${end}&kind=${wbState.kind}`),
+  ]);
+
+  // 인덱싱
+  const dates = Array.from({length: wbState.days}, (_,i) => _addDays(start, i));
+  const byKey = {}; // worker_id|date -> deployment
+  deployments.forEach(d => {
+    byKey[`${d.worker_id}|${d.date}`] = d;
+  });
+  const tdy = today();
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">📅 주간 배치 계획</div>
+        <div class="page-sub">미리 계획 짜기 · 매일·프로젝트별 인력 배분 · 셀 클릭으로 빠르게 변경</div>
+      </div>
+    </div>
+
+    <div class="wb-controls">
+      <button class="nav-btn" id="wb-prev">← 이전 주</button>
+      <span style="font-weight:700; font-size:14px;">${start} ~ ${end}</span>
+      <button class="nav-btn" id="wb-next">다음 주 →</button>
+      <button class="nav-btn" id="wb-this">오늘</button>
+      <span style="margin-left:12px; font-size:12px; color:var(--text-muted)">기간</span>
+      <select id="wb-days" style="padding:5px 8px; border:1px solid var(--border); border-radius:6px; font-family:inherit;">
+        <option value="7"  ${wbState.days==7?'selected':''}>7일</option>
+        <option value="14" ${wbState.days==14?'selected':''}>14일</option>
+        <option value="30" ${wbState.days==30?'selected':''}>30일</option>
+      </select>
+      <span class="wb-mode-tabs" style="margin-left:8px;">
+        <button data-mode="worker" class="${wbState.mode==='worker'?'active':''}">워커별</button>
+        <button data-mode="site"   class="${wbState.mode==='site'  ?'active':''}">현장별</button>
+      </span>
+      <span class="kind-tabs" style="margin-left:8px;">
+        <button data-kind="plan"   class="${wbState.kind==='plan'?'active':''}">계획</button>
+        <button data-kind="actual" class="${wbState.kind==='actual'?'active':''}">실적</button>
+      </span>
+    </div>
+
+    <div class="wb-table-wrap">
+      ${wbState.mode === 'worker' ?
+        renderWorkerGrid(workers, sites, dates, byKey, tdy) :
+        renderSiteGrid(workers, sites, dates, deployments, tdy)}
+    </div>
+
+    <div style="margin-top:14px; font-size:11.5px; color:var(--text-muted)">
+      💡 셀 클릭 → 현장 선택 또는 비우기.
+      ${wbState.kind === 'plan' ? '계획 단계 — 미리 짜놓고 본사가 일괄 통보' : '실적 단계 — 실제 출역 결과'}
+    </div>
+  `;
+
+  $('#wb-prev').onclick = () => { wbState.weekStart = _addDays(wbState.weekStart, -wbState.days); renderWeekBoard(); };
+  $('#wb-next').onclick = () => { wbState.weekStart = _addDays(wbState.weekStart, +wbState.days); renderWeekBoard(); };
+  $('#wb-this').onclick = () => { wbState.weekStart = _weekStart(today()); renderWeekBoard(); };
+  $('#wb-days').onchange = e => { wbState.days = +e.target.value; renderWeekBoard(); };
+  $$('.wb-mode-tabs button').forEach(b => b.onclick = () => { wbState.mode = b.dataset.mode; renderWeekBoard(); });
+  $$('.kind-tabs button').forEach(b => b.onclick = () => { wbState.kind = b.dataset.kind; renderWeekBoard(); });
+
+  $$('.wb-grid .day-cell').forEach(c => c.onclick = () => {
+    const wid = +c.dataset.wid;
+    const sid = +c.dataset.sid;
+    const dt = c.dataset.date;
+    if (wbState.mode === 'worker') {
+      openWorkerCellEdit(wid, dt, sites, byKey);
+    } else {
+      openSiteCellEdit(sid, dt, workers, deployments);
+    }
+  });
+}
+
+function renderWorkerGrid(workers, sites, dates, byKey, tdy) {
+  const cols = '180px ' + dates.map(()=>'1fr').join(' ');
+  const dayName = (ds) => {
+    const d = new Date(ds + 'T00:00:00');
+    return ['일','월','화','수','목','금','토'][d.getDay()];
+  };
+  return `<div class="wb-grid" style="grid-template-columns: ${cols};">
+    <div class="cell col-head">워커 \\ 날짜</div>
+    ${dates.map(d => {
+      const dn = dayName(d);
+      const isWeekend = (dn === '토' || dn === '일');
+      const isToday = (d === tdy);
+      return `<div class="cell col-head ${isToday?'today':''} ${isWeekend?'weekend':''}">
+        ${d.slice(5)}<br><small>${dn}</small>
+      </div>`;
+    }).join('')}
+    ${workers.map(w => `
+      <div class="cell row-head">${w.name}<br><small style="color:var(--text-muted); font-size:10px;">${w.job_role||(w.worker_type==='office'?'사무직':'일용직')}</small></div>
+      ${dates.map(d => {
+        const dep = byKey[`${w.id}|${d}`];
+        const dn = dayName(d);
+        const isWeekend = (dn === '토' || dn === '일');
+        const isToday = (d === tdy);
+        const cls = ['day-cell',
+                     dep ? 'assigned' : '',
+                     isToday ? 'today' : '',
+                     isWeekend ? 'weekend' : ''].join(' ');
+        return `<div class="cell ${cls}" data-wid="${w.id}" data-date="${d}">
+          ${dep ? dep.site_name.slice(0,8) : '<span class="wb-cell-empty">+</span>'}
+        </div>`;
+      }).join('')}
+    `).join('')}
+  </div>`;
+}
+
+function renderSiteGrid(workers, sites, dates, deployments, tdy) {
+  const cols = '180px ' + dates.map(()=>'1fr').join(' ');
+  const dayName = (ds) => {
+    const d = new Date(ds + 'T00:00:00');
+    return ['일','월','화','수','목','금','토'][d.getDay()];
+  };
+  // group by site|date
+  const bySD = {};
+  deployments.forEach(d => {
+    const k = `${d.site_id}|${d.date}`;
+    (bySD[k] = bySD[k] || []).push(d);
+  });
+  return `<div class="wb-grid" style="grid-template-columns: ${cols};">
+    <div class="cell col-head">현장 \\ 날짜</div>
+    ${dates.map(d => {
+      const dn = dayName(d);
+      return `<div class="cell col-head ${d===tdy?'today':''} ${(dn==='토'||dn==='일')?'weekend':''}">
+        ${d.slice(5)}<br><small>${dn}</small>
+      </div>`;
+    }).join('')}
+    ${sites.map(s => `
+      <div class="cell row-head">${s.name}</div>
+      ${dates.map(d => {
+        const list = bySD[`${s.id}|${d}`] || [];
+        const dn = dayName(d);
+        const cls = ['day-cell',
+                     list.length ? 'assigned' : '',
+                     d===tdy ? 'today' : '',
+                     (dn==='토'||dn==='일') ? 'weekend' : ''].join(' ');
+        return `<div class="cell ${cls}" data-sid="${s.id}" data-date="${d}">
+          ${list.length ? `<b>${list.length}명</b><div class="wb-cell-count">${list.slice(0,3).map(x=>x.worker_name).join(', ')}${list.length>3?'…':''}</div>` : '<span class="wb-cell-empty">+</span>'}
+        </div>`;
+      }).join('')}
+    `).join('')}
+  </div>`;
+}
+
+function openWorkerCellEdit(workerId, dateStr, sites, byKey) {
+  const cur = byKey[`${workerId}|${dateStr}`];
+  modal(`${dateStr} 배치 변경`, `
+    <div class="wb-edit-modal-list">
+      <div class="wb-edit-row" data-sid="0">
+        <span><b>비워두기</b></span>
+        <span class="cur">미배치</span>
+      </div>
+      ${sites.map(s => `<div class="wb-edit-row" data-sid="${s.id}">
+        <span>${s.name}</span>
+        ${cur && cur.site_id === s.id ? '<span class="cur">현재</span>' : ''}
+      </div>`).join('')}
+    </div>
+    <div style="font-size:11px; color:var(--text-muted)">${wbState.kind==='plan'?'계획':'실적'} 배치를 변경합니다. 같은 사람이 같은 날 두 곳 동시 배치는 불가.</div>
+  `, async () => true);
+  setTimeout(() => {
+    $$('.wb-edit-row').forEach(r => r.onclick = async () => {
+      const sid = +r.dataset.sid;
+      if (sid === 0) {
+        if (cur) await api.del('/api/deployments/' + cur.id);
+      } else {
+        await api.post('/api/deployments', {
+          worker_id: workerId, site_id: sid, date: dateStr, kind: wbState.kind
+        });
+      }
+      $('#modal-root').innerHTML = '';
+      renderWeekBoard();
+    });
+  }, 30);
+}
+
+function openSiteCellEdit(siteId, dateStr, workers, deployments) {
+  const here = deployments.filter(d => d.site_id === siteId && d.date === dateStr);
+  const hereIds = new Set(here.map(d => d.worker_id));
+  modal(`${dateStr} 배치 — 현장 #${siteId}`, `
+    <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">
+      현재 ${here.length}명 배치. 클릭 → 추가/제거 (${wbState.kind==='plan'?'계획':'실적'})
+    </div>
+    <div class="wb-edit-modal-list">
+      ${workers.map(w => {
+        const isHere = hereIds.has(w.id);
+        return `<div class="wb-edit-row" data-wid="${w.id}" style="${isHere?'background:#eef3fc':''}">
+          <span>${w.name} <span style="color:var(--text-muted); font-size:10.5px">${w.job_role||(w.worker_type==='office'?'사무직':'일용직')}</span></span>
+          ${isHere ? '<span class="cur">✓ 배치 중 (클릭=제거)</span>' : '<span class="cur">+ 추가</span>'}
+        </div>`;
+      }).join('')}
+    </div>
+  `, async () => true);
+  setTimeout(() => {
+    $$('.wb-edit-row').forEach(r => r.onclick = async () => {
+      const wid = +r.dataset.wid;
+      const existing = here.find(d => d.worker_id === wid);
+      if (existing) {
+        await api.del('/api/deployments/' + existing.id);
+      } else {
+        await api.post('/api/deployments', {
+          worker_id: wid, site_id: siteId, date: dateStr, kind: wbState.kind
+        });
+      }
+      $('#modal-root').innerHTML = '';
+      renderWeekBoard();
+    });
+  }, 30);
+}
+
+// ============================================================
+// 역할별 대시보드 — 현장 운영 (/ops)
+// ============================================================
+route('/ops', async () => {
+  const [field, projects] = await Promise.all([
+    api.get('/api/views/field?days=1'),
+    api.get('/api/projects'),
+  ]);
+  const totalToday = field.active_sites.reduce((s, x) => s + (x.clocked_in_today||0), 0);
+  const sortedSites = [...field.active_sites].sort((a,b) => (b.clocked_in_today||0) - (a.clocked_in_today||0));
+
+  $('#app').innerHTML = `
+    <div class="role-hero ops">
+      <h2>🏗 현장 운영 대시보드</h2>
+      <div class="sub">현장 소장·반장·운영팀 — ${field.as_of} 기준 실시간</div>
+      <div class="quick">
+        <div><div class="label">활성 현장</div><div class="value">${field.active_sites.length}</div></div>
+        <div><div class="label">오늘 출근</div><div class="value">${totalToday}</div><div class="delta">GPS 인증</div></div>
+        <div><div class="label">최근 활동</div><div class="value">${field.recent_events.length}</div><div class="delta">24시간</div></div>
+      </div>
+    </div>
+
+    <div class="role-actions">
+      <a href="#/board-week"><span class="ico">📅</span><div><b>주간 배치 계획</b><div class="desc">미리 짜놓기</div></div></a>
+      <a href="#/board"><span class="ico">🎯</span><div><b>오늘 배치 보드</b><div class="desc">드래그앤드롭</div></div></a>
+      <a href="#/map"><span class="ico">🗺</span><div><b>현장 지도</b><div class="desc">출근 GPS 점</div></div></a>
+      <a href="#/processes"><span class="ico">⚙️</span><div><b>일일 운영</b><div class="desc">상태 머신</div></div></a>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head"><h3>오늘 현장별 출근 인원</h3></div>
+      <table class="table">
+        <thead><tr><th>현장</th><th>주소</th><th style="text-align:right">오늘</th><th style="text-align:right">진행률</th></tr></thead>
+        <tbody>
+          ${sortedSites.length === 0 ? '<tr><td colspan="4" style="text-align:center;color:var(--text-muted)">활성 현장 없음</td></tr>' :
+            sortedSites.map(s => {
+              const proj = projects.find(p => p.id === s.id);
+              return `<tr>
+                <td><b>${s.name}</b></td>
+                <td style="font-size:11px; color:var(--text-muted)">${s.address||'-'}</td>
+                <td style="text-align:right"><b>${s.clocked_in_today}명</b></td>
+                <td style="text-align:right">${proj ? proj.progress_pct + '%' : '-'}</td>
+              </tr>`;
+            }).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>최근 활동 타임라인 (24h)</h3></div>
+      <div class="card-pad" style="max-height:300px; overflow-y:auto">
+        ${field.recent_events.length === 0 ? '<div style="color:var(--text-muted)">없음</div>' :
+          field.recent_events.map(eventCardHtml).join('')}
+      </div>
+    </div>
+  `;
+});
+
+// ============================================================
+// 역할별 대시보드 — 행정 (/admin-board)
+// ============================================================
+route('/admin-board', async () => {
+  const d = await api.get('/api/views/admin');
+  const total_pending = d.pending_review.length + d.workers_no_company.length +
+                         d.workers_no_wage.length + d.sites_missing_gps.length;
+  $('#app').innerHTML = `
+    <div class="role-hero admin">
+      <h2>📋 행정 대시보드</h2>
+      <div class="sub">본사 사무직·노무·총무 — 처리 대기 + 신고 대상 + 컴플라이언스</div>
+      <div class="quick">
+        <div><div class="label">처리 대기</div><div class="value">${total_pending}</div><div class="delta">관리자 액션 필요</div></div>
+        <div><div class="label">이번 달 신고 대상</div><div class="value">${d.report_targets_this_month.length}</div><div class="delta">일용근로내용 확인신고</div></div>
+        <div><div class="label">최근 7일 신규</div><div class="value">${d.recent_signups_7d.length}</div></div>
+      </div>
+    </div>
+
+    <div class="role-actions">
+      <a href="#/workers"><span class="ico">👷</span><div><b>직원 관리</b><div class="desc">일당·법인 보강</div></div></a>
+      <a href="#/lens"><span class="ico">🔄</span><div><b>3시점</b><div class="desc">행정 탭으로 자세히</div></div></a>
+      <a href="#/inbox"><span class="ico">📬</span><div><b>알림</b><div class="desc">처리 대기 자동</div></div></a>
+    </div>
+
+    <div class="lens-section">
+      <h3>📋 본사 검토 대기 (${d.pending_review.length})</h3>
+      ${d.pending_review.length === 0 ? '<div class="empty">처리 대기 없음 ✅</div>' :
+        d.pending_review.map(w => `<div class="todo-card">
+          <div class="head">${w.name} · ${w.phone||'-'} · 가입일 ${w.hired_date||'-'}</div>
+          <ul><li>${w.note || '검토 필요'}</li></ul>
+        </div>`).join('')}
+    </div>
+
+    <div class="lens-section">
+      <h3>📋 이번 달 일용근로내용확인신고 대상 (${d.report_targets_this_month.length}명)</h3>
+      ${d.report_targets_this_month.length === 0 ? '<div class="empty">대상 없음</div>' :
+        '<table class="table"><thead><tr><th>이름</th><th style="text-align:right">출근일수</th><th>현장</th></tr></thead><tbody>'
+        + d.report_targets_this_month.map(r => `<tr>
+          <td><b>${r.worker_name||'#'+r.worker_id}</b></td>
+          <td style="text-align:right"><b>${r.days}일</b></td>
+          <td style="font-size:11px;color:var(--text-muted)">${(r.sites||'').replace(/null,?/g,'').replace(/,$/,'')||'-'}</td>
+        </tr>`).join('') + '</tbody></table>'}
+    </div>
+
+    ${d.sites_missing_gps.length || d.workers_no_company.length || d.workers_no_wage.length ? `
+    <div class="lens-section">
+      <h3>📋 컴플라이언스 갭</h3>
+      ${d.sites_missing_gps.map(s => `<div class="todo-card">
+        <div class="head">[GPS 미설정] ${s.name} · ${s.address||'-'}</div>
+      </div>`).join('')}
+      ${d.workers_no_company.map(w => `<div class="todo-card">
+        <div class="head">[법인 미배정] ${w.name} · ${w.phone||'-'}</div>
+      </div>`).join('')}
+      ${d.workers_no_wage.map(w => `<div class="todo-card">
+        <div class="head">[일당 미설정] ${w.name} · ${w.phone||'-'}</div>
+      </div>`).join('')}
+    </div>` : ''}
+  `;
+});
+
+// ============================================================
+// 역할별 대시보드 — 재무 (/finance-board)
+// ============================================================
+route('/finance-board', async () => {
+  const [fin, proc, dash] = await Promise.all([
+    api.get('/api/views/finance'),
+    api.get('/api/procurement/dashboard'),
+    api.get('/api/dashboard'),
+  ]);
+  const k = proc.kpi;
+  $('#app').innerHTML = `
+    <div class="role-hero finance">
+      <h2>💰 재무 대시보드</h2>
+      <div class="sub">대표·경리·재무팀 — 손익·자금·입찰 한눈에</div>
+      <div class="quick">
+        <div><div class="label">계약 총액</div><div class="value">${fmtMoney(dash.contract_total)}</div></div>
+        <div><div class="label">누적 수금</div><div class="value">${fmtMoney(dash.paid_total)}</div></div>
+        <div><div class="label">잔여 공사대금</div><div class="value">${fmtMoney(dash.remaining)}</div></div>
+        <div><div class="label">90일 낙찰률</div><div class="value">${k.win_rate_90d}%</div><div class="delta">${k.my_bids_total_90d}건 응찰</div></div>
+      </div>
+    </div>
+
+    <div class="role-actions">
+      <a href="#/projects"><span class="ico">📋</span><div><b>프로젝트 손익</b><div class="desc">현장별 큰 카드</div></div></a>
+      <a href="#/lens"><span class="ico">🔄</span><div><b>재무 시점</b><div class="desc">다축 집계</div></div></a>
+      <a href="#/procurement"><span class="ico">📑</span><div><b>나라장터 공고</b><div class="desc">미검토 ${k.new_unreviewed}건</div></div></a>
+      <a href="#/my-bids"><span class="ico">🏆</span><div><b>우리 입찰 이력</b><div class="desc">${k.bidding_count}건 진행</div></div></a>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head"><h3>법인별 운영 현황</h3></div>
+      <table class="table">
+        <thead><tr><th>법인</th><th>현장</th><th>직원</th><th style="text-align:right">계약</th><th style="text-align:right">수금</th><th style="text-align:right">잔액</th></tr></thead>
+        <tbody>
+          ${dash.companies.map(c => `<tr>
+            <td><b>${c.name}</b></td>
+            <td>${c.sites}</td>
+            <td>${c.workers}</td>
+            <td style="text-align:right">${fmtMoney(c.contract)}</td>
+            <td style="text-align:right">${fmtMoney(c.paid)}</td>
+            <td style="text-align:right"><b>${fmtMoney(c.contract - c.paid)}</b></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head"><h3>💰 현장별 손익 (events 기반)</h3></div>
+      <div class="card-pad">
+        ${fin.by_site.length === 0 ? '<div style="color:var(--text-muted)">데이터 없음</div>' :
+          fin.by_site.map(r => `<div class="fin-row">
+            <span class="label">${r.name}</span>
+            <span class="num contract">${fmtMoney(r.contract)}</span>
+            <span class="num expense">−${fmtMoney(r.expense)}</span>
+            <span class="num"><b>${fmtMoney(r.contract - r.expense)}</b></span>
+            <span class="count">${r.count}건</span>
+          </div>`).join('')}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>📑 입찰 파이프라인</h3></div>
+      <div class="stat-grid">
+        <div class="stat warning"><div class="label">미검토 신규 공고</div><div class="value">${k.new_unreviewed}</div></div>
+        <div class="stat ${k.deadline_3d>0?'warning':''}"><div class="label">마감 3일 내</div><div class="value">${k.deadline_3d}</div></div>
+        <div class="stat accent"><div class="label">입찰 진행 중</div><div class="value">${k.bidding_count}</div></div>
+        <div class="stat success"><div class="label">최근 30일 낙찰</div><div class="value">${k.won_30d}</div></div>
+      </div>
+    </div>
+  `;
+});
+
+// ============================================================
 // 법인 관리
 // ============================================================
 route('/companies', async () => {
