@@ -81,6 +81,20 @@ CREATE TABLE IF NOT EXISTS deployments (
   note TEXT,
   UNIQUE(worker_id, date, kind)
 );
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL,                     -- 'ClockIn'|'Deploy'|'WorkerCreated'|...
+  occurred_at TEXT NOT NULL,              -- ISO timestamp (KST naive)
+  actors TEXT,                            -- JSON {worker_id, user_id, ...}
+  place TEXT,                             -- JSON {site_id, lat, lng, ...}
+  payload TEXT,                           -- JSON 이벤트별 상세
+  financial TEXT,                         -- JSON {amount, account, kind: expense|revenue}
+  created_by INTEGER REFERENCES users(id),-- 어떤 관리자가 트리거했는지 (있으면)
+  source TEXT DEFAULT 'api'               -- 'admin_ui'|'mobile'|'public'|'system'
+);
+CREATE INDEX IF NOT EXISTS events_type_time ON events(type, occurred_at);
+CREATE INDEX IF NOT EXISTS events_time ON events(occurred_at);
+
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT UNIQUE NOT NULL,
@@ -142,6 +156,27 @@ def row_to_dict(row):
 
 def rows(rs):
     return [dict(r) for r in rs]
+
+# ---- 이벤트 코어 (Phase 1: 디지털 트윈의 시작) ----
+def emit_event(event_type, actors=None, place=None, payload=None, financial=None,
+               created_by=None, source='api'):
+    """모든 도메인 액션은 이걸 호출해서 events 테이블에 기록.
+    실패해도 주 동작에 영향 없도록 best-effort. Append-only history."""
+    try:
+        with conn() as c:
+            c.execute(
+                """INSERT INTO events(type,occurred_at,actors,place,payload,financial,created_by,source)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (event_type,
+                 datetime.now().isoformat(timespec='seconds'),
+                 json.dumps(actors or {}, ensure_ascii=False),
+                 json.dumps(place or {}, ensure_ascii=False),
+                 json.dumps(payload or {}, ensure_ascii=False),
+                 json.dumps(financial or {}, ensure_ascii=False),
+                 created_by, source)
+            )
+    except Exception as e:
+        print(f"[emit_event] {event_type} failed: {e}")
 
 # ========================================================================
 # Pydantic models (입력)
@@ -355,6 +390,10 @@ def signup(payload: SignupIn, request: Request):
     request.session["user_id"] = new_id
     request.session["username"] = username
     request.session["role"] = role
+    emit_event("AdminSignedUp",
+               actors={"user_id": new_id},
+               payload={"username": username, "name": name, "role": role},
+               created_by=new_id, source="public")
     return {"ok": True, "id": new_id, "username": username, "name": name, "role": role}
 
 @app.get("/api/signup-config")
@@ -470,13 +509,18 @@ def list_companies(_: dict = Depends(require_login)):
         return rows(c.execute("SELECT * FROM companies ORDER BY id").fetchall())
 
 @app.post("/api/companies")
-def create_company(payload: CompanyIn, _: dict = Depends(require_login)):
+def create_company(payload: CompanyIn, user: dict = Depends(require_login)):
     with conn() as c:
         cur = c.execute(
             "INSERT INTO companies(name,business_no,ceo,license_info) VALUES(?,?,?,?)",
             (payload.name, payload.business_no, payload.ceo, payload.license_info)
         )
-        return {"id": cur.lastrowid}
+        new_id = cur.lastrowid
+    emit_event("CompanyCreated",
+               actors={"company_id": new_id},
+               payload={"name": payload.name, "business_no": payload.business_no},
+               created_by=user["id"], source="admin_ui")
+    return {"id": new_id}
 
 # ----- 모바일 출퇴근 화면용 공개 API (최소 정보만) -----
 @app.get("/api/public/clock-options")
@@ -499,7 +543,7 @@ def list_sites(active_only: bool = False, _: dict = Depends(require_login)):
         return rows(c.execute(sql).fetchall())
 
 @app.post("/api/sites")
-def create_site(payload: SiteIn, _: dict = Depends(require_login)):
+def create_site(payload: SiteIn, user: dict = Depends(require_login)):
     with conn() as c:
         cur = c.execute(
             """INSERT INTO sites(company_id,name,address,latitude,longitude,geofence_meters,
@@ -509,10 +553,19 @@ def create_site(payload: SiteIn, _: dict = Depends(require_login)):
              payload.geofence_meters or 200, payload.contract_amount or 0, payload.paid_amount or 0,
              payload.start_date, payload.end_date, payload.status or "active", payload.manager)
         )
-        return {"id": cur.lastrowid}
+        new_id = cur.lastrowid
+    emit_event("SiteCreated",
+               actors={"company_id": payload.company_id},
+               place={"site_id": new_id, "lat": payload.latitude, "lng": payload.longitude,
+                      "address": payload.address},
+               payload={"name": payload.name, "manager": payload.manager,
+                        "start_date": payload.start_date, "end_date": payload.end_date},
+               financial={"amount": payload.contract_amount or 0, "account": "계약금액", "kind": "contract"},
+               created_by=user["id"], source="admin_ui")
+    return {"id": new_id}
 
 @app.put("/api/sites/{sid}")
-def update_site(sid: int, payload: SiteIn, _: dict = Depends(require_login)):
+def update_site(sid: int, payload: SiteIn, user: dict = Depends(require_login)):
     with conn() as c:
         c.execute(
             """UPDATE sites SET company_id=?, name=?, address=?, latitude=?, longitude=?,
@@ -522,12 +575,19 @@ def update_site(sid: int, payload: SiteIn, _: dict = Depends(require_login)):
              payload.geofence_meters or 200, payload.contract_amount or 0, payload.paid_amount or 0,
              payload.start_date, payload.end_date, payload.status or "active", payload.manager, sid)
         )
+    emit_event("SiteUpdated",
+               place={"site_id": sid},
+               payload={"name": payload.name, "status": payload.status,
+                        "contract_amount": payload.contract_amount, "paid_amount": payload.paid_amount},
+               created_by=user["id"], source="admin_ui")
     return {"ok": True}
 
 @app.delete("/api/sites/{sid}")
-def delete_site(sid: int, _: dict = Depends(require_login)):
+def delete_site(sid: int, user: dict = Depends(require_login)):
     with conn() as c:
         c.execute("DELETE FROM sites WHERE id=?", (sid,))
+    emit_event("SiteDeleted", place={"site_id": sid},
+               created_by=user["id"], source="admin_ui")
     return {"ok": True}
 
 # ----- Workers -----
@@ -546,7 +606,7 @@ def list_workers(worker_type: Optional[str] = None, q: Optional[str] = None,
         return rows(c.execute(sql, args).fetchall())
 
 @app.post("/api/workers")
-def create_worker(payload: WorkerIn, _: dict = Depends(require_login)):
+def create_worker(payload: WorkerIn, user: dict = Depends(require_login)):
     with conn() as c:
         cur = c.execute(
             """INSERT INTO workers(company_id,name,phone,worker_type,daily_wage,job_role,hired_date,rrn_last,bank_account,note)
@@ -555,10 +615,16 @@ def create_worker(payload: WorkerIn, _: dict = Depends(require_login)):
              payload.daily_wage or 0, payload.job_role, payload.hired_date, payload.rrn_last,
              payload.bank_account, payload.note)
         )
-        return {"id": cur.lastrowid}
+        new_id = cur.lastrowid
+    emit_event("WorkerCreated",
+               actors={"worker_id": new_id, "company_id": payload.company_id},
+               payload={"name": payload.name, "worker_type": payload.worker_type,
+                        "job_role": payload.job_role, "daily_wage": payload.daily_wage},
+               created_by=user["id"], source="admin_ui")
+    return {"id": new_id}
 
 @app.put("/api/workers/{wid}")
-def update_worker(wid: int, payload: WorkerIn, _: dict = Depends(require_login)):
+def update_worker(wid: int, payload: WorkerIn, user: dict = Depends(require_login)):
     with conn() as c:
         c.execute(
             """UPDATE workers SET company_id=?, name=?, phone=?, worker_type=?, daily_wage=?,
@@ -567,12 +633,19 @@ def update_worker(wid: int, payload: WorkerIn, _: dict = Depends(require_login))
              payload.daily_wage or 0, payload.job_role, payload.hired_date, payload.rrn_last,
              payload.bank_account, payload.note, wid)
         )
+    emit_event("WorkerUpdated",
+               actors={"worker_id": wid, "company_id": payload.company_id},
+               payload={"name": payload.name, "daily_wage": payload.daily_wage,
+                        "job_role": payload.job_role},
+               created_by=user["id"], source="admin_ui")
     return {"ok": True}
 
 @app.delete("/api/workers/{wid}")
-def delete_worker(wid: int, _: dict = Depends(require_login)):
+def delete_worker(wid: int, user: dict = Depends(require_login)):
     with conn() as c:
         c.execute("DELETE FROM workers WHERE id=?", (wid,))
+    emit_event("WorkerDeleted", actors={"worker_id": wid},
+               created_by=user["id"], source="admin_ui")
     return {"ok": True}
 
 # ----- 직원 자가 가입 (공개 엔드포인트) -----
@@ -599,7 +672,13 @@ def register_worker(payload: RegisterIn):
             (name, phone, payload.worker_type or "daily", payload.job_role,
              "자가 가입 — 본사 검토 대기", date.today().isoformat())
         )
-        return {"ok": True, "id": cur.lastrowid, "name": name}
+        new_id = cur.lastrowid
+    emit_event("WorkerSelfRegistered",
+               actors={"worker_id": new_id},
+               payload={"name": name, "phone": phone,
+                        "worker_type": payload.worker_type, "job_role": payload.job_role},
+               source="public")
+    return {"ok": True, "id": new_id, "name": name}
 
 # ----- Deployments -----
 @app.get("/api/deployments")
@@ -618,7 +697,7 @@ def list_deployments(date: str = Query(...), kind: Optional[str] = None,
         return rows(c.execute(sql, args).fetchall())
 
 @app.post("/api/deployments")
-def upsert_deployment(payload: DeploymentIn, _: dict = Depends(require_login)):
+def upsert_deployment(payload: DeploymentIn, user: dict = Depends(require_login)):
     with conn() as c:
         c.execute("DELETE FROM deployments WHERE worker_id=? AND date=? AND kind=?",
                   (payload.worker_id, payload.date, payload.kind))
@@ -626,17 +705,32 @@ def upsert_deployment(payload: DeploymentIn, _: dict = Depends(require_login)):
             "INSERT INTO deployments(worker_id,site_id,date,kind,note) VALUES(?,?,?,?,?)",
             (payload.worker_id, payload.site_id, payload.date, payload.kind, payload.note)
         )
-        return {"id": cur.lastrowid}
+        new_id = cur.lastrowid
+    emit_event("Deploy",
+               actors={"worker_id": payload.worker_id},
+               place={"site_id": payload.site_id},
+               payload={"date": payload.date, "kind": payload.kind, "note": payload.note},
+               created_by=user["id"], source="admin_ui")
+    return {"id": new_id}
 
 @app.delete("/api/deployments/{did}")
-def delete_deployment(did: int, _: dict = Depends(require_login)):
+def delete_deployment(did: int, user: dict = Depends(require_login)):
     with conn() as c:
+        row = c.execute(
+            "SELECT worker_id, site_id, date, kind FROM deployments WHERE id=?", (did,)
+        ).fetchone()
         c.execute("DELETE FROM deployments WHERE id=?", (did,))
+    if row:
+        emit_event("DeploymentRemoved",
+                   actors={"worker_id": row["worker_id"]},
+                   place={"site_id": row["site_id"]},
+                   payload={"date": row["date"], "kind": row["kind"]},
+                   created_by=user["id"], source="admin_ui")
     return {"ok": True}
 
 @app.post("/api/deployments/copy")
 def copy_deployments(src_kind: str = Body(...), dst_kind: str = Body(...), date: str = Body(...),
-                     _: dict = Depends(require_login)):
+                     user: dict = Depends(require_login)):
     """계획 → 실적 복사 같은 운영 편의 기능."""
     with conn() as c:
         c.execute("DELETE FROM deployments WHERE date=? AND kind=?", (date, dst_kind))
@@ -645,6 +739,11 @@ def copy_deployments(src_kind: str = Body(...), dst_kind: str = Body(...), date:
                SELECT worker_id,site_id,date,?,note FROM deployments WHERE date=? AND kind=?""",
             (dst_kind, date, src_kind)
         )
+        n = c.execute("SELECT COUNT(*) FROM deployments WHERE date=? AND kind=?",
+                      (date, dst_kind)).fetchone()[0]
+    emit_event("DeploymentsCopied",
+               payload={"date": date, "src_kind": src_kind, "dst_kind": dst_kind, "count": n},
+               created_by=user["id"], source="admin_ui")
     return {"ok": True}
 
 # ----- Clock in/out (mobile, GPS) -----
@@ -695,11 +794,28 @@ def clock(payload: ClockIn, request: Request):
             c.execute("""UPDATE clock_records SET clock_out=?, out_lat=?, out_lng=?,
                          out_distance_m=?, out_verified=? WHERE id=?""",
                       (now, payload.lat, payload.lng, dist, verified, existing["id"]))
-        return {
-            "ok": True, "verified": bool(verified),
-            "distance_m": round(dist, 1) if dist is not None else None,
-            "geofence_m": site["geofence_meters"] or 200,
+
+    # ── 이벤트 기록 ──
+    event_type = "ClockIn" if payload.direction == "in" else "ClockOut"
+    financial = None
+    if payload.direction == "in":
+        financial = {
+            "amount": worker["daily_wage"] or 0,
+            "account": f"직접노무비/{site['name']}",
+            "kind": "expense",
         }
+    emit_event(event_type,
+               actors={"worker_id": payload.worker_id, "worker_name": worker["name"]},
+               place={"site_id": payload.site_id, "site_name": site["name"],
+                      "lat": payload.lat, "lng": payload.lng},
+               payload={"date": today, "distance_m": round(dist, 1) if dist is not None else None,
+                        "verified": bool(verified), "geofence_m": site["geofence_meters"] or 200},
+               financial=financial, source="mobile")
+    return {
+        "ok": True, "verified": bool(verified),
+        "distance_m": round(dist, 1) if dist is not None else None,
+        "geofence_m": site["geofence_meters"] or 200,
+    }
 
 @app.get("/api/clock/today")
 def clock_today(_: dict = Depends(require_login)):
@@ -712,6 +828,58 @@ def clock_today(_: dict = Depends(require_login)):
             JOIN sites s ON cr.site_id=s.id
             WHERE cr.date=? ORDER BY cr.clock_in DESC
         """, (today,)).fetchall())
+
+# ----- Events (Phase 1: 디지털 트윈 코어) -----
+@app.get("/api/events")
+def list_events(
+    type: Optional[str] = None,
+    types: Optional[str] = None,            # 콤마 구분 다중 (e.g. "ClockIn,ClockOut")
+    site_id: Optional[int] = None,
+    worker_id: Optional[int] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    source: Optional[str] = None,
+    limit: int = 200,
+    _: dict = Depends(require_login),
+):
+    """모든 이벤트 조회. 디지털 트윈의 단일 진실 원본(single source of truth)."""
+    sql = "SELECT * FROM events WHERE 1=1"
+    args = []
+    if type:
+        sql += " AND type=?"; args.append(type)
+    if types:
+        ts = [t.strip() for t in types.split(",") if t.strip()]
+        if ts:
+            sql += " AND type IN (" + ",".join(["?"]*len(ts)) + ")"
+            args.extend(ts)
+    if site_id is not None:
+        sql += " AND json_extract(place,'$.site_id') = ?"; args.append(site_id)
+    if worker_id is not None:
+        sql += " AND json_extract(actors,'$.worker_id') = ?"; args.append(worker_id)
+    if from_date:
+        sql += " AND occurred_at >= ?"; args.append(from_date)
+    if to_date:
+        sql += " AND occurred_at <= ?"; args.append(to_date + "T23:59:59")
+    if source:
+        sql += " AND source=?"; args.append(source)
+    sql += " ORDER BY occurred_at DESC, id DESC LIMIT ?"
+    args.append(min(limit, 1000))
+    with conn() as c:
+        rs = rows(c.execute(sql, args).fetchall())
+    # JSON 파싱해서 클라이언트가 쓰기 쉽게
+    for r in rs:
+        for k in ("actors", "place", "payload", "financial"):
+            try: r[k] = json.loads(r.get(k) or "{}")
+            except Exception: r[k] = {}
+    return rs
+
+@app.get("/api/events/types")
+def list_event_types(_: dict = Depends(require_login)):
+    """기록된 이벤트 타입 종류 + 각 카운트."""
+    with conn() as c:
+        return rows(c.execute(
+            "SELECT type, COUNT(*) AS cnt FROM events GROUP BY type ORDER BY cnt DESC"
+        ).fetchall())
 
 # ----- Projects (현장별 일정·인력·비용·손익 종합) -----
 @app.get("/api/projects")

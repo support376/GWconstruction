@@ -816,6 +816,112 @@ function projectCardHtml(p) {
 }
 
 // ============================================================
+// 타임라인 (Phase 1 — 디지털 트윈 코어)
+// ============================================================
+const EVENT_DESC = {
+  ClockIn:           { cat:'t-clock',  label:'GPS 출근',  fmt: e => `<b>${e.actors.worker_name||''}</b> 님 <b>${e.place.site_name||''}</b> 출근 — ${e.payload.verified?'✅':'⚠️'} 거리 ${e.payload.distance_m??'?'}m` },
+  ClockOut:          { cat:'t-clock',  label:'GPS 퇴근',  fmt: e => `<b>${e.actors.worker_name||''}</b> 님 <b>${e.place.site_name||''}</b> 퇴근 — 거리 ${e.payload.distance_m??'?'}m` },
+  Deploy:            { cat:'t-deploy', label:'배치',      fmt: e => `worker #${e.actors.worker_id} → site #${e.place.site_id} (${e.payload.kind}, ${e.payload.date})` },
+  DeploymentRemoved: { cat:'t-deploy', label:'배치 해제',  fmt: e => `worker #${e.actors.worker_id} 배치 해제 (${e.payload.kind}, ${e.payload.date})` },
+  DeploymentsCopied: { cat:'t-deploy', label:'배치 복사',  fmt: e => `${e.payload.date}: ${e.payload.src_kind} → ${e.payload.dst_kind} ${e.payload.count}건` },
+  SiteCreated:       { cat:'t-site',   label:'현장 신규',  fmt: e => `<b>${e.payload.name}</b> 현장 등록 — 계약 ${e.financial.amount?'₩'+e.financial.amount.toLocaleString('ko-KR'):'미정'}` },
+  SiteUpdated:       { cat:'t-site',   label:'현장 수정',  fmt: e => `<b>${e.payload.name}</b> — 상태 ${e.payload.status}, 누적수금 ${e.payload.paid_amount?'₩'+e.payload.paid_amount.toLocaleString('ko-KR'):'-'}` },
+  SiteDeleted:       { cat:'t-site',   label:'현장 삭제',  fmt: e => `현장 #${e.place.site_id} 삭제` },
+  WorkerCreated:     { cat:'t-worker', label:'직원 등록',  fmt: e => `<b>${e.payload.name}</b> (${e.payload.worker_type==='office'?'사무직':'일용직'}, ${e.payload.job_role||'-'}, 일당 ${e.payload.daily_wage?fmt(e.payload.daily_wage)+'원':'-'}) 등록` },
+  WorkerUpdated:     { cat:'t-worker', label:'직원 수정',  fmt: e => `<b>${e.payload.name}</b> 정보 수정 — 일당 ${e.payload.daily_wage?fmt(e.payload.daily_wage)+'원':'-'}` },
+  WorkerDeleted:     { cat:'t-worker', label:'직원 삭제',  fmt: e => `worker #${e.actors.worker_id} 삭제` },
+  WorkerSelfRegistered:{cat:'t-worker',label:'자가 가입',  fmt: e => `<b>${e.payload.name}</b> (${e.payload.phone}) 폰에서 자가 가입` },
+  CompanyCreated:    { cat:'t-other',  label:'법인 등록',  fmt: e => `<b>${e.payload.name}</b> 법인 등록` },
+  AdminSignedUp:     { cat:'t-other',  label:'관리자 가입', fmt: e => `<b>${e.payload.name}</b> (${e.payload.username}, ${e.payload.role}) 관리자 가입` },
+};
+
+let tlState = { type: '', source: '', from: '', to: '' };
+
+route('/timeline', async () => {
+  await loadTimeline();
+});
+
+async function loadTimeline() {
+  const params = new URLSearchParams();
+  if (tlState.type) params.set('type', tlState.type);
+  if (tlState.source) params.set('source', tlState.source);
+  if (tlState.from) params.set('from_date', tlState.from);
+  if (tlState.to) params.set('to_date', tlState.to);
+  params.set('limit', '300');
+
+  const [events, types] = await Promise.all([
+    api.get('/api/events?' + params.toString()),
+    api.get('/api/events/types'),
+  ]);
+
+  const totalAll = types.reduce((s, t) => s + t.cnt, 0);
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">이벤트 타임라인</div>
+        <div class="page-sub">디지털 트윈 코어 — 모든 도메인 행위가 시간순 단일 로그로 기록됩니다 (총 ${fmt(totalAll)}건)</div>
+      </div>
+    </div>
+
+    <div class="tl-filters">
+      <span style="font-size:12px; color:var(--text-muted)">기간</span>
+      <input type="date" id="tl-from" value="${tlState.from}">
+      <span style="color:var(--text-muted)">~</span>
+      <input type="date" id="tl-to" value="${tlState.to}">
+      <select id="tl-source">
+        <option value="">전체 소스</option>
+        <option value="admin_ui" ${tlState.source==='admin_ui'?'selected':''}>관리자</option>
+        <option value="mobile"   ${tlState.source==='mobile'?'selected':''}>폰(모바일)</option>
+        <option value="public"   ${tlState.source==='public'?'selected':''}>공개(자가가입)</option>
+      </select>
+      <button class="btn btn-sm" id="tl-reset">필터 초기화</button>
+    </div>
+
+    <div class="tl-stats">
+      <span class="tl-pill ${!tlState.type?'active':''}" data-t="">전체<span class="cnt">${fmt(totalAll)}</span></span>
+      ${types.map(t => `<span class="tl-pill ${tlState.type===t.type?'active':''}" data-t="${t.type}">${(EVENT_DESC[t.type]||{label:t.type}).label}<span class="cnt">${t.cnt}</span></span>`).join('')}
+    </div>
+
+    <div id="tl-list">
+      ${events.length === 0 ? '<div class="card card-pad" style="text-align:center; color:var(--text-muted)">조회된 이벤트가 없습니다.</div>' :
+        events.map(eventCardHtml).join('')}
+    </div>
+  `;
+
+  $('#tl-from').onchange = e => { tlState.from = e.target.value; loadTimeline(); };
+  $('#tl-to').onchange   = e => { tlState.to   = e.target.value; loadTimeline(); };
+  $('#tl-source').onchange = e => { tlState.source = e.target.value; loadTimeline(); };
+  $('#tl-reset').onclick = () => { tlState = { type:'', source:'', from:'', to:'' }; loadTimeline(); };
+  $$('.tl-pill').forEach(p => p.onclick = () => {
+    tlState.type = p.dataset.t; loadTimeline();
+  });
+}
+
+function eventCardHtml(e) {
+  const def = EVENT_DESC[e.type] || { cat:'t-other', label: e.type, fmt: () => `<i style="color:var(--text-muted)">${e.type}</i>` };
+  let desc = '';
+  try { desc = def.fmt(e); } catch (err) { desc = '<i>오류: ' + err + '</i>'; }
+  const dt = (e.occurred_at || '').replace('T', ' ').slice(0, 19);
+  const [date, time] = dt.split(' ');
+  const sourceLabel = { admin_ui:'관리자', mobile:'📱폰', public:'🌐공개', system:'⚙️시스템' }[e.source] || e.source;
+  const fin = (e.financial && e.financial.amount) ?
+    `<div style="font-size:11px; color:#a35907; margin-top:3px">💰 ${fmtMoney(e.financial.amount)} — ${e.financial.account||''}</div>` : '';
+  return `<div class="event-card">
+    <div class="event-time">
+      <div class="date">${date||''}</div>
+      <div>${time||''}</div>
+    </div>
+    <div class="event-body">
+      <span class="type ${def.cat}">${def.label}</span>
+      <span class="desc">${desc}</span>
+      ${fin}
+    </div>
+    <span class="event-source">${sourceLabel}</span>
+  </div>`;
+}
+
+// ============================================================
 // 사용자 관리 (admin 전용)
 // ============================================================
 route('/users', async () => {

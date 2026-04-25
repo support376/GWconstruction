@@ -261,6 +261,48 @@ input, select, textarea { font-family: inherit; font-size: 14px; }
 .map-legend .dot.out  { background:#c0392b; }
 .geo-hint { font-size: 11px; color: var(--text-muted); margin-top: 4px;}
 
+/* ===== Timeline (Events) ===== */
+.tl-filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; align-items: center;}
+.tl-filters select, .tl-filters input {
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px;
+  font-size: 12px; font-family: inherit;
+}
+.tl-stats {
+  display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px;
+}
+.tl-pill {
+  padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;
+  background: #eef0f4; color: #4a4f57; border: 1px solid #d8dbe0;
+  cursor: pointer; user-select: none;
+}
+.tl-pill:hover { border-color: var(--primary); color: var(--primary);}
+.tl-pill.active { background: var(--primary); color: #fff; border-color: var(--primary);}
+.tl-pill .cnt { opacity: 0.7; margin-left: 4px;}
+
+.event-card {
+  background: #fff; border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 14px; margin-bottom: 8px;
+  display: grid; grid-template-columns: 80px 1fr auto; gap: 12px; align-items: flex-start;
+}
+.event-time { font-size: 11px; color: var(--text-muted); padding-top: 2px;}
+.event-time .date { font-weight: 600; color: var(--text);}
+.event-body { font-size: 13px;}
+.event-body .type {
+  display: inline-block; padding: 1px 7px; border-radius: 8px; font-size: 11px;
+  font-weight: 600; margin-right: 6px;
+}
+.event-body .desc { color: var(--text-muted); font-size: 12px; margin-top: 3px; line-height: 1.5;}
+.event-body .desc b { color: var(--text);}
+.event-source {
+  font-size: 10px; padding: 2px 6px; border-radius: 8px; background: #f7f8fa; color: var(--text-muted);
+}
+.t-clock { background: #e7f6ec; color: #15803d;}
+.t-deploy { background: #fef0e0; color: #a35907;}
+.t-site { background: #eef3fc; color: #2a4a8a;}
+.t-worker { background: #f6f0fb; color: #6b46c1;}
+.t-money { background: #fef9e7; color: #6b5400;}
+.t-other { background: #eef0f4; color: #4a4f57;}
+
 /* ===== Project (큰 카드) ===== */
 .project-card {
   background: var(--card);
