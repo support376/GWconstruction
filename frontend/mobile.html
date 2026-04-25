@@ -48,11 +48,8 @@ const $ = id => document.getElementById(id);
 let workers = [], sites = [];
 
 async function load() {
-  const [w, s] = await Promise.all([
-    fetch('/api/workers').then(r => r.json()),
-    fetch('/api/sites?active_only=true').then(r => r.json()),
-  ]);
-  workers = w; sites = s;
+  const opts = await fetch('/api/public/clock-options').then(r => r.json());
+  workers = opts.workers; sites = opts.sites;
   $('worker-sel').innerHTML = workers.map(x =>
     `<option value="${x.id}">${x.name} · ${x.job_role || x.worker_type}</option>`).join('');
   $('site-sel').innerHTML = sites.map(x =>
@@ -116,7 +113,10 @@ function setStatus(kind, html) {
 async function refreshToday() {
   const wid = +$('worker-sel').value;
   if (!wid) return;
-  const all = await fetch('/api/clock/today').then(r => r.json());
+  // /api/clock/today 는 관리자 전용이라 일반 사용자는 못 봄.
+  // 대신 출/퇴근 결과 자체를 응답에서 받아 표시하므로 여기서는 별도 조회 안 함.
+  return;
+  const all = []; // 비활성: 위에서 return 됨
   const mine = all.find(r => r.worker_id === wid);
   if (mine) {
     $('today-record').style.display = 'block';

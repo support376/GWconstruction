@@ -10,12 +10,25 @@ const fmt = n => (n || 0).toLocaleString('ko-KR');
 const fmtMoney = n => '₩ ' + fmt(n);
 const today = () => new Date().toISOString().slice(0,10);
 
+function _handle401(r) {
+  if (r.status === 401) {
+    location.href = '/login';
+    return new Promise(() => {}); // 더 이상 진행 안 함
+  }
+  return r;
+}
 const api = {
-  get: (path) => fetch(path).then(r => r.json()),
-  post: (path, body) => fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(r => r.json()),
-  put: (path, body) => fetch(path, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(r => r.json()),
-  del: (path) => fetch(path, {method:'DELETE'}).then(r => r.json()),
+  get: (path) => fetch(path).then(_handle401).then(r => r.json()),
+  post: (path, body) => fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(_handle401).then(r => r.json()),
+  put: (path, body) => fetch(path, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(_handle401).then(r => r.json()),
+  del: (path) => fetch(path, {method:'DELETE'}).then(_handle401).then(r => r.json()),
 };
+
+async function logout() {
+  await fetch('/api/logout', { method: 'POST' });
+  location.href = '/login';
+}
+window.logout = logout;
 
 // 주소 → 좌표 (OpenStreetMap Nominatim, 무료, 키 불필요)
 async function geocodeAddress(addr) {
@@ -803,6 +816,26 @@ function projectCardHtml(p) {
 }
 
 // ============================================================
-// 시작
+// 시작 — 로그인 체크 후 진입
 // ============================================================
-navigate();
+(async () => {
+  try {
+    const me = await fetch('/api/me').then(r => r.json());
+    if (!me.authenticated) {
+      location.href = '/login';
+      return;
+    }
+    // 우상단에 사용자명/로그아웃 표시
+    const right = document.querySelector('.topnav .right');
+    if (right) {
+      right.innerHTML = `
+        <span style="margin-right:10px">${me.name || me.username} (${me.role})</span>
+        <a href="#" onclick="logout(); return false;" style="color:rgba(255,255,255,0.85); text-decoration: underline; font-size: 12px;">로그아웃</a>
+      `;
+    }
+  } catch (e) {
+    location.href = '/login';
+    return;
+  }
+  navigate();
+})();

@@ -1,5 +1,4 @@
 # Render 배포 설정 (https://render.com)
-# 이 파일을 GitHub에 같이 올리면 Render가 자동 인식해서 한 번에 배포해줍니다.
 services:
   - type: web
     name: gw-construction-mgmt
@@ -12,3 +11,14 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
+      - key: SECRET_KEY
+        generateValue: true        # Render가 자동으로 강한 랜덤값 생성
+      - key: ADMIN_PASSWORD
+        sync: false                # Render 대시보드에서 직접 입력 (Git에 안 올라감)
+      # ----- 영구 디스크로 SQLite 보존하려면 (월 $1, 1GB) 주석 해제 -----
+      # - key: DB_PATH
+      #   value: /var/data/construction.db
+# disk:
+#   name: data
+#   mountPath: /var/data
+#   sizeGB: 1

@@ -10,19 +10,28 @@ import os
 import math
 import json
 import sqlite3
+import secrets
 from datetime import date, datetime
 from contextlib import contextmanager
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query, Body, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
+
+try:
+    import bcrypt
+except ImportError:
+    bcrypt = None  # 패키지 미설치 시 임시 평문 모드 (배포 시엔 항상 설치됨)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "construction.db")
+# DB 경로 — 환경변수 DB_PATH 로 영구 디스크로 옮길 수 있음 (Render 유료 디스크 등)
+DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "construction.db")
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
+SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
 # ========================================================================
 # DB
@@ -71,6 +80,15 @@ CREATE TABLE IF NOT EXISTS deployments (
   kind TEXT NOT NULL DEFAULT 'plan',  -- 'plan' | 'actual' | 'reported'
   note TEXT,
   UNIQUE(worker_id, date, kind)
+);
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  name TEXT,
+  role TEXT DEFAULT 'admin',          -- 'admin' | 'manager'
+  company_id INTEGER REFERENCES companies(id),
+  created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS clock_records (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,6 +184,14 @@ class RegisterIn(BaseModel):
     worker_type: Optional[str] = "daily"
     job_role: Optional[str] = None
 
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+class PasswordChangeIn(BaseModel):
+    current_password: str
+    new_password: str
+
 class DeploymentIn(BaseModel):
     worker_id: int
     site_id: int
@@ -184,11 +210,57 @@ class ClockIn(BaseModel):
 # App
 # ========================================================================
 app = FastAPI(title="GW Construction Management API")
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="gwc_sess",
+                   max_age=60*60*24*14, https_only=False, same_site="lax")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=False,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+# ========================================================================
+# Auth helpers
+# ========================================================================
+def hash_pw(p: str) -> str:
+    if bcrypt:
+        return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+    return "plain:" + p   # fallback (개발용)
+
+def verify_pw(p: str, h: str) -> bool:
+    if not h: return False
+    if h.startswith("plain:"):
+        return h == "plain:" + p
+    if bcrypt:
+        try: return bcrypt.checkpw(p.encode(), h.encode())
+        except Exception: return False
+    return False
+
+def require_login(request: Request):
+    uid = request.session.get("user_id")
+    if not uid:
+        raise HTTPException(401, "로그인이 필요합니다")
+    with conn() as c:
+        u = c.execute("SELECT id, username, name, role, company_id FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        request.session.clear()
+        raise HTTPException(401, "세션이 만료되었습니다")
+    return dict(u)
+
+def _bootstrap_admin():
+    """관리자 계정이 하나도 없으면 기본 admin 계정 생성."""
+    try:
+        with conn() as c:
+            n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            if n == 0:
+                pw = os.environ.get("ADMIN_PASSWORD", "admin1234")
+                c.execute("INSERT INTO users(username,password_hash,name,role) VALUES(?,?,?,?)",
+                          ("admin", hash_pw(pw), "관리자", "admin"))
+                used_env = bool(os.environ.get("ADMIN_PASSWORD"))
+                print(f"[startup] 기본 관리자 계정 생성 — username=admin, "
+                      + ("password=(환경변수 ADMIN_PASSWORD 사용)" if used_env
+                         else "password=admin1234  ⚠️ 환경변수 ADMIN_PASSWORD 설정 강력 권장"))
+    except Exception as e:
+        print(f"[startup] bootstrap admin skipped: {e}")
 
 def _auto_seed_if_empty():
     """빈 DB면 샘플 데이터 자동 입력 (Render 무료 티어 cold start 대비)."""
@@ -207,16 +279,58 @@ def _auto_seed_if_empty():
 @app.on_event("startup")
 def _startup():
     init_db()
+    _bootstrap_admin()
     _auto_seed_if_empty()
+
+# ----- Auth -----
+@app.post("/api/login")
+def login(payload: LoginIn, request: Request):
+    with conn() as c:
+        u = c.execute("SELECT * FROM users WHERE username=?", (payload.username,)).fetchone()
+    if not u or not verify_pw(payload.password, u["password_hash"]):
+        raise HTTPException(401, "아이디 또는 비밀번호가 일치하지 않습니다")
+    request.session["user_id"] = u["id"]
+    request.session["username"] = u["username"]
+    request.session["role"] = u["role"]
+    return {"ok": True, "username": u["username"], "name": u["name"], "role": u["role"]}
+
+@app.post("/api/logout")
+def logout(request: Request):
+    request.session.clear()
+    return {"ok": True}
+
+@app.get("/api/me")
+def me(request: Request):
+    uid = request.session.get("user_id")
+    if not uid:
+        return {"authenticated": False}
+    with conn() as c:
+        u = c.execute("SELECT id, username, name, role, company_id FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        request.session.clear()
+        return {"authenticated": False}
+    return {"authenticated": True, **dict(u)}
+
+@app.post("/api/me/password")
+def change_password(payload: PasswordChangeIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        u = c.execute("SELECT password_hash FROM users WHERE id=?", (user["id"],)).fetchone()
+        if not u or not verify_pw(payload.current_password, u["password_hash"]):
+            raise HTTPException(401, "현재 비밀번호가 맞지 않습니다")
+        if len(payload.new_password) < 6:
+            raise HTTPException(400, "새 비밀번호는 6자 이상이어야 합니다")
+        c.execute("UPDATE users SET password_hash=? WHERE id=?",
+                  (hash_pw(payload.new_password), user["id"]))
+    return {"ok": True}
 
 # ----- Companies -----
 @app.get("/api/companies")
-def list_companies():
+def list_companies(_: dict = Depends(require_login)):
     with conn() as c:
         return rows(c.execute("SELECT * FROM companies ORDER BY id").fetchall())
 
 @app.post("/api/companies")
-def create_company(payload: CompanyIn):
+def create_company(payload: CompanyIn, _: dict = Depends(require_login)):
     with conn() as c:
         cur = c.execute(
             "INSERT INTO companies(name,business_no,ceo,license_info) VALUES(?,?,?,?)",
@@ -224,9 +338,19 @@ def create_company(payload: CompanyIn):
         )
         return {"id": cur.lastrowid}
 
+# ----- 모바일 출퇴근 화면용 공개 API (최소 정보만) -----
+@app.get("/api/public/clock-options")
+def public_clock_options():
+    with conn() as c:
+        workers = rows(c.execute(
+            "SELECT id, name, job_role, worker_type FROM workers ORDER BY name").fetchall())
+        sites = rows(c.execute(
+            "SELECT id, name FROM sites WHERE status='active' ORDER BY name").fetchall())
+    return {"workers": workers, "sites": sites}
+
 # ----- Sites -----
 @app.get("/api/sites")
-def list_sites(active_only: bool = False):
+def list_sites(active_only: bool = False, _: dict = Depends(require_login)):
     sql = "SELECT s.*, c.name AS company_name FROM sites s LEFT JOIN companies c ON s.company_id=c.id"
     if active_only:
         sql += " WHERE s.status='active'"
@@ -235,7 +359,7 @@ def list_sites(active_only: bool = False):
         return rows(c.execute(sql).fetchall())
 
 @app.post("/api/sites")
-def create_site(payload: SiteIn):
+def create_site(payload: SiteIn, _: dict = Depends(require_login)):
     with conn() as c:
         cur = c.execute(
             """INSERT INTO sites(company_id,name,address,latitude,longitude,geofence_meters,
@@ -248,7 +372,7 @@ def create_site(payload: SiteIn):
         return {"id": cur.lastrowid}
 
 @app.put("/api/sites/{sid}")
-def update_site(sid: int, payload: SiteIn):
+def update_site(sid: int, payload: SiteIn, _: dict = Depends(require_login)):
     with conn() as c:
         c.execute(
             """UPDATE sites SET company_id=?, name=?, address=?, latitude=?, longitude=?,
@@ -261,14 +385,15 @@ def update_site(sid: int, payload: SiteIn):
     return {"ok": True}
 
 @app.delete("/api/sites/{sid}")
-def delete_site(sid: int):
+def delete_site(sid: int, _: dict = Depends(require_login)):
     with conn() as c:
         c.execute("DELETE FROM sites WHERE id=?", (sid,))
     return {"ok": True}
 
 # ----- Workers -----
 @app.get("/api/workers")
-def list_workers(worker_type: Optional[str] = None, q: Optional[str] = None):
+def list_workers(worker_type: Optional[str] = None, q: Optional[str] = None,
+                 _: dict = Depends(require_login)):
     sql = "SELECT w.*, c.name AS company_name FROM workers w LEFT JOIN companies c ON w.company_id=c.id WHERE 1=1"
     args = []
     if worker_type:
@@ -281,7 +406,7 @@ def list_workers(worker_type: Optional[str] = None, q: Optional[str] = None):
         return rows(c.execute(sql, args).fetchall())
 
 @app.post("/api/workers")
-def create_worker(payload: WorkerIn):
+def create_worker(payload: WorkerIn, _: dict = Depends(require_login)):
     with conn() as c:
         cur = c.execute(
             """INSERT INTO workers(company_id,name,phone,worker_type,daily_wage,job_role,hired_date,rrn_last,bank_account,note)
@@ -293,7 +418,7 @@ def create_worker(payload: WorkerIn):
         return {"id": cur.lastrowid}
 
 @app.put("/api/workers/{wid}")
-def update_worker(wid: int, payload: WorkerIn):
+def update_worker(wid: int, payload: WorkerIn, _: dict = Depends(require_login)):
     with conn() as c:
         c.execute(
             """UPDATE workers SET company_id=?, name=?, phone=?, worker_type=?, daily_wage=?,
@@ -305,7 +430,7 @@ def update_worker(wid: int, payload: WorkerIn):
     return {"ok": True}
 
 @app.delete("/api/workers/{wid}")
-def delete_worker(wid: int):
+def delete_worker(wid: int, _: dict = Depends(require_login)):
     with conn() as c:
         c.execute("DELETE FROM workers WHERE id=?", (wid,))
     return {"ok": True}
@@ -338,7 +463,8 @@ def register_worker(payload: RegisterIn):
 
 # ----- Deployments -----
 @app.get("/api/deployments")
-def list_deployments(date: str = Query(...), kind: Optional[str] = None):
+def list_deployments(date: str = Query(...), kind: Optional[str] = None,
+                     _: dict = Depends(require_login)):
     sql = """SELECT d.*, w.name AS worker_name, w.worker_type, w.daily_wage,
              s.name AS site_name FROM deployments d
              JOIN workers w ON d.worker_id=w.id
@@ -352,9 +478,8 @@ def list_deployments(date: str = Query(...), kind: Optional[str] = None):
         return rows(c.execute(sql, args).fetchall())
 
 @app.post("/api/deployments")
-def upsert_deployment(payload: DeploymentIn):
+def upsert_deployment(payload: DeploymentIn, _: dict = Depends(require_login)):
     with conn() as c:
-        # Replace existing for same worker/date/kind
         c.execute("DELETE FROM deployments WHERE worker_id=? AND date=? AND kind=?",
                   (payload.worker_id, payload.date, payload.kind))
         cur = c.execute(
@@ -364,13 +489,14 @@ def upsert_deployment(payload: DeploymentIn):
         return {"id": cur.lastrowid}
 
 @app.delete("/api/deployments/{did}")
-def delete_deployment(did: int):
+def delete_deployment(did: int, _: dict = Depends(require_login)):
     with conn() as c:
         c.execute("DELETE FROM deployments WHERE id=?", (did,))
     return {"ok": True}
 
 @app.post("/api/deployments/copy")
-def copy_deployments(src_kind: str = Body(...), dst_kind: str = Body(...), date: str = Body(...)):
+def copy_deployments(src_kind: str = Body(...), dst_kind: str = Body(...), date: str = Body(...),
+                     _: dict = Depends(require_login)):
     """계획 → 실적 복사 같은 운영 편의 기능."""
     with conn() as c:
         c.execute("DELETE FROM deployments WHERE date=? AND kind=?", (date, dst_kind))
@@ -429,7 +555,7 @@ def clock(payload: ClockIn):
         }
 
 @app.get("/api/clock/today")
-def clock_today():
+def clock_today(_: dict = Depends(require_login)):
     today = date.today().isoformat()
     with conn() as c:
         return rows(c.execute("""
@@ -442,7 +568,7 @@ def clock_today():
 
 # ----- Projects (현장별 일정·인력·비용·손익 종합) -----
 @app.get("/api/projects")
-def projects_overview(include_closed: bool = False):
+def projects_overview(include_closed: bool = False, _: dict = Depends(require_login)):
     """현장을 큰 단위로 보기 위한 통합 데이터.
     누적 투입 인일, 누적 노무비, 일정 진행률, 예상 잔여 노무비, 예상 손익까지."""
     today_d = date.today()
@@ -519,7 +645,7 @@ def projects_overview(include_closed: bool = False):
 
 # ----- Dashboard -----
 @app.get("/api/dashboard")
-def dashboard():
+def dashboard(_: dict = Depends(require_login)):
     today = date.today().isoformat()
     with conn() as c:
         sites_active = c.execute("SELECT COUNT(*) FROM sites WHERE status='active'").fetchone()[0]
@@ -571,6 +697,10 @@ def mobile_page():
 @app.get("/register")
 def register_page():
     return FileResponse(os.path.join(FRONTEND_DIR, "register.html"))
+
+@app.get("/login")
+def login_page():
+    return FileResponse(os.path.join(FRONTEND_DIR, "login.html"))
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
