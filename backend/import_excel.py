@@ -102,6 +102,28 @@ def normalize_date(d):
         return f"{int(y):04d}-{int(mm):02d}-{int(dd):02d}"
     return None
 
+def pick_last_date(d):
+    """multi-line 날짜에서 가장 마지막(최신) 날짜를 ISO로.
+    '23.08.01\\n24.06.16' → '2024-06-16'
+    '24.02.29 08.17 24' → '2024-08-17' (공백 분리도 처리)"""
+    if d is None: return None
+    if isinstance(d, (datetime, date)):
+        return normalize_date(d)
+    s = str(d).strip()
+    if not s: return None
+    # 줄/공백/콤마 모두 구분자
+    parts = re.split(r'[\n\r,]+', s)
+    candidates = []
+    for part in parts:
+        # 한 줄 안에 여러 'YY.MM.DD' 가 공백으로 구분된 경우도
+        for tok in re.findall(r'\d{2,4}[\.\-/]\d{1,2}[\.\-/]\d{1,2}', part):
+            iso = normalize_date(tok)
+            if iso: candidates.append(iso)
+    if not candidates:
+        # 마지막 한 줄에 정규화 시도
+        return normalize_date(parts[-1].strip())
+    return max(candidates)  # ISO 문자열 비교 = 날짜순 정렬
+
 def clean_name(n):
     if not n: return None
     s = str(n).strip()
@@ -147,76 +169,118 @@ SHAREHOLDER_EXCLUDE = {
 }
 
 # ====== 1) 직원,주주명부 임포트 ======
-def import_employee_directory(c, path):
+def wipe_employee_data(c):
+    """직원/자격증/면허등재/주주를 모두 삭제.
+    회사·면허·일용직 출퇴근/배치 등은 유지. (worker_type='daily' 도 같이 와이프 — 직원 전체 재구축)
+    """
+    deleted = {}
+    for tbl in ["license_workers", "worker_certifications", "shareholders"]:
+        cur = c.execute(f"DELETE FROM {tbl}")
+        deleted[tbl] = cur.rowcount
+    # workers 는 ON DELETE CASCADE 로 deployments/attendances 등도 삭제됨
+    cur = c.execute("DELETE FROM workers")
+    deleted["workers"] = cur.rowcount
+    return deleted
+
+def import_employee_directory(c, path, replace=False):
     if not path.exists():
         print(f"  [skip] {path.name} 없음")
-        return {"workers_added": 0, "workers_updated": 0, "certs_added": 0, "shareholders": 0}
+        return {"workers_added": 0, "workers_updated": 0, "certs_added": 0,
+                "shareholders": 0, "wiped": None}
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    stats = {"workers_added": 0, "workers_updated": 0, "certs_added": 0, "shareholders": 0}
+    stats = {"workers_added": 0, "workers_updated": 0, "certs_added": 0,
+             "shareholders": 0, "wiped": None}
+    if replace:
+        stats["wiped"] = wipe_employee_data(c)
+        print(f"  🗑  와이프: {stats['wiped']}")
 
     # ===== 직원현황 시트 (모든 회사 직원 통합) =====
     if "직원현황" in wb.sheetnames:
         ws = wb["직원현황"]
         current_company_id = None
+        current_company_name = None
         for i, row in enumerate(ws.iter_rows(values_only=True)):
             if i == 0: continue  # 헤더
-            company_cell = row[0]
-            if company_cell:
-                # 회사명은 bracket 형태 [건우건설] 만 인식
-                cell_str = str(company_cell)
-                if '[' in cell_str and ']' in cell_str:
-                    cur_co_id = get_or_create_company(c, company_cell, strict=True)
-                    if cur_co_id: current_company_id = cur_co_id
-            name_cell = row[1] if len(row) > 1 else None
-            rrn = row[2] if len(row) > 2 else None
-            hired = row[3] if len(row) > 3 else None
-            resigned = row[4] if len(row) > 4 else None
-            cert_str = row[5] if len(row) > 5 else None
-            related = row[6] if len(row) > 6 else None
-            asbestos = row[7] if len(row) > 7 else None
-            note = row[8] if len(row) > 8 else None
+            cells = [str(x or '') for x in row]
+            company_cell = cells[0]
+            # [건우건설] / [아이엔] 등 — 회사 블록 마커
+            if company_cell and '[' in company_cell and ']' in company_cell:
+                m = re.search(r'\[([^\]]+)\]', company_cell)
+                if m:
+                    co_name_raw = m.group(1).strip()
+                    cur_co_id = get_or_create_company(c, co_name_raw, strict=False)
+                    if cur_co_id:
+                        current_company_id = cur_co_id
+                        current_company_name = co_name_raw
+            if not current_company_id: continue
 
-            name = clean_name(name_cell)
-            if not name: continue
-            rrn_str = str(rrn).strip() if rrn else None
+            name_raw = cells[1].strip() if len(cells) > 1 else ''
+            if not name_raw: continue
+            # "1.안 경 이" → 정규직 #1
+            is_regular = bool(re.match(r'^\s*\d+\.', name_raw))
+            regular_no = None
+            m = re.match(r'^\s*(\d+)\.', name_raw)
+            if m: regular_no = int(m.group(1))
+            name = clean_name(name_raw)
+            if not name or len(name) < 2: continue
+            if name in {'이름', '성명', '회사명', '직위'}: continue
 
-            # 이미 등록된 사람? (이름+rrn 또는 이름+회사)
+            rrn_raw = cells[2].strip() if len(cells) > 2 else ''
+            rrn = re.sub(r'\s+', '', rrn_raw)
+            if rrn and not re.match(r'^\d{6}-\d{7}$', rrn): rrn = None
+
+            hired_iso = pick_last_date(row[3] if len(row) > 3 else None)
+            resigned_iso = pick_last_date(row[4] if len(row) > 4 else None)
+            cert_main = cells[5].strip() if len(cells) > 5 else ''
+            related = cells[6].strip() if len(cells) > 6 else ''
+            asbestos_cell = cells[7].strip() if len(cells) > 7 else ''
+            note = cells[8].strip() if len(cells) > 8 else ''
+            asbestos_flag = 1 if '석면' in asbestos_cell else 0
+            # 사망·퇴사 표시
+            is_deceased = ('사망' in asbestos_cell) or ('사망' in note)
+
+            # 이미 같은 회사에 같은 RRN 존재? (replace=False 일 때 멱등성 유지)
             existing = None
-            if rrn_str:
-                existing = c.execute("SELECT id FROM workers WHERE name=? AND rrn=?", (name, rrn_str)).fetchone()
+            if rrn:
+                existing = c.execute(
+                    "SELECT id FROM workers WHERE rrn=? AND company_id=?",
+                    (rrn, current_company_id)).fetchone()
             if not existing:
                 existing = c.execute(
                     "SELECT id FROM workers WHERE name=? AND company_id=?",
                     (name, current_company_id)).fetchone()
-            hired_iso = normalize_date(hired)
-            resigned_iso = normalize_date(resigned)
-            asbestos_flag = 1 if (asbestos and '석면' in str(asbestos)) else 0
+
+            note_combined = note
+            if is_deceased and '사망' not in note_combined: note_combined = (note_combined + ' [사망]').strip()
+            if related and related not in note_combined:
+                note_combined = (note_combined + f' [관련업종: {related}]').strip()
+            job_role = '정규직' if is_regular else ('전직원' if resigned_iso else '직원')
+
             if existing:
                 wid = existing[0]
                 c.execute(
                     """UPDATE workers SET company_id=?, rrn=COALESCE(?,rrn),
                        hired_date=COALESCE(?,hired_date), resigned_at=?,
-                       asbestos_certified=?, note=COALESCE(?,note),
-                       worker_type=COALESCE(NULLIF(worker_type,''),'office')
+                       asbestos_certified=?, note=?, worker_type='office',
+                       job_role=?
                        WHERE id=?""",
-                    (current_company_id, rrn_str, hired_iso, resigned_iso,
-                     asbestos_flag, str(note) if note else None, wid))
+                    (current_company_id, rrn, hired_iso, resigned_iso,
+                     asbestos_flag, note_combined or None, job_role, wid))
                 stats["workers_updated"] += 1
             else:
                 cur = c.execute(
                     """INSERT INTO workers(company_id, name, rrn, worker_type, hired_date,
-                       resigned_at, asbestos_certified, note)
-                       VALUES(?,?,?,'office',?,?,?,?)""",
-                    (current_company_id, name, rrn_str, hired_iso, resigned_iso,
-                     asbestos_flag, str(note) if note else None))
+                       resigned_at, asbestos_certified, note, job_role)
+                       VALUES(?,?,?,'office',?,?,?,?,?)""",
+                    (current_company_id, name, rrn, hired_iso, resigned_iso,
+                     asbestos_flag, note_combined or None, job_role))
                 wid = cur.lastrowid
                 stats["workers_added"] += 1
 
-            # 자격증 임포트
-            if cert_str:
-                certs = parse_certifications(cert_str)
-                for cert in certs:
-                    # 중복 방지
+            # 자격증 — 메인 (parse_cert_field 사용)
+            if cert_main:
+                for cert in parse_cert_field(cert_main):
+                    if not cert.get('name'): continue
                     dup = c.execute(
                         "SELECT id FROM worker_certifications WHERE worker_id=? AND cert_name=? AND IFNULL(cert_level,'')=IFNULL(?,'')",
                         (wid, cert["name"], cert.get("level"))).fetchone()
@@ -225,72 +289,161 @@ def import_employee_directory(c, path):
                             """INSERT INTO worker_certifications(worker_id, cert_name, cert_level, related_business)
                                VALUES(?,?,?,?)""",
                             (wid, cert["name"], cert.get("level"),
-                             str(related).strip() if related else None))
+                             related or None))
                         stats["certs_added"] += 1
-            elif related:
-                # 자격증 없이 관련업종만 — 정보 저장
-                pass
+            # 자격증 — 비고에서 추가 추출
+            for nc in parse_note_certs(note):
+                if not nc.get('name'): continue
+                dup = c.execute(
+                    "SELECT id FROM worker_certifications WHERE worker_id=? AND cert_name=?",
+                    (wid, nc["name"])).fetchone()
+                if not dup:
+                    c.execute(
+                        """INSERT INTO worker_certifications(worker_id, cert_name, cert_level, cert_no, related_business, note)
+                           VALUES(?,?,?,?,?,?)""",
+                        (wid, nc["name"], nc.get("level"), nc.get("cert_no"),
+                         related or None, '비고에서 추출'))
+                    stats["certs_added"] += 1
 
-    # ===== 주주명부 시트 (회사별) =====
-    SH_SHEETS = ["건우", "아이엔", "인우", "새암", "다우", "유신"]
+    # ===== 주주명부 시트 (회사별) — 고정 컬럼 헤더 파서 =====
+    SH_SHEETS = {
+        "건우": "건우건설주식회사",
+        "아이엔": "(주)아이엔건설환경",
+        "인우": "인우건설(주)",
+        "새암": "새암건설(주)",
+        "다우": "다우건설(주)",
+        "유신": "유신건설(주)",
+    }
+    # 이전분 시트는 historical → 스킵
     for sn in wb.sheetnames:
         if sn not in SH_SHEETS: continue
         ws = wb[sn]
-        co_id = get_or_create_company(c, sn)
+        co_id = get_or_create_company(c, SH_SHEETS[sn], strict=False)
         if not co_id: continue
-        # 보통 R5~ 부터 데이터 (헤더 R3 "주주명부", R4 빈줄)
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i < 4: continue
-            if all(x is None or not str(x).strip() for x in row): continue
-            # 컬럼 추정: 번호, 직책/관계, 이름, 주민번호, 주소, 지분, ...
-            cells = [str(x).strip() if x is not None else '' for x in row]
-            # 이름 후보 — 주민번호 옆에 있는 한글 2~4자, 라벨 제외
-            name = None
-            rrn = None
-            role = None
-            shares = None
-            # 먼저 주민번호 위치 찾기
-            for ci, cell in enumerate(cells):
-                if re.match(r'^\d{6}-\d{7}$', cell):
-                    rrn = cell
-                    # 주민번호 바로 왼쪽 셀이 보통 이름
-                    for offset in [-1, -2, 1]:
-                        idx = ci + offset
-                        if 0 <= idx < len(cells):
-                            cand = cells[idx].replace(' ', '')
-                            if re.match(r'^[가-힣]{2,4}$', cand) and cand not in SHAREHOLDER_EXCLUDE:
-                                name = cand; break
-                    break
-            # 주민번호 없는 경우엔 첫 한글 2~4자 셀 (라벨 제외)
-            if not name:
-                for cell in cells:
-                    cand = cell.replace(' ', '')
-                    if re.match(r'^[가-힣]{2,4}$', cand) and cand not in SHAREHOLDER_EXCLUDE:
-                        name = cand; break
-            for cell in cells:
-                if not role and cell in ['대표', '대표이사', '이사', '감사', '사내이사', '사외이사']:
-                    role = cell
-                if not shares and re.match(r'^\d+(\.\d+)?%?$', cell):
-                    try:
-                        v = float(cell.replace('%', ''))
-                        if 0 < v <= 100: shares = v  # 합리적 지분율만
-                    except: pass
-            if not name: continue
+        # R7 헤더 — 고정 컬럼 위치 파악
+        col_idx = {}
+        rows_data = list(ws.iter_rows(values_only=True))
+        if len(rows_data) < 8: continue
+        header = rows_data[6]  # R7 (0-indexed = 6)
+        for ci, cell in enumerate(header or []):
+            key = (str(cell or '')).replace(' ', '').strip()
+            if key == '직위': col_idx['role'] = ci
+            elif key == '성명': col_idx['name'] = ci
+            elif '주민' in key: col_idx['rrn'] = ci
+            elif '주소' in key or key == '주      주소': col_idx['address'] = ci
+            elif '주식수' in key: col_idx['shares'] = ci
+            elif key in {'비율', '비  율'} or '비' in key and '율' in key:
+                col_idx['ratio'] = ci
+        if 'name' not in col_idx: continue
+        # R8~ 데이터 — '계' 행 만나면 종료
+        for ri in range(7, len(rows_data)):
+            row = rows_data[ri]
+            if not row: continue
+            cells = [str(x or '').strip() for x in row]
+            # 종료 조건: '계' '합계' '소계' 셀 발견
+            first_nonempty = next((c_val for c_val in cells if c_val), '')
+            if first_nonempty in {'계', '합계', '소계'}: break
+            name_raw = cells[col_idx['name']] if col_idx['name'] < len(cells) else ''
+            name = name_raw.replace(' ', '').strip()
+            if not name or len(name) < 2: continue
+            if not re.match(r'^[가-힣]{2,4}$', name): continue
             if name in SHAREHOLDER_EXCLUDE: continue
-            # 중복 방지
+            # 주민번호
+            rrn = None
+            if 'rrn' in col_idx and col_idx['rrn'] < len(cells):
+                rrn_raw = cells[col_idx['rrn']]
+                rrn = re.sub(r'\s+', '', rrn_raw)
+                if not re.match(r'^\d{6}-\d{7}$', rrn or ''): rrn = None
+            role = cells[col_idx['role']] if 'role' in col_idx and col_idx['role'] < len(cells) else None
+            if role:
+                role = role.strip()
+                if role in {'직위', ''}: role = None
+            address = cells[col_idx['address']] if 'address' in col_idx and col_idx['address'] < len(cells) else None
+            if address: address = re.sub(r'\s+', ' ', address.replace('\n', ' ')).strip() or None
+            # 지분율 — 0~1 (소수) 또는 0~100 둘다 허용
+            ratio = None
+            if 'ratio' in col_idx and col_idx['ratio'] < len(cells):
+                rraw = cells[col_idx['ratio']].replace('%', '').strip()
+                try:
+                    v = float(rraw)
+                    ratio = v * 100.0 if 0 < v <= 1 else v
+                except: pass
+            shares_count = None
+            if 'shares' in col_idx and col_idx['shares'] < len(cells):
+                try: shares_count = int(float(cells[col_idx['shares']]))
+                except: pass
+            # 직원과 매칭 시도 (rrn 우선, 그 다음 name+회사)
+            w_row = None
+            if rrn:
+                w_row = c.execute("SELECT id FROM workers WHERE rrn=?", (rrn,)).fetchone()
+            if not w_row:
+                w_row = c.execute("SELECT id FROM workers WHERE name=? AND company_id=?",
+                                  (name, co_id)).fetchone()
+            # 중복 방지 (replace=False 일 때)
             dup = c.execute(
                 "SELECT id FROM shareholders WHERE company_id=? AND name=? AND IFNULL(rrn,'')=IFNULL(?,'')",
-                (co_id, name, rrn)).fetchone()
-            if not dup:
-                # 직원과 매칭 시도
-                w = c.execute("SELECT id FROM workers WHERE name=? AND company_id=?", (name, co_id)).fetchone()
-                c.execute(
-                    """INSERT INTO shareholders(company_id, name, role, rrn, shares_pct, worker_id)
-                       VALUES(?,?,?,?,?,?)""",
-                    (co_id, name, role, rrn, shares, w[0] if w else None))
-                stats["shareholders"] += 1
+                (co_id, name, rrn or '')).fetchone()
+            if dup: continue
+            c.execute(
+                """INSERT INTO shareholders(company_id, name, role, rrn, address, shares_pct, contribution, worker_id)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (co_id, name, role, rrn, address, ratio, shares_count,
+                 w_row[0] if w_row else None))
+            stats["shareholders"] += 1
     wb.close()
     return stats
+
+# ====== 자격증 ↔ 면허 자동 매칭 (전체 직원 대상) ======
+CERT_KEYWORD_TO_LICENSE = [
+    ("토목",      ["토목공사업","토목건축공사업","지반조성·포장공사업","상·하수도설비공사업"]),
+    ("건축",      ["건축공사업","토목건축공사업","실내건축공사업","철근·콘크리트공사업","도장·습식·방수·석공사업","금속창호·지붕건축물조립공사업"]),
+    ("실내건축",  ["실내건축공사업"]),
+    ("기계설비",  ["기계가스설비공사업","가스난방공사업"]),
+    ("전기",      ["전기공사업"]),
+    ("정보통신",  ["정보통신공사업"]),
+    ("소방",      ["소방시설공사업"]),
+    ("가스",      ["가스난방공사업","기계가스설비공사업"]),
+    ("건설안전",  ["구조물해체·비계공사업"]),
+    ("산업안전",  ["구조물해체·비계공사업"]),
+    ("콘크리트",  ["철근·콘크리트공사업"]),
+    ("굴삭기",    ["지반조성·포장공사업","구조물해체·비계공사업"]),
+    ("굴착기",    ["지반조성·포장공사업","구조물해체·비계공사업"]),
+    ("비계",      ["구조물해체·비계공사업"]),
+    ("방수",      ["도장·습식·방수·석공사업"]),
+    ("도장",      ["도장·습식·방수·석공사업"]),
+    ("습식",      ["도장·습식·방수·석공사업"]),
+    ("배관",      ["기계가스설비공사업","가스난방공사업","상·하수도설비공사업"]),
+    ("석면",      ["석면해체·제거업"]),
+]
+
+def auto_register_workers_to_licenses(c):
+    """모든 재직 직원의 자격증 ↔ 회사 면허 매칭 → license_workers 자동 등록."""
+    rows = c.execute("""
+        SELECT w.id, w.company_id, wc.cert_name FROM workers w
+        JOIN worker_certifications wc ON wc.worker_id = w.id
+        WHERE (w.resigned_at IS NULL OR w.resigned_at = '')
+          AND w.company_id IS NOT NULL
+    """).fetchall()
+    auto_count = 0
+    # 회사별 면허 캐시
+    lic_cache = {}
+    for wid, co_id, cert_name in rows:
+        if not cert_name: continue
+        if co_id not in lic_cache:
+            lic_cache[co_id] = c.execute(
+                "SELECT id, license_type FROM licenses WHERE company_id=? AND status='active'",
+                (co_id,)).fetchall()
+        for lic_id, lic_type in lic_cache[co_id]:
+            for kw, lic_list in CERT_KEYWORD_TO_LICENSE:
+                if kw in cert_name and lic_type in lic_list:
+                    cur = c.execute(
+                        """INSERT OR IGNORE INTO license_workers(license_id, worker_id, role, note)
+                           VALUES(?,?,?,?)""",
+                        (lic_id, wid, '기술인 (자동매칭)',
+                         f'{cert_name} → {lic_type}'))
+                    if cur.rowcount: auto_count += 1
+                    break
+    return auto_count
 
 # ====== 자격증 파싱 (메인 + 비고) ======
 def parse_cert_field(cert_str):
@@ -620,7 +773,10 @@ def import_payroll_directory(c, path):
     return stats
 
 # ====== 메인 ======
-def import_all(db_path=None):
+def import_all(db_path=None, replace=False):
+    """엑셀 일괄 임포트.
+    replace=True 면 기존 직원/자격증/주주/면허등재를 모두 와이프하고 다시 구축.
+    """
     if not openpyxl:
         return {"error": "openpyxl 미설치"}
     if db_path is None:
@@ -630,11 +786,12 @@ def import_all(db_path=None):
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys = ON")
 
-    report = {}
+    report = {"replace_mode": replace}
     print("=" * 60)
-    print("📥 1) 직원,주주명부 임포트")
+    print(f"📥 1) 직원,주주명부 임포트  (replace={replace})")
     report["employees"] = import_employee_directory(
-        c, DATA_DIR / "직원,주주명부-5개회사 (자동 저장됨).xlsx")
+        c, DATA_DIR / "직원,주주명부-5개회사 (자동 저장됨).xlsx",
+        replace=replace)
     print(f"  → {report['employees']}")
 
     print("\n📥 2) 회사별 아웃라인 임포트 (회사정보 + 기술자)")
@@ -647,15 +804,22 @@ def import_all(db_path=None):
         c, DATA_DIR / "건우건설급여대장.xlsx")
     print(f"  → {report['payroll']}")
 
+    print("\n🔗 4) 자격증 ↔ 면허 자동 매칭 (전체 직원 대상)")
+    auto_n = auto_register_workers_to_licenses(c)
+    report["auto_register_total"] = auto_n
+    print(f"  → 자동 등재 추가: {auto_n}건")
+
     c.commit()
     # 최종 카운트
     final = {
         "companies":        c.execute("SELECT COUNT(*) FROM companies").fetchone()[0],
         "workers_total":    c.execute("SELECT COUNT(*) FROM workers").fetchone()[0],
         "workers_office":   c.execute("SELECT COUNT(*) FROM workers WHERE worker_type='office'").fetchone()[0],
-        "workers_resigned": c.execute("SELECT COUNT(*) FROM workers WHERE resigned_at IS NOT NULL").fetchone()[0],
+        "workers_active":   c.execute("SELECT COUNT(*) FROM workers WHERE resigned_at IS NULL OR resigned_at=''").fetchone()[0],
+        "workers_resigned": c.execute("SELECT COUNT(*) FROM workers WHERE resigned_at IS NOT NULL AND resigned_at!=''").fetchone()[0],
         "certifications":   c.execute("SELECT COUNT(*) FROM worker_certifications").fetchone()[0],
         "shareholders":     c.execute("SELECT COUNT(*) FROM shareholders").fetchone()[0],
+        "license_workers":  c.execute("SELECT COUNT(*) FROM license_workers").fetchone()[0],
         "asbestos_certified": c.execute("SELECT COUNT(*) FROM workers WHERE asbestos_certified=1").fetchone()[0],
     }
     report["final"] = final
@@ -667,5 +831,7 @@ def import_all(db_path=None):
     return report
 
 if __name__ == "__main__":
-    r = import_all()
-    print("\n[REPORT]", json.dumps(r, ensure_ascii=False, indent=2))
+    import sys
+    replace = '--replace' in sys.argv
+    r = import_all(replace=replace)
+    print("\n[REPORT]", json.dumps(r, ensure_ascii=False, indent=2, default=str))

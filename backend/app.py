@@ -3120,22 +3120,29 @@ def register_page():
     return FileResponse(os.path.join(FRONTEND_DIR, "register.html"))
 
 @app.post("/api/admin/import-excel")
-def admin_import_excel(user: dict = Depends(require_login)):
-    """엑셀 4종 일괄 임포트 (admin 전용). backend/initial_data/ 의 파일 사용."""
+def admin_import_excel(replace: bool = False, user: dict = Depends(require_login)):
+    """엑셀 4종 일괄 임포트 (admin 전용). backend/initial_data/ 의 파일 사용.
+    replace=true 이면 기존 직원/자격증/주주/면허등재 모두 와이프 후 재구축.
+    """
     if user.get("role") != "admin":
         raise HTTPException(403, "관리자 전용입니다")
     try:
         import import_excel
-        report = import_excel.import_all(db_path=DB_PATH)
+        # 모듈 캐시 갱신 (코드 업데이트 반영)
+        import importlib
+        importlib.reload(import_excel)
+        report = import_excel.import_all(db_path=DB_PATH, replace=replace)
     except Exception as e:
         import traceback
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()[:2000]}
     emit_event("ExcelImportRun",
                actors={"user_id": user["id"]},
-               payload={"final": report.get("final", {}),
+               payload={"replace": replace,
+                        "final": report.get("final", {}),
                         "employees": report.get("employees", {}),
                         "outline": report.get("outline", {}),
-                        "payroll": report.get("payroll", {})},
+                        "payroll": report.get("payroll", {}),
+                        "auto_register_total": report.get("auto_register_total", 0)},
                created_by=user["id"], source="admin_ui")
     # 임포트 후 룰 재평가
     _evaluate_rules()

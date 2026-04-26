@@ -1662,23 +1662,34 @@ route('/import', async () => {
     <div class="card" style="margin-bottom:14px">
       <div class="card-pad" style="text-align:center;">
         <p style="font-size:13px; color:var(--text-muted); margin-bottom:14px;">
-          기존 시드 5개 법인은 그대로 유지하고, 직원·주주·자격증을 추가합니다 (멱등 — 여러 번 실행해도 안전).
+          <b>일반 모드</b>는 기존 데이터를 유지하고 추가합니다 (멱등).<br>
+          <b>전체 교체 모드</b>는 기존 직원·자격증·주주·면허등재를 모두 삭제하고 엑셀 기준으로 재구축합니다.
         </p>
-        <button class="btn btn-primary" id="btn-import" style="font-size:14px; padding:12px 28px;">
-          🚀 임포트 실행
-        </button>
+        <div style="display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
+          <button class="btn btn-primary" id="btn-import" style="font-size:14px; padding:12px 28px;">
+            🚀 일반 임포트 (추가)
+          </button>
+          <button class="btn" id="btn-import-replace" style="font-size:14px; padding:12px 28px; background:#c0392b; color:#fff; border-color:#922b21;">
+            🗑 전체 교체 (와이프 후 재구축)
+          </button>
+        </div>
       </div>
     </div>
 
     <div id="import-result"></div>
   `;
-  $('#btn-import').onclick = async () => {
-    if (!confirm('엑셀 4종을 시스템에 일괄 임포트합니다. 계속할까요?')) return;
-    $('#btn-import').disabled = true;
-    $('#btn-import').textContent = '임포트 중… (10~30초)';
-    $('#import-result').innerHTML = '<div class="card card-pad" style="text-align:center; color:var(--text-muted)">서버에서 처리 중…</div>';
+  const runImport = async (replace) => {
+    const msg = replace
+      ? '⚠ 기존 직원/자격증/주주/면허등재를 모두 삭제하고 엑셀 기준으로 재구축합니다.\n\n진짜 진행할까요?'
+      : '엑셀 4종을 시스템에 일괄 임포트합니다. 계속할까요?';
+    if (!confirm(msg)) return;
+    const btnId = replace ? '#btn-import-replace' : '#btn-import';
+    document.querySelectorAll('#btn-import,#btn-import-replace').forEach(b => b.disabled = true);
+    $(btnId).textContent = replace ? '와이프 후 재구축 중…' : '임포트 중…';
+    $('#import-result').innerHTML = '<div class="card card-pad" style="text-align:center; color:var(--text-muted)">서버에서 처리 중… (10~30초)</div>';
     try {
-      const r = await fetch('/api/admin/import-excel', { method: 'POST' }).then(r => r.json());
+      const url = '/api/admin/import-excel' + (replace ? '?replace=true' : '');
+      const r = await fetch(url, { method: 'POST' }).then(r => r.json());
       if (!r.ok) {
         $('#import-result').innerHTML = `<div class="card card-pad" style="background:#fdedec; color:#922b21;">
           <b>임포트 실패:</b> ${r.error || '알 수 없는 오류'}<br>
@@ -1689,16 +1700,23 @@ route('/import', async () => {
         const e = r.report.employees || {};
         const o = r.report.outline || {};
         const p = r.report.payroll || {};
+        const w = e.wiped || null;
+        const wipedBlock = w ? `
+              <div style="background:#fef5f5; padding:8px 10px; border-radius:6px; margin-bottom:10px; font-size:12px; color:#922b21;">
+                🗑 와이프: workers ${w.workers||0}건 / 자격증 ${w.worker_certifications||0}건 / 주주 ${w.shareholders||0}건 / 면허등재 ${w.license_workers||0}건 모두 삭제됨
+              </div>` : '';
         $('#import-result').innerHTML = `
           <div class="card" style="background:#e7f6ec; border-color:#bce5c5;">
             <div class="card-pad">
-              <h3 style="color:#196f3d; margin-bottom:8px;">✅ 임포트 완료</h3>
+              <h3 style="color:#196f3d; margin-bottom:8px;">✅ 임포트 완료 ${r.report.replace_mode ? '(전체 교체)' : ''}</h3>
+              ${wipedBlock}
               <div style="font-size:13px; line-height:1.8;">
                 <b>최종 카운트:</b><br>
                 · 회사: ${f.companies}개<br>
-                · 직원 (총): ${f.workers_total}명 / 정규직 ${f.workers_office}명 / 퇴사자 ${f.workers_resigned}명<br>
+                · 직원 (총): ${f.workers_total}명 / 정규직 ${f.workers_office}명 / 재직 ${f.workers_active||0}명 / 퇴사 ${f.workers_resigned}명<br>
                 · 자격증: ${f.certifications}건<br>
                 · 주주: ${f.shareholders}건<br>
+                · 면허 등재: ${f.license_workers||0}건<br>
                 · 석면 자격자: ${f.asbestos_certified}명
               </div>
               <hr style="margin:12px 0; border:none; border-top:1px solid #bce5c5;">
@@ -1708,7 +1726,8 @@ route('/import', async () => {
                 · 자격증 추가 ${e.certs_added||0}건 + 기술자 시트 ${o.tech_added||0}건<br>
                 · 주주 추가 ${e.shareholders||0}건<br>
                 · 회사 정보 보강 ${o.companies_updated||0}건<br>
-                · 급여대장 직원 보강 ${p.workers_updated||0}건
+                · 급여대장 직원 보강 ${p.workers_updated||0}건<br>
+                · <b>자격증→면허 자동 매칭:</b> ${r.report.auto_register_total||0}건 등재
               </div>
             </div>
           </div>
@@ -1721,10 +1740,13 @@ route('/import', async () => {
     } catch (err) {
       $('#import-result').innerHTML = `<div class="card card-pad" style="background:#fdedec;">서버 통신 실패: ${err}</div>`;
     } finally {
-      $('#btn-import').disabled = false;
-      $('#btn-import').textContent = '🚀 임포트 실행';
+      document.querySelectorAll('#btn-import,#btn-import-replace').forEach(b => b.disabled = false);
+      $('#btn-import').textContent = '🚀 일반 임포트 (추가)';
+      $('#btn-import-replace').textContent = '🗑 전체 교체 (와이프 후 재구축)';
     }
   };
+  $('#btn-import').onclick = () => runImport(false);
+  $('#btn-import-replace').onclick = () => runImport(true);
 });
 
 // ============================================================
