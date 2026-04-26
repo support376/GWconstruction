@@ -18,6 +18,84 @@ except ImportError:
 
 DATA_DIR = Path(__file__).parent / "initial_data"
 
+# ====== 회사 시트명 → 표준 법인명 (직원,주주명부.xlsx) ======
+SHEET_TO_COMPANY = {
+    "건우": "건우건설주식회사",
+    "아이엔": "(주)아이엔건설환경",
+    "인우": "인우건설(주)",
+    "새암": "새암건설(주)",
+    "다우": "다우건설(주)",
+    "유신": "유신건설(주)",
+    "건우이전분": "건우건설주식회사",
+    "아이엔이전분": "(주)아이엔건설환경",
+}
+
+# 주주시트 사이드의 면허 종목 약식명 → 표준 카탈로그명
+LICENSE_SHORT_TO_FULL = {
+    "토목공사업": "토목공사업",
+    "건축공사업": "건축공사업",
+    "토목건축공사업": "토목건축공사업",
+    "시설물(토목)": "토목공사업",
+    "시설물": "토목공사업",
+    "지반조성": "지반조성·포장공사업",
+    "지반": "지반조성·포장공사업",
+    "지반공사업": "지반조성·포장공사업",
+    "지반포장": "지반조성·포장공사업",
+    "포장": "지반조성·포장공사업",
+    "철콘": "철근·콘크리트공사업",
+    "철근콘크리트": "철근·콘크리트공사업",
+    "콘크리트": "철근·콘크리트공사업",
+    "비계": "구조물해체·비계공사업",
+    "비계구조물": "구조물해체·비계공사업",
+    "구조물": "구조물해체·비계공사업",
+    "구조물해체": "구조물해체·비계공사업",
+    "해체비계": "구조물해체·비계공사업",
+    "실내건축": "실내건축공사업",
+    "도장습식": "도장·습식·방수·석공사업",
+    "도장습식석공": "도장·습식·방수·석공사업",
+    "도장방수": "도장·습식·방수·석공사업",
+    "방수": "도장·습식·방수·석공사업",
+    "도장": "도장·습식·방수·석공사업",
+    "금속창호지붕": "금속창호·지붕건축물조립공사업",
+    "금속창호": "금속창호·지붕건축물조립공사업",
+    "상하수도": "상·하수도설비공사업",
+    "상하": "상·하수도설비공사업",
+    "기계가스": "기계가스설비공사업",
+    "기계설비": "기계가스설비공사업",
+    "가스난방": "가스난방공사업",
+    "전기": "전기공사업",
+    "전기공사": "전기공사업",
+    "정보통신": "정보통신공사업",
+    "소방": "소방시설공사업",
+    "소방시설": "소방시설공사업",
+    "조경": "조경식재·시설물공사업",
+    "조경식재": "조경식재·시설물공사업",
+    "철도": "철도·궤도공사업",
+    "철도궤도": "철도·궤도공사업",
+    "수중준설": "수중·준설공사업",
+    "철강구조물": "철강구조물공사업",
+    "승강기": "승강기·삭도공사업",
+    "정밀안전점검기관": "정밀안전점검(시설물)",
+    "정밀안전점검": "정밀안전점검(시설물)",
+    "정밀안전": "정밀안전점검(시설물)",
+    "석면해체제거": "석면해체·제거업",
+    "석면해체": "석면해체·제거업",
+    "석면": "석면해체·제거업",
+    "시설물유지관리": "시설물유지관리업",
+    "문화재수리": "문화재수리업",
+    "문화재": "문화재수리업",
+}
+
+def map_license_short(short_name):
+    if not short_name: return None
+    s = str(short_name).strip().replace(' ', '')
+    # 정확 매칭 우선
+    if s in LICENSE_SHORT_TO_FULL: return LICENSE_SHORT_TO_FULL[s]
+    # 부분 매칭
+    for k, v in LICENSE_SHORT_TO_FULL.items():
+        if k in s: return v
+    return None
+
 # ====== 회사명 → DB 매칭 (시드와 일치하는 표준명) ======
 COMPANY_NAME_MAP = {
     "건우건설": "건우건설주식회사",
@@ -182,19 +260,42 @@ def wipe_employee_data(c):
     deleted["workers"] = cur.rowcount
     return deleted
 
+def _split_dates(s):
+    """'23.08.01/24.06.16' 또는 '24.02.29 08.17 24.10.14' 같은 멀티-날짜를 ISO 리스트로."""
+    if s is None: return []
+    text = str(s).strip()
+    if not text: return []
+    iso_dates = []
+    # YY.MM.DD 또는 YYYY-MM-DD 모두 정규식으로 추출
+    for tok in re.findall(r'\d{2,4}[\.\-/]\d{1,2}[\.\-/]\d{1,2}', text):
+        iso = normalize_date(tok)
+        if iso: iso_dates.append(iso)
+    return iso_dates
+
 def import_employee_directory(c, path, replace=False):
+    """직원,주주명부 엑셀 → workers + worker_certifications + shareholders + companies 메타 + licenses.
+
+    이 함수는 9개 시트(직원현황 + 5 회사 + 2 이전분 + 유신) 의 모든 정보를 처리한다:
+      1) 직원현황: 회사 블록 단위로 직원·자격증·재입사·퇴사·메모·계좌·명절보너스 모두 임포트
+      2) 회사 시트: 주주 + 회사 메타(사업자번호·상호·주소·전화) + 사이드 면허 카탈로그(등록번호·자본금)
+      3) 이전분 시트: 과거 주주 정보 (note 에 보존) — 주주 등록은 현재 시트가 우선
+    """
     if not path.exists():
         print(f"  [skip] {path.name} 없음")
         return {"workers_added": 0, "workers_updated": 0, "certs_added": 0,
                 "shareholders": 0, "wiped": None}
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     stats = {"workers_added": 0, "workers_updated": 0, "certs_added": 0,
-             "shareholders": 0, "wiped": None}
+             "shareholders": 0, "company_meta_updated": 0, "licenses_added": 0,
+             "licenses_updated": 0, "wiped": None}
     if replace:
         stats["wiped"] = wipe_employee_data(c)
+        # 면허도 함께 와이프 (사이드 면허 카탈로그 새로 채워넣기 위해)
+        cur = c.execute("DELETE FROM licenses")
+        stats["wiped"]["licenses"] = cur.rowcount
         print(f"  🗑  와이프: {stats['wiped']}")
 
-    # ===== 직원현황 시트 (모든 회사 직원 통합) =====
+    # ===== 직원현황 시트 — 모든 회사 직원 통합 (정밀 모드) =====
     if "직원현황" in wb.sheetnames:
         ws = wb["직원현황"]
         current_company_id = None
@@ -202,10 +303,11 @@ def import_employee_directory(c, path, replace=False):
         for i, row in enumerate(ws.iter_rows(values_only=True)):
             if i == 0: continue  # 헤더
             cells = [str(x or '') for x in row]
-            company_cell = cells[0]
-            # [건우건설] / [아이엔] 등 — 회사 블록 마커
-            if company_cell and '[' in company_cell and ']' in company_cell:
-                m = re.search(r'\[([^\]]+)\]', company_cell)
+            # 18컬럼까지 보존 (실제로는 0~10이 데이터, 11+ 는 거의 비어있음)
+            col0 = cells[0] if len(cells) > 0 else ''
+            # [건우건설] / [아이엔] 등 — 회사 블록 마커 ([] 있으면 무조건 회사 정보)
+            if col0 and '[' in col0 and ']' in col0:
+                m = re.search(r'\[([^\]]+)\]', col0)
                 if m:
                     co_name_raw = m.group(1).strip()
                     cur_co_id = get_or_create_company(c, co_name_raw, strict=False)
@@ -216,30 +318,68 @@ def import_employee_directory(c, path, replace=False):
 
             name_raw = cells[1].strip() if len(cells) > 1 else ''
             if not name_raw: continue
-            # "1.안 경 이" → 정규직 #1
-            is_regular = bool(re.match(r'^\s*\d+\.', name_raw))
+            # 라벨 제거 후 "1.안 경 이" → 정규직 #1
+            is_regular = bool(re.match(r'^\s*\*?\s*\d+\.', name_raw))
             regular_no = None
-            m = re.match(r'^\s*(\d+)\.', name_raw)
+            m = re.match(r'^\s*\*?\s*(\d+)\.', name_raw)
             if m: regular_no = int(m.group(1))
-            name = clean_name(name_raw)
+            # "*김정길" — 별표 prefix 제거
+            name_clean_raw = re.sub(r'^\s*\*\s*', '', name_raw)
+            name = clean_name(name_clean_raw)
             if not name or len(name) < 2: continue
             if name in {'이름', '성명', '회사명', '직위'}: continue
 
             rrn_raw = cells[2].strip() if len(cells) > 2 else ''
             rrn = re.sub(r'\s+', '', rrn_raw)
-            if rrn and not re.match(r'^\d{6}-\d{7}$', rrn): rrn = None
+            # "700920-1" 처럼 잘려있는 경우도 그대로 보존 (None 처리하지 말고 raw 저장)
+            if rrn and not re.match(r'^\d{6}-\d{7}$', rrn):
+                # 부분 RRN — 그대로 저장하되 표준 검증 통과 안 함 표시
+                rrn_partial = rrn
+                rrn = None
+            else:
+                rrn_partial = None
 
-            hired_iso = pick_last_date(row[3] if len(row) > 3 else None)
-            resigned_iso = pick_last_date(row[4] if len(row) > 4 else None)
+            # 입사일/퇴사일 멀티-라인 → 모든 날짜 추출, 마지막이 현재
+            hired_dates = _split_dates(row[3] if len(row) > 3 else None)
+            resigned_dates = _split_dates(row[4] if len(row) > 4 else None)
+            hired_iso = hired_dates[-1] if hired_dates else None
+            resigned_iso = resigned_dates[-1] if resigned_dates else None
+            # 재입사 이력
+            rehire_history = None
+            if len(hired_dates) > 1 or len(resigned_dates) > 1:
+                rehire_history = f"입사이력: {' → '.join(hired_dates)}"
+                if resigned_dates:
+                    rehire_history += f" / 퇴사이력: {' → '.join(resigned_dates)}"
+
             cert_main = cells[5].strip() if len(cells) > 5 else ''
             related = cells[6].strip() if len(cells) > 6 else ''
             asbestos_cell = cells[7].strip() if len(cells) > 7 else ''
-            note = cells[8].strip() if len(cells) > 8 else ''
-            asbestos_flag = 1 if '석면' in asbestos_cell else 0
-            # 사망·퇴사 표시
-            is_deceased = ('사망' in asbestos_cell) or ('사망' in note)
+            note_main = cells[8].strip() if len(cells) > 8 else ''
+            note_extra1 = cells[9].strip() if len(cells) > 9 else ''
+            note_extra2 = cells[10].strip() if len(cells) > 10 else ''
+            note_extra3 = cells[11].strip() if len(cells) > 11 else ''
 
-            # 이미 같은 회사에 같은 RRN 존재? (replace=False 일 때 멱등성 유지)
+            # 8번 컬럼 분석 — 석면인력 / 사망 / 잡정보
+            asbestos_flag = 1 if '석면' in asbestos_cell and '인력' in asbestos_cell else 0
+            is_deceased = '사망' in asbestos_cell or '사망' in note_main
+            asbestos_extra_note = ''
+            if asbestos_cell and not asbestos_flag and '사망' not in asbestos_cell:
+                # "대민충주구치소" / "새암입사" 같은 잡정보
+                asbestos_extra_note = asbestos_cell
+
+            # note — 사용자가 보일만한 핵심 메모만. 부속정보(메모2/메모3/계좌)는 제외
+            note_parts = []
+            if note_main: note_parts.append(note_main)
+            if asbestos_extra_note: note_parts.append(asbestos_extra_note)
+            if is_deceased: note_parts.append('★ 사망')
+            if rrn_partial: note_parts.append(f"부분주민: {rrn_partial}")
+            note_combined = ' / '.join(note_parts) if note_parts else None
+
+            job_role = ('정규직' if is_regular else
+                        ('퇴사자' if resigned_iso else '재직'))
+            position = f"#{regular_no}" if regular_no else None
+
+            # 같은 회사 + 같은 사람 (rrn 우선, 없으면 name)
             existing = None
             if rrn:
                 existing = c.execute(
@@ -250,34 +390,29 @@ def import_employee_directory(c, path, replace=False):
                     "SELECT id FROM workers WHERE name=? AND company_id=?",
                     (name, current_company_id)).fetchone()
 
-            note_combined = note
-            if is_deceased and '사망' not in note_combined: note_combined = (note_combined + ' [사망]').strip()
-            if related and related not in note_combined:
-                note_combined = (note_combined + f' [관련업종: {related}]').strip()
-            job_role = '정규직' if is_regular else ('전직원' if resigned_iso else '직원')
-
             if existing:
                 wid = existing[0]
                 c.execute(
                     """UPDATE workers SET company_id=?, rrn=COALESCE(?,rrn),
                        hired_date=COALESCE(?,hired_date), resigned_at=?,
                        asbestos_certified=?, note=?, worker_type='office',
-                       job_role=?
+                       job_role=?, position=COALESCE(?,position)
                        WHERE id=?""",
                     (current_company_id, rrn, hired_iso, resigned_iso,
-                     asbestos_flag, note_combined or None, job_role, wid))
+                     asbestos_flag, note_combined, job_role, position, wid))
                 stats["workers_updated"] += 1
             else:
                 cur = c.execute(
                     """INSERT INTO workers(company_id, name, rrn, worker_type, hired_date,
-                       resigned_at, asbestos_certified, note, job_role)
-                       VALUES(?,?,?,'office',?,?,?,?,?)""",
+                       resigned_at, asbestos_certified, note, job_role, position,
+                       job_specialty)
+                       VALUES(?,?,?,'office',?,?,?,?,?,?,?)""",
                     (current_company_id, name, rrn, hired_iso, resigned_iso,
-                     asbestos_flag, note_combined or None, job_role))
+                     asbestos_flag, note_combined, job_role, position, related or None))
                 wid = cur.lastrowid
                 stats["workers_added"] += 1
 
-            # 자격증 — 메인 (parse_cert_field 사용)
+            # 자격증 — 메인 컬럼
             if cert_main:
                 for cert in parse_cert_field(cert_main):
                     if not cert.get('name'): continue
@@ -291,34 +426,29 @@ def import_employee_directory(c, path, replace=False):
                             (wid, cert["name"], cert.get("level"),
                              related or None))
                         stats["certs_added"] += 1
-            # 자격증 — 비고에서 추가 추출
-            for nc in parse_note_certs(note):
-                if not nc.get('name'): continue
-                dup = c.execute(
-                    "SELECT id FROM worker_certifications WHERE worker_id=? AND cert_name=?",
-                    (wid, nc["name"])).fetchone()
-                if not dup:
-                    c.execute(
-                        """INSERT INTO worker_certifications(worker_id, cert_name, cert_level, cert_no, related_business, note)
-                           VALUES(?,?,?,?,?,?)""",
-                        (wid, nc["name"], nc.get("level"), nc.get("cert_no"),
-                         related or None, '비고에서 추출'))
-                    stats["certs_added"] += 1
+            # 비고에서 추가 자격증 (예: "건축중급" "굴삭기,기중기운전기능사 (G00xxx)")
+            for src in [note_main, note_extra1, note_extra2, note_extra3]:
+                if not src: continue
+                for nc in parse_note_certs(src):
+                    if not nc.get('name'): continue
+                    dup = c.execute(
+                        "SELECT id FROM worker_certifications WHERE worker_id=? AND cert_name=?",
+                        (wid, nc["name"])).fetchone()
+                    if not dup:
+                        c.execute(
+                            """INSERT INTO worker_certifications(worker_id, cert_name, cert_level, cert_no, related_business, note)
+                               VALUES(?,?,?,?,?,?)""",
+                            (wid, nc["name"], nc.get("level"), nc.get("cert_no"),
+                             related or None, '비고에서 추출'))
+                        stats["certs_added"] += 1
 
     # ===== 주주명부 시트 (회사별) — 고정 컬럼 헤더 파서 =====
-    SH_SHEETS = {
-        "건우": "건우건설주식회사",
-        "아이엔": "(주)아이엔건설환경",
-        "인우": "인우건설(주)",
-        "새암": "새암건설(주)",
-        "다우": "다우건설(주)",
-        "유신": "유신건설(주)",
-    }
-    # 이전분 시트는 historical → 스킵
+    # 9개 시트 (5 + 2 이전분 + 유신 + 직원현황) 중 회사 시트만 — SHEET_TO_COMPANY 사용
     for sn in wb.sheetnames:
-        if sn not in SH_SHEETS: continue
+        if sn not in SHEET_TO_COMPANY: continue
         ws = wb[sn]
-        co_id = get_or_create_company(c, SH_SHEETS[sn], strict=False)
+        is_previous = sn.endswith("이전분")
+        co_id = get_or_create_company(c, SHEET_TO_COMPANY[sn], strict=False)
         if not co_id: continue
         # R7 헤더 — 고정 컬럼 위치 파악
         col_idx = {}
@@ -390,6 +520,85 @@ def import_employee_directory(c, path, replace=False):
                 (co_id, name, role, rrn, address, ratio, shares_count,
                  w_row[0] if w_row else None))
             stats["shareholders"] += 1
+
+        # ----- 추가 1) 회사 메타 (R14~R17 영역: 사업자번호 / 주소) -----
+        for ri in range(13, min(18, len(rows_data))):
+            row = rows_data[ri]
+            if not row: continue
+            full_text = ' '.join(str(x or '').strip() for x in row if x)
+            if '사업자' in full_text and '등록' in full_text:
+                m = re.search(r'(\d{3})\s*-\s*(\d{2})\s*-\s*(\d{5})', full_text)
+                if m:
+                    biz = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                    c.execute(
+                        "UPDATE companies SET business_no=COALESCE(NULLIF(business_no,''),?) WHERE id=?",
+                        (biz, co_id))
+                    stats["company_meta_updated"] += 1
+            elif ('주' in full_text and '소' in full_text and
+                  '주민' not in full_text and '주식' not in full_text):
+                m = re.search(r'소\s*[:：]\s*(.+)$', full_text)
+                if m:
+                    addr = m.group(1).strip()
+                    if addr and len(addr) > 5 and addr not in {'-', '없음'}:
+                        c.execute(
+                            "UPDATE companies SET address=COALESCE(NULLIF(address,''),?) WHERE id=?",
+                            (addr, co_id))
+
+        # ----- 추가 2) 사이드 면허 카탈로그 (이전분 시트는 면허 양식 다름 → 스킵) -----
+        if not is_previous:
+            lic_hdr_row = None
+            lic_col_idx = {}
+            for ri in range(15, min(20, len(rows_data))):
+                row = rows_data[ri]
+                if not row: continue
+                cells_clean = [str(x or '').strip().replace(' ', '') for x in row]
+                if any(k in cells_clean for k in ['종목', '보유종목']):
+                    lic_hdr_row = ri
+                    for ci, k in enumerate(cells_clean):
+                        if k in ['종목', '보유종목']: lic_col_idx['type'] = ci
+                        elif k in ['면허번호', '등록번호']: lic_col_idx['no'] = ci
+                        elif '자본금' in k: lic_col_idx['cap'] = ci
+                        elif '기술자' in k: lic_col_idx['tech'] = ci
+                    break
+            if lic_hdr_row is not None and 'type' in lic_col_idx:
+                for ri in range(lic_hdr_row + 1, len(rows_data)):
+                    row = rows_data[ri]
+                    if not row: continue
+                    cells = [str(x or '').strip() for x in row]
+                    type_raw = cells[lic_col_idx['type']] if lic_col_idx['type'] < len(cells) else ''
+                    type_clean = type_raw.replace(' ', '')
+                    if not type_clean or type_clean in {'합계', '합', '소계', '계'}: continue
+                    license_type = map_license_short(type_clean) or type_clean
+                    license_no = None
+                    if 'no' in lic_col_idx and lic_col_idx['no'] < len(cells):
+                        no_raw = cells[lic_col_idx['no']].strip()
+                        if no_raw and no_raw not in {'-', '없음'}:
+                            license_no = no_raw
+                    capacity_amount = 0
+                    if 'cap' in lic_col_idx and lic_col_idx['cap'] < len(cells):
+                        cap_raw = cells[lic_col_idx['cap']].replace('억','').replace(',','').strip()
+                        try:
+                            v = float(cap_raw)
+                            capacity_amount = int(v * 100_000_000)  # 억 → 원
+                        except: pass
+                    existing_lic = c.execute(
+                        "SELECT id FROM licenses WHERE company_id=? AND license_type=?",
+                        (co_id, license_type)).fetchone()
+                    if existing_lic:
+                        c.execute(
+                            """UPDATE licenses SET
+                                license_no=COALESCE(NULLIF(license_no,''),?),
+                                capacity_amount=CASE WHEN capacity_amount=0 THEN ? ELSE capacity_amount END
+                                WHERE id=?""",
+                            (license_no, capacity_amount, existing_lic[0]))
+                        stats["licenses_updated"] += 1
+                    else:
+                        c.execute(
+                            """INSERT INTO licenses(company_id, license_type, license_no,
+                                                     capacity_amount, status)
+                               VALUES(?,?,?,?,'active')""",
+                            (co_id, license_type, license_no, capacity_amount))
+                        stats["licenses_added"] += 1
     wb.close()
     return stats
 

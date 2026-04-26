@@ -1058,6 +1058,37 @@ body { display: flex; min-height: 100vh; }
 .badge-blue { background: #dbeafe; color: #1e40af;}
 .badge-gray { background: #e5e7eb; color: #374151;}
 .badge-green { background: #d1fae5; color: #065f46;}
+.badge-orange { background: #fef3c7; color: #92400e;}
+
+/* ===== /reference (기본 정보) ===== */
+.ref-tabs {
+  display: flex; gap: 8px; margin-bottom: 14px; border-bottom: 1px solid var(--border);
+}
+.ref-tab {
+  padding: 10px 18px; border: none; background: transparent;
+  font-size: 13px; font-weight: 600; cursor: pointer; color: var(--text-muted);
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.ref-tab:hover { color: var(--text);}
+.ref-tab.active { color: var(--primary); border-bottom-color: var(--primary);}
+
+.ref-license-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 12px;
+}
+.ref-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px 16px; box-shadow: var(--shadow);
+}
+.ref-card-head {
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;
+  border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 8px;
+}
+.ref-desc { font-size: 12.5px; color: var(--text); line-height: 1.5; margin-bottom: 8px;}
+.ref-section { margin-top: 6px;}
+.ref-lbl { font-size: 10.5px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.4px; font-weight: 700; margin-bottom: 3px;}
+.ref-list { padding-left: 16px; font-size: 12px; line-height: 1.5;}
+.ref-list li { margin-bottom: 2px;}
 
 /* ===== /workers 테이블 — 칸 폭 고정, 줄바꿈 제어 ===== */
 .workers-table { table-layout: fixed; width: 100%; font-size: 12.5px;}
@@ -1069,7 +1100,9 @@ body { display: flex; min-height: 100vh; }
 .workers-table .col-certs   { width: auto;}    /* flex 영역 */
 .workers-table .col-phone   { width: 110px;}
 .workers-table .col-hired   { width: 90px;}
+.workers-table .col-resigned{ width: 90px;}
 .workers-table .col-actions { width: 110px;}
+.workers-table td.col-resigned { white-space: nowrap; font-size: 11.5px; color: var(--text-muted);}
 .workers-table td.col-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
 .workers-table td.col-company { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
 .workers-table td.col-phone { white-space: nowrap; font-size: 11.5px; color: var(--text-muted);}

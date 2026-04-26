@@ -12,21 +12,21 @@ def seed():
         c.close()
         return
 
-    # ====== 법인 5개 (실제) ======
+    # ====== 법인 5개 — 이름만 (사업자번호·주소·면허는 모두 엑셀에서 임포트) ======
     companies = [
-        # name, biz_no, ceo, license_info(text 백업용)
-        ("건우건설주식회사",     "316-81-05103", "안경이",
-         "토목공사업, 실내건축, 도장방수석공사, 금속창호지붕, 구조물해체, 석면해체, 정밀안전점검"),
-        ("(주)아이엔건설환경",   "302-81-28785", "이건우",
-         "철근콘크리트공사업, 구조물해체, 지반조성, 석면해체"),
-        ("인우건설(주)",         "699-87-00368", "최승열",
-         "구조물해체공사업, 지반조성공사업, 석면해체"),
-        ("새암건설(주)",         "893-81-02092", "이규섭",
-         "구조물해체, 실내건축, 도장방수, 금속창호, 석면해체"),
-        ("다우건설(주)",         "403-81-32317", "김충식",
-         "철콘, 상하수도, 구조물해체, 석면해체"),
+        ("건우건설주식회사",),
+        ("(주)아이엔건설환경",),
+        ("인우건설(주)",),
+        ("새암건설(주)",),
+        ("다우건설(주)",),
     ]
-    cur.executemany("INSERT INTO companies(name,business_no,ceo,license_info) VALUES(?,?,?,?)", companies)
+    cur.executemany("INSERT INTO companies(name) VALUES(?)", companies)
+    c.commit()
+    c.close()
+    print("시드 완료 — 5개 법인 (이름만). 사업자번호·주소·면허·직원·주주는 /workers 의 엑셀 업로드 + /companies 상세에서 입력하세요.")
+    return
+    # 아래는 legacy code — 더 이상 실행되지 않음 (삭제 예정)
+    cur.executemany("INSERT INTO companies(name,business_no,ceo,license_info) VALUES(?,?,?,?)", [])
 
     # ====== 보유 면허 (구조화) — licenses 테이블 ======
     today_d = date.today()
@@ -96,7 +96,14 @@ def seed():
     cur.executemany("""INSERT INTO sites(company_id,name,address,latitude,longitude,geofence_meters,
                        contract_amount,paid_amount,start_date,end_date,status,manager) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", sites)
 
-    # ====== 직원 — 5개 법인에 분배 ======
+    # ====== 직원 — 시드에서는 만들지 않음 (엑셀 업로드로 실제 데이터 입력) ======
+    # 더미 직원 (한지영·박현우 등) 자동 시드 제거됨
+    # /workers 페이지의 "📥 엑셀 올리기" 버튼으로 직원,주주명부 엑셀 업로드하면 채워짐
+    c.commit()
+    c.close()
+    print("시드 완료 — 5개 법인 + 23개 면허 + 7개 현장 (직원은 엑셀 업로드로)")
+    return
+    # 아래는 legacy code — 더 이상 실행 안 됨 (참고용)
     workers = [
         # 건우건설 (1) — 정규직 5명, 일용직 3명
         (1, "안경이",   "010-1000-0001", "office", 0,     "대표",       "2018-01-01", "1", "",              "대표이사"),

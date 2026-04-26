@@ -353,12 +353,16 @@ CREATE TABLE IF NOT EXISTS clock_records (
 
 @contextmanager
 def conn():
-    c = sqlite3.connect(DB_PATH)
+    # autocommit (isolation_level=None) — 각 statement 즉시 commit, lock 해제
+    # → 중첩된 with conn() 호출에서 'database is locked' 방지
+    # timeout=10s + busy_timeout 으로 만에 하나 동시 write 시 대기
+    c = sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys = ON")
+    c.execute("PRAGMA busy_timeout = 10000")
     try:
         yield c
-        c.commit()
+        # autocommit 모드라 명시 commit 불필요
     finally:
         c.close()
 
@@ -380,10 +384,17 @@ SCHEMA_MIGRATIONS = [
     "ALTER TABLE companies ADD COLUMN registration_date TEXT",
     "ALTER TABLE companies ADD COLUMN fiscal_year_end TEXT",
     "ALTER TABLE companies ADD COLUMN address TEXT",
+    "ALTER TABLE companies ADD COLUMN corporate_no TEXT",  # 법인등록번호 (110111-XXXXXXX)
+    "ALTER TABLE companies ADD COLUMN phone TEXT",
+    "ALTER TABLE companies ADD COLUMN email TEXT",
+    "ALTER TABLE companies ADD COLUMN representative_phone TEXT",
 ]
 
 def init_db():
     with conn() as c:
+        # WAL 모드 — reader/writer 동시성 향상 (database is locked 방지)
+        try: c.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError: pass
         c.executescript(SCHEMA)
         for stmt in SCHEMA_MIGRATIONS:
             try: c.execute(stmt)
@@ -626,10 +637,14 @@ def emit_event(event_type, actors=None, place=None, payload=None, financial=None
 # ========================================================================
 class CompanyIn(BaseModel):
     name: str
-    business_no: Optional[str] = None
+    business_no: Optional[str] = None      # 사업자등록번호 XXX-XX-XXXXX
+    corporate_no: Optional[str] = None     # 법인등록번호 XXXXXX-XXXXXXX
     ceo: Optional[str] = None
     license_info: Optional[str] = None
     address: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    representative_phone: Optional[str] = None
     fiscal_year_end: Optional[str] = None
     incorporation_date: Optional[str] = None
     registration_date: Optional[str] = None
@@ -882,12 +897,14 @@ def _startup():
     _auto_seed_if_empty()
     _backfill_relations()
     _backfill_processes()
-    # 시연용 나라장터 mock — DB 비어있을 때만
+    # 시연용 나라장터 mock — DB 비어있을 때만 (외부 conn 닫고 호출 — nested conn lock 방지)
     try:
+        n_tenders = 0
         with conn() as c:
-            if c.execute("SELECT COUNT(*) FROM tenders").fetchone()[0] == 0:
-                _seed_mock_tenders()
-                _seed_mock_competitor_bids()
+            n_tenders = c.execute("SELECT COUNT(*) FROM tenders").fetchone()[0]
+        if n_tenders == 0:
+            _seed_mock_tenders()
+            _seed_mock_competitor_bids()
     except Exception as e: print(f"[startup mock tenders] {e}")
     _seed_mock_vehicles_licenses()
     _evaluate_rules()
@@ -1078,18 +1095,21 @@ def list_companies(_: dict = Depends(require_login)):
 def create_company(payload: CompanyIn, user: dict = Depends(require_login)):
     with conn() as c:
         cur = c.execute(
-            """INSERT INTO companies(name,business_no,ceo,license_info,address,
+            """INSERT INTO companies(name,business_no,corporate_no,ceo,license_info,address,
+                                     phone,email,representative_phone,
                                      fiscal_year_end,incorporation_date,registration_date)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            (payload.name, payload.business_no, payload.ceo, payload.license_info,
-             payload.address, payload.fiscal_year_end,
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (payload.name, payload.business_no, payload.corporate_no, payload.ceo,
+             payload.license_info, payload.address,
+             payload.phone, payload.email, payload.representative_phone,
+             payload.fiscal_year_end,
              payload.incorporation_date, payload.registration_date)
         )
         new_id = cur.lastrowid
     emit_event("CompanyCreated",
                actors={"company_id": new_id},
                payload={"name": payload.name, "business_no": payload.business_no,
-                        "ceo": payload.ceo, "address": payload.address},
+                        "corporate_no": payload.corporate_no, "ceo": payload.ceo},
                created_by=user["id"], source="admin_ui")
     return {"id": new_id}
 
@@ -1100,13 +1120,14 @@ def update_company(cid: int, payload: CompanyIn, user: dict = Depends(require_lo
         if not existing:
             raise HTTPException(404, "company not found")
         c.execute(
-            """UPDATE companies SET name=?, business_no=?, ceo=?, license_info=?,
-                                    address=?, fiscal_year_end=?,
-                                    incorporation_date=?, registration_date=?
+            """UPDATE companies SET name=?, business_no=?, corporate_no=?, ceo=?, license_info=?,
+                                    address=?, phone=?, email=?, representative_phone=?,
+                                    fiscal_year_end=?, incorporation_date=?, registration_date=?
                WHERE id=?""",
-            (payload.name, payload.business_no, payload.ceo, payload.license_info,
-             payload.address, payload.fiscal_year_end,
-             payload.incorporation_date, payload.registration_date, cid)
+            (payload.name, payload.business_no, payload.corporate_no, payload.ceo,
+             payload.license_info, payload.address,
+             payload.phone, payload.email, payload.representative_phone,
+             payload.fiscal_year_end, payload.incorporation_date, payload.registration_date, cid)
         )
     emit_event("CompanyUpdated",
                actors={"company_id": cid},
@@ -2284,6 +2305,7 @@ def _seed_mock_tenders():
          "raw_url":"https://www.g2b.go.kr/"},
     ]
     inserted = 0
+    pending_events = []  # conn 닫힌 후 발행 — nested conn lock 방지
     with conn() as c:
         for s in samples:
             try:
@@ -2300,13 +2322,16 @@ def _seed_mock_tenders():
                 )
                 if c.execute("SELECT changes()").fetchone()[0]:
                     inserted += 1
-                    emit_event("TenderDiscovered",
-                               payload={"tender_no": s.get("tender_no"), "title": s.get("title"),
-                                        "org_name": s.get("org_name"), "budget": s.get("budget"),
-                                        "deadline": s.get("deadline")},
-                               source="system")
+                    pending_events.append({
+                        "tender_no": s.get("tender_no"), "title": s.get("title"),
+                        "org_name": s.get("org_name"), "budget": s.get("budget"),
+                        "deadline": s.get("deadline")
+                    })
             except Exception as e:
                 print(f"[mock_seed] {e}")
+    # 외부 conn 닫힌 후 이벤트 발행
+    for ev in pending_events:
+        emit_event("TenderDiscovered", payload=ev, source="system")
     return {"ok": True, "mode": "mock", "inserted": inserted, "total_now": _count_tenders()}
 
 def _count_tenders():
@@ -2513,6 +2538,243 @@ def list_expiring_licenses(days: int = 90, _: dict = Depends(require_login)):
 def license_types_catalog(_: dict = Depends(require_login)):
     """표준 면허 종류 카탈로그 — 태그 입력용 자동완성 목록."""
     return LICENSE_TYPES_CATALOG
+
+# ====== 참고용 카탈로그 — 전문건설업 면허 종류 + 자격증 ======
+LICENSE_REFERENCE = [
+    # 종합건설업 (3종)
+    {"name":"토목공사업","category":"종합","min_workers":6,"min_capital":500_000_000,
+     "description":"도로·교량·터널·하수도·항만 등 종합 토목 공사",
+     "required_certs":["건설기술자(토목 분야) 6명 — 초급 이상","또는 토목·건축·기계 분야 국가기술자격"],
+     "examples":"도로 보수공사, 하수처리장 신설, 교량 가설"},
+    {"name":"건축공사업","category":"종합","min_workers":6,"min_capital":500_000_000,
+     "description":"건축물의 종합 시공",
+     "required_certs":["건설기술자(건축 분야) 6명 — 초급 이상"],
+     "examples":"공동주택, 사무실, 학교 신축"},
+    {"name":"토목건축공사업","category":"종합","min_workers":12,"min_capital":1_200_000_000,
+     "description":"토목·건축을 통합한 대형 종합 시공 (위 두 면허 통합)",
+     "required_certs":["건설기술자(토목+건축) 12명"],
+     "examples":"대형 단지 개발, SOC 통합 사업"},
+
+    # 전문건설업 — 대업종 14
+    {"name":"지반조성·포장공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"부지 조성, 도로 포장, 터파기·되메우기",
+     "required_certs":["건설기술자(토목) 2명 — 또는 굴삭기·기계 운전기능사"],
+     "examples":"부지 평탄화, 아스팔트 포장, 보도블록"},
+    {"name":"실내건축공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"건물 내부 인테리어 시공",
+     "required_certs":["건설기술자(건축 또는 실내건축) 2명","또는 건축응용제도기능사·실내건축기능사"],
+     "examples":"사무실 인테리어, 매장 리모델링"},
+    {"name":"금속창호·지붕건축물조립공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"금속창호 설치 + 지붕 시공",
+     "required_certs":["건설기술자(건축) 2명 — 또는 비계기능사·금속재창호기능사"],
+     "examples":"커튼월, 알루미늄 창호, 샌드위치 패널 지붕"},
+    {"name":"도장·습식·방수·석공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"도장·미장·방수·석재 시공 (구 도장방수·석공사업)",
+     "required_certs":["건설기술자(건축) 2명 — 또는 방수·도배·미장·타일·도장 기능사"],
+     "examples":"외벽 도장, 옥상 방수, 화장실 타일"},
+    {"name":"조경식재·시설물공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"조경수 식재 + 조경 시설물",
+     "required_certs":["건설기술자(조경) 2명 — 또는 조경기능사"],
+     "examples":"공원 조경, 가로수 식재"},
+    {"name":"철근·콘크리트공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"철근 배근 + 거푸집 + 콘크리트 타설",
+     "required_certs":["건설기술자(건축 또는 토목) 2명","또는 콘크리트기능사·철근기능사"],
+     "examples":"건축 골조, 옹벽, 슬라브"},
+    {"name":"구조물해체·비계공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"건물 해체 + 비계 가설",
+     "required_certs":["건설안전·산업안전기사 1명 + 건설기술자 1명","또는 비계기능사"],
+     "examples":"노후 건물 해체, 시스템 비계"},
+    {"name":"상·하수도설비공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"상수·하수 배관 매설",
+     "required_certs":["건설기술자(토목) 2명","또는 배관기능사"],
+     "examples":"상수도 본관, 우수·오수관"},
+    {"name":"철도·궤도공사업","category":"전문","min_workers":2,"min_capital":200_000_000,
+     "description":"철로 부설·교체",
+     "required_certs":["건설기술자(토목·철도 분야) 2명"],
+     "examples":"지하철·고속철도 궤도"},
+    {"name":"철강구조물공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"철골조 제작·설치",
+     "required_certs":["건설기술자(건축 또는 토목) 2명","또는 용접·철골기능사"],
+     "examples":"공장 철골, 창고"},
+    {"name":"수중·준설공사업","category":"전문","min_workers":2,"min_capital":200_000_000,
+     "description":"수중 작업, 항만 준설",
+     "required_certs":["건설기술자(토목·항만) + 잠수기능사"],
+     "examples":"부두 보수, 해저 케이블"},
+    {"name":"승강기·삭도공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"엘리베이터·에스컬레이터·곤돌라·삭도",
+     "required_certs":["건설기술자(기계 또는 전기) 2명","또는 승강기기능사"],
+     "examples":"신축 건물 EV, 케이블카"},
+    {"name":"기계가스설비공사업","category":"전문","min_workers":2,"min_capital":150_000_000,
+     "description":"기계설비 + 가스배관",
+     "required_certs":["건설기술자(기계설비) 2명","또는 배관·가스기능사"],
+     "examples":"공조·환기·소방설비, 가스배관"},
+    {"name":"가스난방공사업","category":"전문","min_workers":1,"min_capital":100_000_000,
+     "description":"가스 보일러·난방기 설치",
+     "required_certs":["가스기능사 또는 보일러산업기사"],
+     "examples":"주택 보일러, 상업용 가스기기"},
+
+    # 특수·환경
+    {"name":"석면해체·제거업","category":"특수","min_workers":2,"min_capital":50_000_000,
+     "description":"건물 내 석면 함유물 안전 해체·제거 (산안법 별도)",
+     "required_certs":["석면해체작업감독자 + 석면해체감리원 (고용노동부)","산업안전기사·건설안전기사"],
+     "examples":"천정텍스, 슬레이트 지붕 제거"},
+    {"name":"정밀안전점검(시설물)","category":"특수","min_workers":2,"min_capital":30_000_000,
+     "description":"시특법상 시설물 정밀안전점검·진단 (별도등록)",
+     "required_certs":["건설기술자(토목·건축) 특급 2명 + 정밀안전점검 교육이수"],
+     "examples":"교량·터널·댐 정밀안전진단"},
+    {"name":"시설물유지관리업","category":"특수","min_workers":4,"min_capital":200_000_000,
+     "description":"시설물 유지보수 종합",
+     "required_certs":["건설기술자(건축·토목 또는 기계·전기) 4명"],
+     "examples":"학교·공공시설 유지관리"},
+
+    # 별도법
+    {"name":"전기공사업","category":"별도법","min_workers":3,"min_capital":150_000_000,
+     "description":"전기공사업법 — 발전·송변전·배전·전기설비",
+     "required_certs":["전기기술자 3명 — 전기·전자 분야 국가기술자격","또는 전기 분야 건설기술자 (기능사 이상)"],
+     "examples":"건축물 전기, 가로등, 변전실"},
+    {"name":"정보통신공사업","category":"별도법","min_workers":3,"min_capital":150_000_000,
+     "description":"정보통신공사업법 — 통신선로·구내통신·방송",
+     "required_certs":["정보통신기술자 3명 — 정보통신·전자 국가기술자격","또는 정보통신 분야 건설기술자"],
+     "examples":"광케이블, 구내전화, CCTV"},
+    {"name":"소방시설공사업","category":"별도법","min_workers":2,"min_capital":100_000_000,
+     "description":"소방시설공사업법 — 소화·경보·피난설비",
+     "required_certs":["소방시설관리사·소방기술자 2명","소방설비기사(전기/기계)"],
+     "examples":"스프링클러, 화재경보, 비상조명"},
+    {"name":"문화재수리업","category":"별도법","min_workers":2,"min_capital":200_000_000,
+     "description":"문화재수리법 — 지정 문화재 수리·보수",
+     "required_certs":["문화재수리기술자 2명 (문화재청)"],
+     "examples":"사찰·궁궐 보수"},
+]
+
+CERT_CATALOG = [
+    # ====== 국가기술자격 (한국산업인력공단) ======
+    {"name":"토목기사","category":"국가기술자격","field":"토목","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["토목공사업","지반조성·포장공사업","상·하수도설비공사업","철도·궤도공사업"]},
+    {"name":"토목산업기사","category":"국가기술자격","field":"토목","grade":"산업기사","issuer":"한국산업인력공단",
+     "applicable":["토목공사업","지반조성·포장공사업","상·하수도설비공사업"]},
+    {"name":"건축기사","category":"국가기술자격","field":"건축","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["건축공사업","실내건축공사업","철근·콘크리트공사업"]},
+    {"name":"건축산업기사","category":"국가기술자격","field":"건축","grade":"산업기사","issuer":"한국산업인력공단",
+     "applicable":["건축공사업","실내건축공사업"]},
+    {"name":"건축일반시공산업기사","category":"국가기술자격","field":"건축","grade":"산업기사","issuer":"한국산업인력공단",
+     "applicable":["건축공사업","실내건축공사업","도장·습식·방수·석공사업"]},
+    {"name":"건설안전기사","category":"국가기술자격","field":"안전","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["구조물해체·비계공사업","석면해체·제거업"], "note":"안전관리자 선임 시 필수"},
+    {"name":"산업안전기사","category":"국가기술자격","field":"안전","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["구조물해체·비계공사업","석면해체·제거업"]},
+    {"name":"산업안전산업기사","category":"국가기술자격","field":"안전","grade":"산업기사","issuer":"한국산업인력공단",
+     "applicable":["석면해체·제거업"]},
+    {"name":"콘크리트기사","category":"국가기술자격","field":"건축","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["철근·콘크리트공사업"]},
+    {"name":"콘크리트산업기사","category":"국가기술자격","field":"건축","grade":"산업기사","issuer":"한국산업인력공단",
+     "applicable":["철근·콘크리트공사업"]},
+    {"name":"전기기사","category":"국가기술자격","field":"전기","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["전기공사업"]},
+    {"name":"전기산업기사","category":"국가기술자격","field":"전기","grade":"산업기사","issuer":"한국산업인력공단",
+     "applicable":["전기공사업"]},
+    {"name":"정보통신기사","category":"국가기술자격","field":"정보통신","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["정보통신공사업"]},
+    {"name":"정보통신산업기사","category":"국가기술자격","field":"정보통신","grade":"산업기사","issuer":"한국산업인력공단",
+     "applicable":["정보통신공사업"]},
+    {"name":"소방설비기사(전기)","category":"국가기술자격","field":"소방","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["소방시설공사업"]},
+    {"name":"소방설비기사(기계)","category":"국가기술자격","field":"소방","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["소방시설공사업"]},
+    {"name":"가스기사","category":"국가기술자격","field":"가스","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["가스난방공사업","기계가스설비공사업"]},
+    {"name":"건축설비기사","category":"국가기술자격","field":"기계설비","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["기계가스설비공사업","가스난방공사업"]},
+    {"name":"공조냉동기계기사","category":"국가기술자격","field":"기계설비","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["기계가스설비공사업"]},
+    {"name":"조경기사","category":"국가기술자격","field":"조경","grade":"기사","issuer":"한국산업인력공단",
+     "applicable":["조경식재·시설물공사업"]},
+
+    # ====== 기능사 (한국산업인력공단) ======
+    {"name":"방수기능사","category":"기능사","field":"건축","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["도장·습식·방수·석공사업"]},
+    {"name":"비계기능사","category":"기능사","field":"건축","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["구조물해체·비계공사업","금속창호·지붕건축물조립공사업"]},
+    {"name":"도배기능사","category":"기능사","field":"건축","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["실내건축공사업","도장·습식·방수·석공사업"]},
+    {"name":"타일기능사","category":"기능사","field":"건축","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["도장·습식·방수·석공사업","실내건축공사업"]},
+    {"name":"미장기능사","category":"기능사","field":"건축","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["도장·습식·방수·석공사업"]},
+    {"name":"도장기능사","category":"기능사","field":"건축","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["도장·습식·방수·석공사업"]},
+    {"name":"건축응용제도기능사","category":"기능사","field":"건축","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["실내건축공사업"]},
+    {"name":"실내건축기능사","category":"기능사","field":"건축","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["실내건축공사업"]},
+    {"name":"콘크리트기능사","category":"기능사","field":"건축","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["철근·콘크리트공사업"]},
+    {"name":"전기기능사","category":"기능사","field":"전기","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["전기공사업"]},
+    {"name":"배관기능사","category":"기능사","field":"기계설비","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["기계가스설비공사업","상·하수도설비공사업","가스난방공사업"]},
+    {"name":"가스기능사","category":"기능사","field":"가스","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["가스난방공사업","기계가스설비공사업"]},
+    {"name":"굴삭기운전기능사","category":"기능사","field":"중장비","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["지반조성·포장공사업","구조물해체·비계공사업"]},
+    {"name":"기중기운전기능사","category":"기능사","field":"중장비","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["지반조성·포장공사업","철강구조물공사업"]},
+    {"name":"지게차운전기능사","category":"기능사","field":"중장비","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["도장·습식·방수·석공사업"]},
+    {"name":"용접기능사","category":"기능사","field":"기계","grade":"기능사","issuer":"한국산업인력공단",
+     "applicable":["철강구조물공사업","기계가스설비공사업"]},
+
+    # ====== 건설기술자 (한국건설기술인협회) — 분야별 등급 ======
+    {"name":"건설기술자(토목) 초급","category":"건설기술자","field":"토목","grade":"초급","issuer":"한국건설기술인협회",
+     "applicable":["토목공사업","지반조성·포장공사업","상·하수도설비공사업"], "note":"국가기술자격 또는 학력+경력으로 신고"},
+    {"name":"건설기술자(토목) 중급","category":"건설기술자","field":"토목","grade":"중급","issuer":"한국건설기술인협회",
+     "applicable":["토목공사업","토목건축공사업"]},
+    {"name":"건설기술자(토목) 고급","category":"건설기술자","field":"토목","grade":"고급","issuer":"한국건설기술인협회",
+     "applicable":["토목공사업","토목건축공사업"]},
+    {"name":"건설기술자(토목) 특급","category":"건설기술자","field":"토목","grade":"특급","issuer":"한국건설기술인협회",
+     "applicable":["토목공사업","토목건축공사업","정밀안전점검(시설물)"]},
+    {"name":"건설기술자(건축) 초급","category":"건설기술자","field":"건축","grade":"초급","issuer":"한국건설기술인협회",
+     "applicable":["건축공사업","실내건축공사업","철근·콘크리트공사업"]},
+    {"name":"건설기술자(건축) 중급","category":"건설기술자","field":"건축","grade":"중급","issuer":"한국건설기술인협회",
+     "applicable":["건축공사업","토목건축공사업"]},
+    {"name":"건설기술자(건축) 고급","category":"건설기술자","field":"건축","grade":"고급","issuer":"한국건설기술인협회",
+     "applicable":["건축공사업"]},
+    {"name":"건설기술자(건축) 특급","category":"건설기술자","field":"건축","grade":"특급","issuer":"한국건설기술인협회",
+     "applicable":["건축공사업","정밀안전점검(시설물)"]},
+    {"name":"건설기술자(기계설비)","category":"건설기술자","field":"기계설비","grade":"분야자격","issuer":"한국건설기술인협회",
+     "applicable":["기계가스설비공사업","가스난방공사업"]},
+    {"name":"건설기술자(전기)","category":"건설기술자","field":"전기","grade":"분야자격","issuer":"한국건설기술인협회",
+     "applicable":["전기공사업"]},
+    {"name":"건설기술자(정보통신)","category":"건설기술자","field":"정보통신","grade":"분야자격","issuer":"한국건설기술인협회",
+     "applicable":["정보통신공사업"]},
+    {"name":"건설기술자(조경)","category":"건설기술자","field":"조경","grade":"분야자격","issuer":"한국건설기술인협회",
+     "applicable":["조경식재·시설물공사업"]},
+    {"name":"건설기술자(안전)","category":"건설기술자","field":"안전","grade":"분야자격","issuer":"한국건설기술인협회",
+     "applicable":["구조물해체·비계공사업"]},
+
+    # ====== 환경·특수 ======
+    {"name":"석면해체작업감독자","category":"특수교육","field":"안전·환경","grade":"교육이수","issuer":"고용노동부 (KOSHA 위탁)",
+     "applicable":["석면해체·제거업"], "note":"산안법상 별도 교육·자격"},
+    {"name":"석면해체감리원","category":"특수교육","field":"안전·환경","grade":"교육이수","issuer":"환경부",
+     "applicable":["석면해체·제거업"]},
+    {"name":"산업안전관리자","category":"법정선임","field":"안전","grade":"-","issuer":"고용노동부",
+     "applicable":["구조물해체·비계공사업","석면해체·제거업"], "note":"50인 이상 사업장 필수"},
+    {"name":"건설안전관리자","category":"법정선임","field":"안전","grade":"-","issuer":"고용노동부",
+     "applicable":["토목공사업","건축공사업"], "note":"공사규모 별 의무 선임"},
+    {"name":"소방시설관리사","category":"국가전문자격","field":"소방","grade":"-","issuer":"한국소방산업기술원",
+     "applicable":["소방시설공사업"]},
+    {"name":"문화재수리기술자","category":"국가전문자격","field":"문화재","grade":"-","issuer":"문화재청",
+     "applicable":["문화재수리업"]},
+]
+
+@app.get("/api/reference/license-types")
+def reference_license_types(_: dict = Depends(require_login)):
+    """전문건설업 면허 종류 풀카탈로그 (참고용)."""
+    return LICENSE_REFERENCE
+
+@app.get("/api/reference/certifications")
+def reference_certifications(_: dict = Depends(require_login)):
+    """건설업 자격증 카탈로그 (참고용)."""
+    return CERT_CATALOG
 
 @app.get("/api/cert-license-map")
 def cert_license_map(_: dict = Depends(require_login)):
@@ -3415,6 +3677,56 @@ def download_workers_template(_: dict = Depends(require_login)):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname_enc}"}
     )
+
+@app.post("/api/admin/full-reset")
+def admin_full_reset(user: dict = Depends(require_login)):
+    """전체 데이터 초기화 — 회사·면허·직원·자격증·주주·현장·배치·차량 모두 삭제 후
+    회사 5개 (이름만) 만 재생성. 사용자 계정·이벤트 로그·알림은 보존."""
+    if user.get("role") != "admin":
+        raise HTTPException(403, "관리자 전용입니다")
+    deleted = {}
+    with conn() as c:
+        # 순서 — FK 제약 안 걸리게
+        for tbl in [
+            "license_workers", "worker_certifications", "shareholders",
+            "deployments", "clock_records", "vehicle_assignments",
+            "vehicles", "licenses", "sites", "workers",
+            "process_instances", "competitor_bids", "my_bids",
+            "tenders", "competitors", "relations",
+        ]:
+            try:
+                cur = c.execute(f"DELETE FROM {tbl}")
+                deleted[tbl] = cur.rowcount
+            except Exception as e:
+                deleted[tbl] = f"err: {e}"
+        # 회사도 모두 삭제 후 5개 이름만 재시드
+        c.execute("DELETE FROM companies")
+        seed_companies = [
+            ("건우건설주식회사",),
+            ("(주)아이엔건설환경",),
+            ("인우건설(주)",),
+            ("새암건설(주)",),
+            ("다우건설(주)",),
+        ]
+        c.executemany("INSERT INTO companies(name) VALUES(?)", seed_companies)
+        deleted["companies_reseeded"] = 5
+    emit_event("FullReset", payload=deleted, created_by=user["id"], source="admin_ui")
+    return {"ok": True, "deleted": deleted}
+
+@app.post("/api/sites/wipe")
+def wipe_all_sites(user: dict = Depends(require_login)):
+    """모든 현장 + 배치 + 출퇴근 + 차량 배정 삭제. 회사·면허·직원은 유지."""
+    if user.get("role") != "admin":
+        raise HTTPException(403, "관리자 전용입니다")
+    deleted = {}
+    with conn() as c:
+        for tbl in ["clock_records", "deployments", "vehicle_assignments"]:
+            cur = c.execute(f"DELETE FROM {tbl}")
+            deleted[tbl] = cur.rowcount
+        cur = c.execute("DELETE FROM sites")
+        deleted["sites"] = cur.rowcount
+    emit_event("SitesWiped", payload=deleted, created_by=user["id"], source="admin_ui")
+    return {"ok": True, "deleted": deleted}
 
 @app.post("/api/workers/wipe")
 def wipe_all_workers(user: dict = Depends(require_login)):
