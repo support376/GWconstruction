@@ -2460,6 +2460,46 @@ def license_types_catalog(_: dict = Depends(require_login)):
     """표준 면허 종류 카탈로그 — 태그 입력용 자동완성 목록."""
     return LICENSE_TYPES_CATALOG
 
+@app.get("/api/cert-license-map")
+def cert_license_map(_: dict = Depends(require_login)):
+    """자격증 키워드 → 매칭 가능한 면허 매트릭스. 프론트에서 자동 매칭에 사용."""
+    return [{"cert_keyword": k, "level_required": lv, "license_types": lics}
+            for k, lv, lics in CERT_TO_LICENSE_MAP]
+
+@app.get("/api/workers/{wid}/full")
+def worker_full(wid: int, _: dict = Depends(require_login)):
+    """한 직원의 모든 관련 정보 — 자격증·매칭면허·등재면허·법인."""
+    with conn() as c:
+        w = c.execute(
+            "SELECT w.*, c.name AS company_name FROM workers w "
+            "LEFT JOIN companies c ON w.company_id=c.id WHERE w.id=?",
+            (wid,)).fetchone()
+        if not w: raise HTTPException(404, "worker not found")
+        certs = rows(c.execute(
+            "SELECT * FROM worker_certifications WHERE worker_id=? ORDER BY cert_name",
+            (wid,)).fetchall())
+        # 매칭 가능 면허 (자격증 → license_types_catalog 매칭)
+        matching_set = set()
+        for cert in certs:
+            for lic_type in find_matching_licenses(cert['cert_name'], cert['cert_level']):
+                matching_set.add(lic_type)
+        matching_licenses = sorted(list(matching_set))
+        # 현재 등재된 면허 (license_workers 기반)
+        registered = rows(c.execute(
+            """SELECT lw.*, l.license_type, l.license_no, l.expires_at, l.status,
+                      co.id AS company_id, co.name AS company_name
+               FROM license_workers lw
+               JOIN licenses l ON lw.license_id=l.id
+               JOIN companies co ON l.company_id=co.id
+               WHERE lw.worker_id=? ORDER BY co.name, l.license_type""",
+            (wid,)).fetchall())
+    return {
+        "worker": dict(w),
+        "certifications": certs,
+        "matching_license_types": matching_licenses,
+        "registered_licenses": registered,
+    }
+
 # ----- 면허 등재 직원 (license_workers) -----
 @app.get("/api/licenses/{lid}/available-workers")
 def list_available_workers_for_license(lid: int, _: dict = Depends(require_login)):

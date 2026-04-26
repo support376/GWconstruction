@@ -426,11 +426,35 @@ async function unassignWorker(wid) {
 // 직원 관리
 // ============================================================
 let _workerFilter = 'all';
+let _certLicenseMap = null;
+
+async function getCertLicenseMap() {
+  if (!_certLicenseMap) _certLicenseMap = await api.get('/api/cert-license-map');
+  return _certLicenseMap;
+}
+
+function findMatchingLicenseTypes(certs, mapData) {
+  // certs: [{cert_name, cert_level}, ...]  mapData: [{cert_keyword, level_required, license_types}]
+  const result = new Set();
+  for (const cert of certs) {
+    const name = (cert.cert_name || '').toString();
+    for (const m of mapData) {
+      if (name.includes(m.cert_keyword)) {
+        if (!m.level_required || (cert.cert_level && m.level_required === cert.cert_level)) {
+          m.license_types.forEach(lt => result.add(lt));
+        }
+      }
+    }
+  }
+  return Array.from(result);
+}
+
 route('/workers', async () => {
-  const [workers, companies, allCerts] = await Promise.all([
+  const [workers, companies, allCerts, certLicMap] = await Promise.all([
     api.get('/api/workers'),
     api.get('/api/companies'),
     api.get('/api/worker-certifications'),
+    getCertLicenseMap(),
   ]);
 
   // 자격증을 worker_id 별로 인덱싱
@@ -473,6 +497,9 @@ route('/workers', async () => {
           ${filteredWorkers.map(w => {
             const lics = (w.worker_type === 'office' ? wlMap[w.id] : null) || [];
             const certs = certMap[w.id] || [];
+            const matchingLicenses = w.worker_type === 'office' ? findMatchingLicenseTypes(certs, certLicMap) : [];
+            const registeredTypes = new Set(lics.map(l => l.license_type));
+            const matchingNotRegistered = matchingLicenses.filter(lt => !registeredTypes.has(lt));
             const resigned = w.resigned_at ? `<div style="font-size:10.5px; color:#c0392b; margin-top:2px;">⊗ 퇴사 ${w.resigned_at}</div>` : '';
             return `<tr ${w.resigned_at ? 'style="opacity:0.55;background:#fafbfc"' : ''}>
               <td>
@@ -482,16 +509,22 @@ route('/workers', async () => {
                 ${resigned}
               </td>
               <td><span class="badge ${w.worker_type==='office'?'badge-orange':'badge-blue'}">${w.worker_type==='office'?'정규직':'일용직'}</span></td>
-              <td>${w.company_name || '-'}</td>
+              <td>${w.company_id ? `<a href="#/company/${w.company_id}" style="color:var(--primary); text-decoration:none">${w.company_name||'-'}</a>` : '-'}</td>
               <td>
                 ${w.job_role || '-'}
-                ${certs.length ? `<div class="worker-lic-chips">
+                ${certs.length ? `<div class="row-section-label">📜 보유 자격증</div>
+                <div class="worker-lic-chips">
                   ${certs.map(c => `<span class="worker-lic-chip" style="background:#e8f5e9; color:#1b5e20;" title="자격증${c.cert_no?' · '+c.cert_no:''}">${c.cert_name}${c.cert_level?' '+c.cert_level:''}</span>`).join('')}
                 </div>` : ''}
-                ${lics.length ? `<div class="worker-lic-chips">
-                  ${lics.map(l => `<span class="worker-lic-chip" title="${l.company_name} · ${l.role||'기술인'}">📜 ${l.license_type}</span>`).join('')}
+                ${matchingNotRegistered.length ? `<div class="row-section-label">→ 매칭 가능 (미등재)</div>
+                <div class="worker-lic-chips">
+                  ${matchingNotRegistered.map(lt => `<span class="match-chip" title="이 자격증으로 등재 가능한 면허">${lt}</span>`).join('')}
                 </div>` : ''}
-                ${(w.worker_type==='office' && !certs.length && !lics.length) ? '<div style="font-size:10.5px; color:var(--text-muted); margin-top:3px;">자격·면허 등재 없음</div>' : ''}
+                ${lics.length ? `<div class="row-section-label">✓ 등재된 면허 (${lics.length})</div>
+                <div class="worker-lic-chips">
+                  ${lics.map(l => `<a class="registered-lic-chip" href="#/company/${l.company_id}" title="${l.role||'기술인'} — 클릭하면 ${l.company_name} 으로">📜 ${l.license_type} <span class="co">${(l.company_name||'').slice(0,4)}</span></a>`).join('')}
+                </div>` : ''}
+                ${(w.worker_type==='office' && !certs.length && !lics.length && !matchingNotRegistered.length) ? '<div style="font-size:10.5px; color:var(--text-muted); margin-top:3px;">자격·면허 정보 없음</div>' : ''}
               </td>
               <td>${w.daily_wage ? fmt(w.daily_wage) + '원' : '-'}</td>
               <td>${w.phone || '-'}</td>
@@ -2020,7 +2053,9 @@ route('/licenses', async () => {
                 <button class="staff-chip-add" data-lic-add-worker="${l.id}">+ 직원 등재</button>
               </div>
             </div>
-            <div>${l.company_name||'-'}</div>
+            <div>
+              ${l.company_id ? `<a href="#/company/${l.company_id}" style="color:var(--primary); text-decoration:none; font-weight:600;">${l.company_name||'-'}</a>` : (l.company_name||'-')}
+            </div>
             <div style="font-size:11.5px">${(l.issued_at||'-').slice(0,10)} ~ <b>${(l.expires_at||'-').slice(0,10)}</b></div>
             <div style="text-align:right">${l.capacity_amount?fmtMoney(l.capacity_amount):'-'}</div>
             <div><span class="days-left ${dCls}">${dLbl}</span></div>
@@ -2776,12 +2811,26 @@ async function renderCompanyDetail(cid) {
 // 법인 관리
 // ============================================================
 route('/companies', async () => {
-  const companies = await api.get('/api/companies');
-  // 각 법인의 의존성 (워커·현장 카운트) 계산 + 주주
-  const [workers, sites] = await Promise.all([
+  const [companies, allLicenses, workers, sites, catalog] = await Promise.all([
+    api.get('/api/companies'),
+    api.get('/api/licenses'),
     api.get('/api/workers'),
     api.get('/api/sites'),
+    getLicenseCatalog(),
   ]);
+  const catalogByName = Object.fromEntries(catalog.map(x => [x.name, x]));
+  // 면허 → 등재 직원 카운트
+  const licWorkerCount = {};
+  await Promise.all(allLicenses.map(async l => {
+    const ws = await api.get(`/api/licenses/${l.id}/workers`);
+    licWorkerCount[l.id] = ws.length;
+  }));
+  // 법인별 면허 그룹화
+  const licByCompany = {};
+  allLicenses.forEach(l => {
+    (licByCompany[l.company_id] = licByCompany[l.company_id] || []).push(l);
+  });
+  // 주주
   const shMap = {};
   await Promise.all(companies.map(async co => {
     shMap[co.id] = await api.get(`/api/companies/${co.id}/shareholders`);
@@ -2801,7 +2850,7 @@ route('/companies', async () => {
     <div class="card">
       <table class="table">
         <thead><tr>
-          <th>법인명</th><th>사업자번호</th><th>대표</th><th>보유 면허</th>
+          <th>법인명</th><th>사업자번호</th><th>대표</th><th>보유 면허 (객체)</th>
           <th style="text-align:right">소속 직원</th><th style="text-align:right">진행 현장</th><th></th>
         </tr></thead>
         <tbody>
@@ -2820,7 +2869,22 @@ route('/companies', async () => {
                   ${c.ceo || (ceoSh ? ceoSh.name : '-')}
                   ${sh.length ? `<div style="font-size:10.5px; color:var(--text-muted)">주주 ${sh.length}명</div>` : ''}
                 </td>
-                <td style="font-size:12px; color: var(--text-muted)">${c.license_info || '-'}</td>
+                <td>
+                  ${(licByCompany[c.id] || []).length === 0 ?
+                    `<span style="color:var(--text-muted); font-size:11px">등록된 면허 없음</span>` :
+                    `<div class="co-lic-chips">
+                      ${(licByCompany[c.id]||[]).map(l => {
+                        const reqN = catalogByName[l.license_type]?.min_workers || 2;
+                        const regN = licWorkerCount[l.id] || 0;
+                        const isShort = regN < reqN;
+                        const days = l.expires_at ? Math.ceil((new Date(l.expires_at) - new Date()) / 86400000) : null;
+                        const isExpiring = days !== null && days <= 60 && days >= 0;
+                        const cls = isShort ? 'short' : (isExpiring ? 'expiring' : '');
+                        const title = `${l.license_type} | ${l.license_no||'-'} | 등재 ${regN}/${reqN}${days!==null?' | D-'+days:''}`;
+                        return `<a class="co-lic-obj-chip ${cls}" href="#/licenses" title="${title}">${l.license_type.split('·')[0].slice(0,8)} <span class="cnt">${regN}/${reqN}</span></a>`;
+                      }).join('')}
+                    </div>`}
+                </td>
                 <td style="text-align:right">${workerCnt[c.id] || 0}명</td>
                 <td style="text-align:right">${siteCnt[c.id] || 0}개</td>
                 <td>

@@ -825,6 +825,55 @@ body { display: flex; min-height: 100vh; }
 }
 .lic-tag-add:hover { background: #eef3fc; border-style: solid;}
 
+/* 매칭 가능 면허 칩 (자격증 기반 자동) — 점선 보라 */
+.match-chip {
+  display: inline-flex; align-items: center;
+  background: #f5e9fa; color: #6b46c1;
+  border: 1px dashed #d8c6f0;
+  padding: 1px 7px; border-radius: 6px;
+  font-size: 10px; font-weight: 500;
+  cursor: help;
+}
+
+/* 등재된 면허 칩 — 진한 보라, 클릭 가능 */
+.registered-lic-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #6b46c1; color: #fff;
+  padding: 2px 8px; border-radius: 8px;
+  font-size: 10.5px; font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+}
+.registered-lic-chip:hover { background: #5b3aa0;}
+.registered-lic-chip .co {
+  background: rgba(255,255,255,0.25); padding: 0 4px;
+  border-radius: 3px; font-size: 9.5px;
+}
+
+/* 회사 행에 보유 면허 칩 (객체화) */
+.co-lic-chips { display: flex; flex-wrap: wrap; gap: 3px; max-width: 380px;}
+.co-lic-obj-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #eef3fc; color: #2a4a8a;
+  padding: 2px 6px; border-radius: 6px;
+  font-size: 10.5px; font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+}
+.co-lic-obj-chip:hover { background: #d4e6f7;}
+.co-lic-obj-chip.short { background: #fdedec; color: #922b21;}
+.co-lic-obj-chip.expiring { background: #fef0e0; color: #a35907;}
+.co-lic-obj-chip .cnt {
+  background: rgba(0,0,0,0.1); padding: 0 4px;
+  border-radius: 3px; font-size: 9.5px;
+}
+
+.row-section-label {
+  font-size: 9.5px; color: var(--text-muted);
+  font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px;
+  margin-top: 4px; margin-bottom: 1px;
+}
+
 /* ===== Project (큰 카드) ===== */
 .project-card {
   background: var(--card);
