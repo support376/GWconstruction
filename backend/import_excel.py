@@ -447,45 +447,44 @@ def auto_register_workers_to_licenses(c):
 
 # ====== 자격증 파싱 (메인 + 비고) ======
 def parse_cert_field(cert_str):
-    """ '토목+건축 초급' / '토목 특급, 건축 초급' / '토목기사(중급인정)' / '굴삭기운전기능사' 모두 처리. """
+    """ 자격증 컬럼 → [{name, level}] 리스트.
+    지원 케이스:
+      - 단일:           '토목특급' → [{토목, 특급}]
+      - 콤마/점/플러스:  '건축,토목 초급' / '건축.토목초급' / '건축+토목 초급' → 둘 다 초급
+      - 멀티라인:        '건축일반산업기사\\n타일기능사' → 두 자격증
+      - 마지막 레벨 전파: '건축, 토목 초급' → 건축도 초급
+      - 단일 인정 패턴:  '토목기사(중급인정)' → {토목, 중급}
+    """
     if not cert_str: return []
     s = str(cert_str).strip()
-    levels = ['특급', '고급', '중급', '초급', '기능사', '기술사', '기사', '산업기사']
-    result = []
-    # "토목기사(중급인정)" 패턴
+    if not s: return []
+    # 길이순 — 산업기사 > 기술사 > 기능사 > 기사 (짧은 것이 긴 것을 잡아먹지 않게)
+    levels = ['산업기사', '기술사', '기능사', '특급', '고급', '중급', '초급', '기사']
+    # 단일 패턴 — "토목기사(중급인정)"
     m = re.match(r'^(\S+?)기사\(([특고중초]급)인정\)$', s)
     if m:
         return [{"name": m.group(1), "level": m.group(2)}]
-    # "+" 으로 분리
-    if '+' in s:
-        last_level = None
+    # 구분자: \n, ,, ., +, /, ·, 、
+    parts = re.split(r'[\n\r,./+·、]+', s)
+    parts = [p.strip() for p in parts if p.strip()]
+    parsed = []
+    for p in parts:
+        level = None; name = p
         for lv in levels:
-            if lv in s:
-                last_level = lv
-                s = s.replace(lv, '').strip()
+            if lv in p:
+                level = lv
+                name = p.replace(lv, '').strip()
                 break
-        for part in s.split('+'):
-            p = part.strip()
-            if p: result.append({"name": p, "level": last_level})
-        return result
-    # "," 으로 분리
-    if ',' in s:
-        for part in s.split(','):
-            p = part.strip()
-            sub_level = None
-            for lv in levels:
-                if lv in p:
-                    sub_level = lv
-                    p = p.replace(lv, '').strip()
-                    break
-            if p: result.append({"name": p, "level": sub_level})
-        return result
-    # 단일
-    for lv in levels:
-        if lv in s:
-            name = s.replace(lv, '').strip()
-            return [{"name": name or s, "level": lv}]
-    return [{"name": s, "level": None}]
+        if not name: name = p
+        parsed.append({"name": name, "level": level})
+    # 마지막 레벨 → 앞쪽 None entry 에 전파 (명시된 레벨은 보존)
+    last_level = None
+    for entry in reversed(parsed):
+        if entry["level"]:
+            last_level = entry["level"]
+        elif last_level:
+            entry["level"] = last_level
+    return parsed
 
 def parse_note_certs(note):
     """비고 컬럼에서 추가 자격증 추출."""
