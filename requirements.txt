@@ -4,3 +4,4 @@ pydantic
 itsdangerous
 bcrypt
 openpyxl
+python-multipart
