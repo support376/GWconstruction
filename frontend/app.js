@@ -10,6 +10,19 @@ const fmt = n => (n || 0).toLocaleString('ko-KR');
 const fmtMoney = n => '₩ ' + fmt(n);
 const today = () => new Date().toISOString().slice(0,10);
 
+// 면허 종류명 단축 — 칩 표시용. 점(·) 토큰 분리 후 첫 조각만 쓰면 "상·하수도설비..." 가 "상"이 되니
+// 점만 제거하고 끝의 "공사업/제거업/조립공사업" 등 접미사 떼고 8자 이내로 자름.
+function shortLicName(name, max = 8) {
+  if (!name) return '-';
+  let s = String(name);
+  // 점 제거
+  s = s.replace(/·/g, '');
+  // 흔한 접미사 제거
+  s = s.replace(/(공사업|제거업|조립공사업|시설물공사업|시설물\)|업|\(시설물\))$/g, '');
+  if (s.length === 0) return name.slice(0, max);
+  return s.length > max ? s.slice(0, max) : s;
+}
+
 function _handle401(r) {
   if (r.status === 401) {
     // 현재 hash 를 보존해서 로그인 후 돌아오게 (자동 화면 전환 방지)
@@ -536,7 +549,7 @@ function renderRefCerts(items) {
           <td style="font-size:11.5px">${c.grade}</td>
           <td style="font-size:11px; color:var(--text-muted)">${c.issuer}</td>
           <td>
-            ${(c.applicable||[]).map(a => `<a href="#/licenses" class="match-chip" style="font-size:10.5px" title="이 자격으로 ${a} 면허 등재 가능">${a.split('·')[0].slice(0,8)}</a>`).join(' ')}
+            ${(c.applicable||[]).map(a => `<a href="#/licenses" class="match-chip" style="font-size:10.5px" title="이 자격으로 ${a} 면허 등재 가능">${shortLicName(a, 8)}</a>`).join(' ')}
           </td>
           <td>
             <button class="btn btn-sm" data-add-cert-name="${c.name}" data-add-cert-grade="${c.grade}" title="이 자격증으로 직원 추가 시 미리 채움">📋 사용</button>
@@ -668,8 +681,8 @@ route('/workers', async () => {
               const matchingNotRegistered = matchingLicenses.filter(lt => !registeredTypes.has(lt));
               const allCertChips = [
                 ...certs.map(c => `<span class="worker-lic-chip" title="${c.cert_no?'등록 '+c.cert_no:''}${c.acquired_at?' · 취득 '+c.acquired_at:''}">${c.cert_name}${c.cert_level?' '+c.cert_level:''}</span>`),
-                ...lics.map(l => `<a class="registered-lic-chip" href="#/company/${l.company_id}" title="${l.company_name} · ${l.role||'기술인'}">📜 ${l.license_type.split('·')[0].slice(0,6)}</a>`),
-                ...matchingNotRegistered.slice(0,3).map(lt => `<span class="worker-lic-chip match" title="자격으로 등재 가능">↳ ${lt.split('·')[0].slice(0,6)}</span>`),
+                ...lics.map(l => `<a class="registered-lic-chip" href="#/company/${l.company_id}" title="${l.company_name} · ${l.role||'기술인'} · ${l.license_type}">📜 ${shortLicName(l.license_type, 8)}</a>`),
+                ...matchingNotRegistered.slice(0,3).map(lt => `<span class="worker-lic-chip match" title="자격으로 등재 가능 · ${lt}">↳ ${shortLicName(lt, 8)}</span>`),
               ];
               return `<tr ${w.resigned_at ? 'style="opacity:0.55; background:#fafbfc"' : ''}>
                 <td class="col-name" title="${w.name}${w.position?' · '+w.position:''}${w.note?' · '+w.note:''}">
@@ -768,8 +781,24 @@ route('/workers', async () => {
   };
 });
 
-function workerModal(w, companies) {
-  const isNew = !w;
+async function workerModal(w, companies) {
+  const isNew = !w || !w.id;   // id 가 없으면 새 직원 (defaults 만 있는 경우 포함)
+  if (isNew && !w) w = {};      // 빈 객체로 표준화
+  // 카탈로그 + 기존 자격증 미리 로드
+  const [catalog, existingCerts] = await Promise.all([
+    api.get('/api/reference/certifications'),
+    !isNew ? api.get(`/api/workers/${w.id}/certifications`) : Promise.resolve([]),
+  ]);
+  // 분야별 그룹
+  const certsByField = {};
+  catalog.forEach(c => { (certsByField[c.field] = certsByField[c.field] || []).push(c); });
+  // 기존 보유 자격증 — Map(name → {id, level})
+  const existingByName = new Map(existingCerts.map(c => [c.cert_name, c]));
+  // 카탈로그에 없는 직원 보유 자격증 (커스텀)
+  const customCerts = existingCerts.filter(c => !catalog.find(cc => cc.name === c.cert_name));
+  // 분야 옵션
+  const fields = Object.keys(certsByField).sort();
+
   modal(isNew ? '+ 직원 추가' : '직원 정보 수정', `
     <div class="form-grid">
       <div class="form-row"><label>이름 *</label><input id="f-name" value="${w?.name || ''}"></div>
@@ -799,13 +828,40 @@ function workerModal(w, companies) {
       <div class="form-row"><label>예금주</label><input id="f-ah" value="${w?.account_holder || ''}"></div>
       <div class="form-row" style="grid-column:span 2"><label>계좌번호</label><input id="f-bank" value="${w?.bank_account || ''}"></div>
     </div>
+
+    <!-- ========== 자격증 다중 선택 ========== -->
+    <div class="form-row" style="margin-top:12px">
+      <label>📜 보유 자격증 (기본정보 카탈로그에서 선택, 클릭으로 토글)</label>
+      <div class="cert-picker-toolbar">
+        <input id="cert-q" type="text" placeholder="자격증명 검색" style="flex:1; min-width:140px;">
+        <select id="cert-field-filter">
+          <option value="">분야 전체</option>
+          ${fields.map(f => `<option value="${f}">${f}</option>`).join('')}
+        </select>
+        <input id="cert-custom" type="text" placeholder="카탈로그에 없는 자격증 직접 입력" style="flex:1; min-width:160px;">
+        <button class="btn btn-sm" type="button" id="cert-add-custom">+ 직접 추가</button>
+      </div>
+      <div class="cert-selected-area" id="cert-selected-area">
+        <!-- 선택된 칩 (자바스크립트로 채움) -->
+      </div>
+      <div class="cert-options-area" id="cert-options-area">
+        ${fields.map(field => `
+          <div class="cert-field-group" data-field="${field}">
+            <div class="cert-field-name">${field} <span class="cnt">${certsByField[field].length}</span></div>
+            <div class="cert-field-chips">
+              ${certsByField[field].map(c => `
+                <span class="cert-pickable" data-cert="${c.name}" data-grade="${c.grade}" title="${c.issuer} · ${(c.applicable||[]).join(', ')}">${c.name}</span>
+              `).join('')}
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+
     <div class="form-row" style="display:flex; align-items:center; gap:8px;">
-      <label style="margin:0"><input id="f-asb" type="checkbox" ${w?.asbestos_certified?'checked':''}> 석면 자격 보유</label>
+      <label style="margin:0"><input id="f-asb" type="checkbox" ${w?.asbestos_certified?'checked':''}> 석면 자격 보유 (denormalized 빠른 필터용)</label>
     </div>
     <div class="form-row"><label>비고</label><textarea id="f-note" rows="2">${w?.note || ''}</textarea></div>
-    <div style="font-size:11px; color:var(--text-muted); margin-top:6px;">
-      ※ 자격증은 저장 후 직원 행의 자격증 칩 또는 법인 상세 페이지에서 추가하세요.
-    </div>
   `, async () => {
     const payload = {
       name: $('#f-name').value.trim(),
@@ -826,10 +882,121 @@ function workerModal(w, companies) {
       note: $('#f-note').value.trim() || null,
     };
     if (!payload.name) { alert('이름을 입력하세요'); return false; }
-    if (isNew) await api.post('/api/workers', payload);
-    else      await api.put('/api/workers/' + w.id, payload);
+    let workerId;
+    if (isNew) {
+      const r = await api.post('/api/workers', payload);
+      workerId = r.id;
+    } else {
+      await api.put('/api/workers/' + w.id, payload);
+      workerId = w.id;
+    }
+    // 자격증 변경사항 동기화
+    const selectedNow = window.__certSelected || new Map();   // name → {grade, issuer, custom?}
+    // 추가: 현재 선택 중인데 기존에 없던 것
+    for (const [name, meta] of selectedNow.entries()) {
+      if (!existingByName.has(name)) {
+        try {
+          await api.post(`/api/workers/${workerId}/certifications`, {
+            cert_name: name,
+            cert_level: meta.grade && meta.grade !== '-' && meta.grade !== '분야자격' && meta.grade !== '교육이수' ? meta.grade : null,
+            note: meta.issuer ? `발급: ${meta.issuer}` : null,
+          });
+        } catch (e) { console.error('cert add fail', name, e); }
+      }
+    }
+    // 삭제: 기존엔 있었는데 지금 빠진 것
+    for (const [name, c] of existingByName.entries()) {
+      if (!selectedNow.has(name)) {
+        try {
+          await api.del(`/api/workers/${workerId}/certifications/${c.id}`);
+        } catch (e) { console.error('cert del fail', name, e); }
+      }
+    }
+    // 정리
+    delete window.__certSelected;
     navigate();
   });
+
+  // ========== 자격증 피커 인터랙션 ==========
+  // 선택된 자격증 Map(name → {grade, issuer, custom?})
+  window.__certSelected = new Map();
+  // 기존 자격증 = 미리 선택
+  existingCerts.forEach(c => {
+    const cat = catalog.find(cc => cc.name === c.cert_name);
+    window.__certSelected.set(c.cert_name, {
+      grade: cat?.grade || c.cert_level,
+      issuer: cat?.issuer || null,
+      custom: !cat,
+    });
+  });
+  const refreshSelectedChips = () => {
+    const area = $('#cert-selected-area');
+    if (!area) return;
+    if (window.__certSelected.size === 0) {
+      area.innerHTML = '<span style="color:var(--text-muted); font-size:11.5px">선택된 자격증 없음 — 아래 카탈로그에서 클릭하거나 직접 입력</span>';
+      return;
+    }
+    area.innerHTML = [...window.__certSelected.entries()].map(([name, meta]) => `
+      <span class="cert-chip-selected ${meta.custom?'custom':''}">
+        ${name}${meta.grade && meta.grade !== '-' && meta.grade !== '분야자격' ? ' ('+meta.grade+')':''}
+        <button type="button" class="x" data-remove="${name.replace(/"/g,'&quot;')}">×</button>
+      </span>
+    `).join('');
+    area.querySelectorAll('button[data-remove]').forEach(b => b.onclick = () => {
+      window.__certSelected.delete(b.dataset.remove);
+      syncOptionStates();
+      refreshSelectedChips();
+    });
+  };
+  const syncOptionStates = () => {
+    document.querySelectorAll('.cert-pickable').forEach(c => {
+      c.classList.toggle('selected', window.__certSelected.has(c.dataset.cert));
+    });
+  };
+  // 카탈로그 칩 클릭 → 선택/해제
+  setTimeout(() => {
+    document.querySelectorAll('.cert-pickable').forEach(c => c.onclick = () => {
+      const name = c.dataset.cert;
+      if (window.__certSelected.has(name)) window.__certSelected.delete(name);
+      else window.__certSelected.set(name, {
+        grade: c.dataset.grade,
+        issuer: c.title.split(' · ')[0],
+      });
+      c.classList.toggle('selected');
+      refreshSelectedChips();
+    });
+    // 검색·필터
+    const applyFilter = () => {
+      const q = ($('#cert-q').value || '').toLowerCase().trim();
+      const f = $('#cert-field-filter').value;
+      document.querySelectorAll('.cert-field-group').forEach(g => {
+        const grpField = g.dataset.field;
+        if (f && grpField !== f) { g.style.display = 'none'; return; }
+        let visibleCount = 0;
+        g.querySelectorAll('.cert-pickable').forEach(c => {
+          const name = c.dataset.cert.toLowerCase();
+          const show = !q || name.includes(q);
+          c.style.display = show ? '' : 'none';
+          if (show) visibleCount++;
+        });
+        g.style.display = visibleCount === 0 ? 'none' : '';
+      });
+    };
+    $('#cert-q').oninput = applyFilter;
+    $('#cert-field-filter').onchange = applyFilter;
+    // 직접 추가
+    $('#cert-add-custom').onclick = () => {
+      const name = $('#cert-custom').value.trim();
+      if (!name) { alert('자격증명을 입력하세요'); return; }
+      if (window.__certSelected.has(name)) { alert('이미 선택됨'); return; }
+      window.__certSelected.set(name, { grade: null, issuer: null, custom: true });
+      $('#cert-custom').value = '';
+      refreshSelectedChips();
+      syncOptionStates();
+    };
+    refreshSelectedChips();
+    syncOptionStates();
+  }, 50);
 }
 
 // ============================================================
@@ -3400,44 +3567,9 @@ function shareholderModal(companyId, sh, regulars) {
 
 // ====== 직원 추가 (회사 상세에서) — 회사 미리 선택, 정규직(office) 기본 ======
 function workerModalForCompany(w, defaultCompanyId, allCompanies) {
-  const isNew = !w;
-  modal(isNew ? '➕ 직원 추가' : '직원 정보 수정', `
-    <div class="form-grid">
-      <div class="form-row"><label>이름 *</label><input id="f-n" value="${w?.name||''}"></div>
-      <div class="form-row"><label>법인 *</label>
-        <select id="f-co">
-          ${allCompanies.map(co => `<option value="${co.id}" ${(w?.company_id||defaultCompanyId)==co.id?'selected':''}>${co.name}</option>`).join('')}
-        </select>
-      </div>
-      <div class="form-row"><label>구분</label>
-        <select id="f-wt">
-          <option value="office" ${(!w||w.worker_type==='office')?'selected':''}>정규직 (사무직)</option>
-          <option value="daily" ${w?.worker_type==='daily'?'selected':''}>일용직</option>
-        </select>
-      </div>
-      <div class="form-row"><label>직책</label><input id="f-jr" value="${w?.job_role||''}" placeholder="예: 정규직, 현장소장"></div>
-      <div class="form-row"><label>입사일</label><input id="f-h" type="date" value="${(w?.hired_date||'').slice(0,10)}"></div>
-      <div class="form-row"><label>전화번호</label><input id="f-p" value="${w?.phone||''}"></div>
-    </div>
-    <div class="form-row"><label>비고</label><input id="f-nt" value="${w?.note||''}"></div>
-    <div style="font-size:11px; color:var(--text-muted); margin-top:8px;">
-      ※ 추가 후 자격증·주민번호·계좌 등은 직원 카드의 "+ 자격증" 또는 직원 페이지에서 입력하세요.
-    </div>
-  `, async () => {
-    const payload = {
-      name: $('#f-n').value.trim(),
-      company_id: +$('#f-co').value,
-      worker_type: $('#f-wt').value,
-      job_role: $('#f-jr').value.trim() || null,
-      hired_date: $('#f-h').value || null,
-      phone: $('#f-p').value.trim() || null,
-      note: $('#f-nt').value.trim() || null,
-    };
-    if (!payload.name) { alert('이름을 입력하세요'); return false; }
-    if (isNew) await api.post('/api/workers', payload);
-    else      await api.put('/api/workers/' + w.id, payload);
-    navigate();
-  });
+  // 법인 상세에서 호출됨 — 풀 모달(workerModal)에 회사 미리 선택해서 위임
+  const wFilled = w || { company_id: defaultCompanyId, worker_type: 'office' };
+  return workerModal(wFilled, allCompanies);
 }
 
 // ============================================================
@@ -3511,7 +3643,7 @@ route('/companies', async () => {
                   const regN = licWorkerCount[l.id] || 0;
                   const days = l.expires_at ? Math.ceil((new Date(l.expires_at) - new Date()) / 86400000) : null;
                   const cls = (regN < reqN) ? 'short' : (days !== null && days <= 60 && days >= 0 ? 'expiring' : '');
-                  return `<span class="co-lic-obj-chip ${cls}" title="${l.license_type} · ${l.license_no||''} · 등재 ${regN}/${reqN}${days!==null?' · D'+(days>=0?'-':'+')+Math.abs(days):''}">${l.license_type.split('·')[0].slice(0,10)} <span class="cnt">${regN}/${reqN}</span></span>`;
+                  return `<span class="co-lic-obj-chip ${cls}" title="${l.license_type} · ${l.license_no||''} · 등재 ${regN}/${reqN}${days!==null?' · D'+(days>=0?'-':'+')+Math.abs(days):''}">${shortLicName(l.license_type, 10)} <span class="cnt">${regN}/${reqN}</span></span>`;
                 }).join('')}
             </div>
             <div class="cc-foot">

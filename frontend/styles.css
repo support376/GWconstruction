@@ -1090,6 +1090,59 @@ body { display: flex; min-height: 100vh; }
 .ref-list { padding-left: 16px; font-size: 12px; line-height: 1.5;}
 .ref-list li { margin-bottom: 2px;}
 
+/* ===== workerModal 자격증 피커 ===== */
+.cert-picker-toolbar {
+  display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px;
+}
+.cert-picker-toolbar input, .cert-picker-toolbar select {
+  padding: 5px 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 4px;
+}
+.cert-selected-area {
+  min-height: 36px; padding: 8px 10px;
+  background: #f0f8f3; border: 1px dashed #bce5c5; border-radius: 6px;
+  margin-bottom: 8px;
+  display: flex; flex-wrap: wrap; gap: 4px;
+}
+.cert-chip-selected {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #196f3d; color: white;
+  padding: 3px 8px 3px 10px; border-radius: 12px;
+  font-size: 11.5px; font-weight: 600;
+}
+.cert-chip-selected.custom { background: #b56708; }   /* 직접 입력한 것 */
+.cert-chip-selected .x {
+  background: rgba(255,255,255,0.3); border: none; color: white;
+  font-size: 14px; line-height: 1; padding: 0 5px; cursor: pointer;
+  border-radius: 50%; margin-left: 2px;
+}
+.cert-chip-selected .x:hover { background: rgba(255,255,255,0.5); }
+
+.cert-options-area {
+  max-height: 280px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px;
+  background: #fafbfc;
+}
+.cert-field-group { margin-bottom: 10px; }
+.cert-field-group:last-child { margin-bottom: 0; }
+.cert-field-name {
+  font-size: 11px; font-weight: 700; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 4px;
+  padding-bottom: 2px; border-bottom: 1px solid var(--border);
+}
+.cert-field-name .cnt { background: #e5e7eb; padding: 0 5px; border-radius: 8px; font-size: 9.5px; margin-left: 4px;}
+.cert-field-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.cert-pickable {
+  display: inline-block; padding: 3px 8px; border-radius: 10px;
+  background: white; border: 1px solid var(--border);
+  font-size: 11.5px; cursor: pointer;
+  transition: all 0.1s;
+}
+.cert-pickable:hover { background: #e8f5e9; border-color: #4caf50; }
+.cert-pickable.selected {
+  background: #196f3d; color: white; border-color: #196f3d;
+  font-weight: 600;
+}
+
 /* ===== /workers 테이블 — 칸 폭 고정, 줄바꿈 제어 ===== */
 .workers-table { table-layout: fixed; width: 100%; font-size: 12.5px;}
 .workers-table th { padding: 8px 8px; vertical-align: middle;}
