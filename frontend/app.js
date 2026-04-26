@@ -3201,6 +3201,17 @@ route('/competitors', async () => {
     document.getElementById('sb-toggle')?.addEventListener('click', () => {
       document.getElementById('sidebar')?.classList.toggle('open');
     });
+    // 사이드바 접힌 그룹 토글
+    document.querySelectorAll('.sb-collapsible').forEach(el => {
+      el.addEventListener('click', () => {
+        const group = el.dataset.group;
+        const target = document.querySelector(`.sb-group[data-group="${group}"]`);
+        if (!target) return;
+        const isOpen = target.style.display !== 'none';
+        target.style.display = isOpen ? 'none' : '';
+        el.classList.toggle('open', !isOpen);
+      });
+    });
   } catch (e) {
     location.href = '/login';
     return;

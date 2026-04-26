@@ -59,6 +59,19 @@ body { display: flex; min-height: 100vh; }
   color: #6c7a99; text-transform: uppercase; letter-spacing: 0.6px;
   padding: 12px 12px 6px;
 }
+.sb-collapsible {
+  display: flex; justify-content: space-between; align-items: center;
+  cursor: pointer; user-select: none;
+  border-radius: 4px;
+  transition: background 0.1s;
+}
+.sb-collapsible:hover { background: rgba(255,255,255,0.04); color: #cbd5e8;}
+.sb-collapsible .sb-arrow {
+  font-size: 9px; opacity: 0.5; transition: transform 0.15s;
+  margin-right: 6px;
+}
+.sb-collapsible.open .sb-arrow { transform: rotate(90deg);}
+.sb-group { padding-left: 6px;}
 .sb-item {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 12px; margin-bottom: 1px;

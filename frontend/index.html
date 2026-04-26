@@ -28,42 +28,51 @@
       <span>📬 알림</span>
       <span id="notif-badge" class="sb-badge" style="display:none"></span>
     </a>
-
-    <div class="sb-section">🏗 현장 운영</div>
-    <a class="sb-item" href="#/ops">운영 대시보드</a>
-    <a class="sb-item" href="#/board-week">주간 계획</a>
-    <a class="sb-item" href="#/board">오늘 배치</a>
-    <a class="sb-item" href="#/vehicles">차량·자원</a>
-    <a class="sb-item" href="#/map">현장 지도</a>
-
-    <div class="sb-section">📋 행정 (HR·총무)</div>
     <a class="sb-item" href="#/admin-board">행정 대시보드</a>
-    <a class="sb-item" href="#/workers">직원 관리</a>
 
-    <div class="sb-section">💰 재무 (대표·경리)</div>
-    <a class="sb-item" href="#/finance-board">재무 대시보드</a>
-    <a class="sb-item" href="#/projects">프로젝트 손익</a>
-
-    <div class="sb-section">📑 입찰 (나라장터)</div>
-    <a class="sb-item" href="#/procurement">공고 분석</a>
-    <a class="sb-item" href="#/my-bids">우리 입찰</a>
-    <a class="sb-item" href="#/competitors">경쟁사</a>
-
-    <div class="sb-section">🧬 디지털 트윈</div>
-    <a class="sb-item" href="#/lens">3시점</a>
-    <a class="sb-item" href="#/timeline">타임라인</a>
-    <a class="sb-item" href="#/processes">프로세스</a>
-    <a class="sb-item" href="#/graph">엔티티 그래프</a>
-
-    <div class="sb-section">🏢 마스터</div>
-    <a class="sb-item" href="#/companies">법인</a>
-    <a class="sb-item" href="#/licenses">면허</a>
-    <a class="sb-item" href="#/sites">현장</a>
+    <div class="sb-section">📋 행정 마스터</div>
+    <a class="sb-item" href="#/workers">👷 직원 관리</a>
+    <a class="sb-item" href="#/companies">🏢 법인</a>
+    <a class="sb-item" href="#/licenses">📜 면허</a>
 
     <div class="sb-section">⚙️ 관리</div>
     <a class="sb-item admin-only" href="#/users" id="nav-users" style="display:none">사용자</a>
     <a class="sb-item admin-only" href="#/import" id="nav-import" style="display:none">📥 엑셀 임포트</a>
-    <a class="sb-item" href="#/dashboard">통합 대시보드</a>
+
+    <!-- 접힌 그룹들 — 클릭하면 펼쳐짐 -->
+    <div class="sb-section sb-collapsible" data-group="bidding">
+      <span>📑 입찰 (나라장터)</span><span class="sb-arrow">▸</span>
+    </div>
+    <div class="sb-group" data-group="bidding" style="display:none">
+      <a class="sb-item" href="#/procurement">공고 분석</a>
+      <a class="sb-item" href="#/my-bids">우리 입찰</a>
+      <a class="sb-item" href="#/competitors">경쟁사</a>
+    </div>
+
+    <div class="sb-section sb-collapsible" data-group="field">
+      <span>🏗 현장 운영</span><span class="sb-arrow">▸</span>
+    </div>
+    <div class="sb-group" data-group="field" style="display:none">
+      <a class="sb-item" href="#/ops">운영 대시보드</a>
+      <a class="sb-item" href="#/board-week">주간 계획</a>
+      <a class="sb-item" href="#/board">오늘 배치</a>
+      <a class="sb-item" href="#/sites">현장</a>
+      <a class="sb-item" href="#/map">현장 지도</a>
+      <a class="sb-item" href="#/vehicles">차량·자원</a>
+      <a class="sb-item" href="#/projects">프로젝트 손익</a>
+      <a class="sb-item" href="#/finance-board">재무 대시보드</a>
+      <a class="sb-item" href="#/dashboard">통합 대시보드</a>
+    </div>
+
+    <div class="sb-section sb-collapsible" data-group="twin">
+      <span>🧪 실험적 (디지털 트윈)</span><span class="sb-arrow">▸</span>
+    </div>
+    <div class="sb-group" data-group="twin" style="display:none">
+      <a class="sb-item" href="#/lens">3시점</a>
+      <a class="sb-item" href="#/timeline">타임라인</a>
+      <a class="sb-item" href="#/processes">프로세스</a>
+      <a class="sb-item" href="#/graph">엔티티 그래프</a>
+    </div>
   </nav>
 
   <div class="sb-foot">
