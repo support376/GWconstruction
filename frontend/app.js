@@ -284,14 +284,15 @@ function renderBoard() {
 }
 
 function workerChipHtml(w, sites) {
+  // sites 가 주어지면 현장에 있는 칩 (이동 버튼들), 없으면 풀에 있는 칩 (배정 클릭만)
   const moveBtns = sites
     ? `<div style="display:flex; gap:2px; flex-wrap:wrap; justify-content:flex-end">
-         <button class="move-btn" data-wid="${w.id}" data-sid="0" title="대기로">↩</button>
+         <button class="move-btn" data-wid="${w.id}" data-sid="0" title="대기로 회수">↩</button>
          ${sites.filter(s => s.id !== w._site_id).slice(0,3).map(s =>
            `<button class="move-btn" data-wid="${w.id}" data-sid="${s.id}" title="${s.name}">→${s.name.slice(0,4)}</button>`
          ).join('')}
        </div>`
-    : '';
+    : `<button class="move-btn assign-btn" data-wid="${w.id}" title="현장 선택해서 배정">+ 배정</button>`;
   return `<div class="worker-chip ${w.worker_type === 'office' ? 'office' : 'daily'}" draggable="true" data-wid="${w.id}">
     <div>
       <span>${w.name}</span>
@@ -302,35 +303,83 @@ function workerChipHtml(w, sites) {
 }
 
 function bindDrag() {
+  // 칩 드래그 시작/끝
   $$('.worker-chip[draggable=true]').forEach(chip => {
-    chip.ondragstart = e => {
+    chip.addEventListener('dragstart', e => {
       chip.classList.add('dragging');
       e.dataTransfer.setData('text/plain', chip.dataset.wid);
       e.dataTransfer.effectAllowed = 'move';
-    };
-    chip.ondragend = () => chip.classList.remove('dragging');
+    });
+    chip.addEventListener('dragend', () => chip.classList.remove('dragging'));
   });
+  // 현장 컬럼 = 드롭 영역
   $$('.site-col').forEach(col => {
-    col.ondragover = e => { e.preventDefault(); col.classList.add('drag-over'); };
-    col.ondragleave = () => col.classList.remove('drag-over');
-    col.ondrop = async e => {
+    col.addEventListener('dragenter', e => { e.preventDefault(); });
+    col.addEventListener('dragover', e => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      col.classList.add('drag-over');
+    });
+    col.addEventListener('dragleave', () => col.classList.remove('drag-over'));
+    col.addEventListener('drop', async e => {
       e.preventDefault();
       col.classList.remove('drag-over');
       const wid = +e.dataTransfer.getData('text/plain');
       const sid = +col.dataset.sid;
       if (!wid || !sid) return;
       await assignWorker(wid, sid);
-    };
+    });
   });
+  // 풀 영역 = 드롭하면 배정 해제
   const pool = $('#pool');
-  pool.ondragover = e => { e.preventDefault(); pool.style.background = '#eef3fc'; };
-  pool.ondragleave = () => pool.style.background = '';
-  pool.ondrop = async e => {
-    e.preventDefault(); pool.style.background = '';
-    const wid = +e.dataTransfer.getData('text/plain');
-    if (!wid) return;
-    await unassignWorker(wid);
-  };
+  if (pool) {
+    pool.addEventListener('dragenter', e => { e.preventDefault(); });
+    pool.addEventListener('dragover', e => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      pool.style.background = '#eef3fc';
+    });
+    pool.addEventListener('dragleave', () => pool.style.background = '');
+    pool.addEventListener('drop', async e => {
+      e.preventDefault();
+      pool.style.background = '';
+      const wid = +e.dataTransfer.getData('text/plain');
+      if (!wid) return;
+      await unassignWorker(wid);
+    });
+  }
+  // 풀 칩 본문 클릭 (버튼 외) → 현장 선택 모달
+  $$('#pool-list .worker-chip').forEach(chip => {
+    chip.addEventListener('click', e => {
+      if (e.target.closest('.move-btn')) return;
+      const wid = +chip.dataset.wid;
+      openSitePickerModal(wid);
+    });
+  });
+}
+
+function openSitePickerModal(wid) {
+  const sites = boardState.sites;
+  const worker = boardState.workers.find(w => w.id === wid);
+  if (!sites.length) { alert('등록된 현장이 없습니다'); return; }
+  modal(`${worker?.name || '직원'} 배치할 현장 선택`, `
+    <div style="font-size:12px; color:var(--text-muted); margin-bottom:10px">
+      클릭한 현장으로 즉시 배정됩니다 (${boardState.kind === 'plan' ? '계획' : boardState.kind === 'actual' ? '실적' : '신고'} 기준).
+    </div>
+    <div class="wb-edit-modal-list">
+      ${sites.map(s => `<div class="wb-edit-row" data-sid="${s.id}">
+        <span><b>${s.name}</b> <span style="font-size:10.5px; color:var(--text-muted)">${s.address || ''}</span></span>
+        <span style="color:var(--primary); font-size:11px">선택 →</span>
+      </div>`).join('')}
+    </div>
+  `, async () => true);
+  setTimeout(() => {
+    $$('.wb-edit-row').forEach(r => r.onclick = async () => {
+      const sid = +r.dataset.sid;
+      $('#modal-root').innerHTML = '';
+      await assignWorker(wid, sid);
+    });
+  }, 30);
 }
 
 function bindMoveButtons(sites) {
@@ -338,6 +387,11 @@ function bindMoveButtons(sites) {
     btn.onclick = async e => {
       e.stopPropagation();
       const wid = +btn.dataset.wid;
+      // 풀에 있는 칩의 + 배정 버튼 → 현장 선택 모달
+      if (btn.classList.contains('assign-btn')) {
+        openSitePickerModal(wid);
+        return;
+      }
       const sid = +btn.dataset.sid;
       if (sid === 0) await unassignWorker(wid);
       else await assignWorker(wid, sid);
