@@ -967,3 +967,94 @@ body { display: flex; min-height: 100vh; }
   .project-card .pc-name { font-size: 17px; }
   .pc-stats { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* ===== 법인 카드 그리드 (/companies) ===== */
+.company-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 14px;
+}
+.company-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: var(--shadow); padding: 16px 18px;
+  display: flex; flex-direction: column; gap: 10px;
+  text-decoration: none; color: inherit;
+  transition: transform 0.1s, box-shadow 0.1s, border-color 0.1s;
+}
+.company-card:hover {
+  transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  border-color: var(--primary-light);
+}
+.cc-head { border-bottom: 1px solid var(--border); padding-bottom: 8px;}
+.cc-name { font-size: 16px; font-weight: 700; color: var(--primary);}
+.cc-biz { font-size: 11px; color: var(--text-muted); margin-top: 2px; font-family: ui-monospace, monospace;}
+.cc-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px;
+}
+.cc-grid .cc-lbl { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.3px;}
+.cc-grid .cc-val { font-size: 13px; font-weight: 600; margin-top: 1px;}
+.cc-licenses { display: flex; flex-wrap: wrap; gap: 4px; padding-top: 6px; border-top: 1px dashed var(--border);}
+.cc-foot {
+  display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted);
+  border-top: 1px dashed var(--border); padding-top: 6px; margin-top: 2px;
+}
+
+/* ===== 면허 종류별 그룹 카드 (/licenses?view=by-type) ===== */
+.lic-type-grid {
+  display: grid; grid-template-columns: 1fr; gap: 10px;
+}
+.lic-type-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: var(--shadow); padding: 14px 18px;
+}
+.lic-type-card .lt-head {
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 10px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border); margin-bottom: 8px;
+}
+.lic-type-card .lt-name { font-size: 16px; font-weight: 700; color: var(--text);}
+.lic-type-card .lt-meta { display: flex; gap: 6px; align-items: center; margin-top: 4px;}
+.lic-type-card .lt-body { display: flex; flex-direction: column; gap: 6px;}
+.lt-co-row {
+  display: flex; gap: 12px; padding: 8px 10px; background: #fafbfc;
+  border-radius: 6px; font-size: 12px;
+}
+.lt-co-row:hover { background: #f0f3f8;}
+.lt-co-name { color: var(--primary); text-decoration: none; font-weight: 700; font-size: 13px;}
+.lt-co-name:hover { text-decoration: underline;}
+
+/* 등재 직원 칩 (법인 상세 면허 카드 내부) */
+.reg-worker-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #e8f5e9; color: #196f3d;
+  padding: 2px 6px 2px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 500; margin-right: 4px;
+}
+.reg-worker-chip .x {
+  border: none; background: transparent; color: #196f3d;
+  font-size: 14px; line-height: 1; padding: 0 2px;
+  cursor: pointer; opacity: 0.5;
+}
+.reg-worker-chip .x:hover { opacity: 1; color: var(--danger);}
+
+/* 자격증 칩 ×버튼 */
+.worker-lic-chip .x {
+  border: none; background: transparent; color: inherit;
+  font-size: 13px; line-height: 1; padding: 0 0 0 4px;
+  cursor: pointer; opacity: 0.5;
+}
+.worker-lic-chip .x:hover { opacity: 1; color: var(--danger);}
+
+/* 뷰 모드 토글 */
+.view-toggle {
+  display: inline-flex; gap: 0; border: 1px solid var(--border);
+  border-radius: 6px; overflow: hidden;
+}
+.view-toggle .btn { border-radius: 0; border: none;}
+
+.btn-danger {
+  background: var(--danger); color: #fff; border-color: var(--danger);
+}
+.btn-danger:hover { background: #922b21;}
+
+.badge-blue { background: #dbeafe; color: #1e40af;}
+.badge-gray { background: #e5e7eb; color: #374151;}
+.badge-green { background: #d1fae5; color: #065f46;}

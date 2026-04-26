@@ -628,6 +628,30 @@ class CompanyIn(BaseModel):
     business_no: Optional[str] = None
     ceo: Optional[str] = None
     license_info: Optional[str] = None
+    address: Optional[str] = None
+    fiscal_year_end: Optional[str] = None
+    incorporation_date: Optional[str] = None
+    registration_date: Optional[str] = None
+
+class CertificationIn(BaseModel):
+    cert_name: str
+    cert_level: Optional[str] = None
+    cert_no: Optional[str] = None
+    acquired_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    related_business: Optional[str] = None
+    note: Optional[str] = None
+
+class ShareholderIn(BaseModel):
+    name: str
+    role: Optional[str] = None
+    rrn: Optional[str] = None
+    address: Optional[str] = None
+    shares_pct: Optional[float] = None
+    contribution: Optional[int] = None
+    registered_at: Optional[str] = None
+    worker_id: Optional[int] = None
+    note: Optional[str] = None
 
 class SiteIn(BaseModel):
     company_id: Optional[int] = None
@@ -1044,14 +1068,18 @@ def list_companies(_: dict = Depends(require_login)):
 def create_company(payload: CompanyIn, user: dict = Depends(require_login)):
     with conn() as c:
         cur = c.execute(
-            "INSERT INTO companies(name,business_no,ceo,license_info) VALUES(?,?,?,?)",
-            (payload.name, payload.business_no, payload.ceo, payload.license_info)
+            """INSERT INTO companies(name,business_no,ceo,license_info,address,
+                                     fiscal_year_end,incorporation_date,registration_date)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (payload.name, payload.business_no, payload.ceo, payload.license_info,
+             payload.address, payload.fiscal_year_end,
+             payload.incorporation_date, payload.registration_date)
         )
         new_id = cur.lastrowid
     emit_event("CompanyCreated",
                actors={"company_id": new_id},
                payload={"name": payload.name, "business_no": payload.business_no,
-                        "ceo": payload.ceo, "license_info": payload.license_info},
+                        "ceo": payload.ceo, "address": payload.address},
                created_by=user["id"], source="admin_ui")
     return {"id": new_id}
 
@@ -1062,13 +1090,18 @@ def update_company(cid: int, payload: CompanyIn, user: dict = Depends(require_lo
         if not existing:
             raise HTTPException(404, "company not found")
         c.execute(
-            "UPDATE companies SET name=?, business_no=?, ceo=?, license_info=? WHERE id=?",
-            (payload.name, payload.business_no, payload.ceo, payload.license_info, cid)
+            """UPDATE companies SET name=?, business_no=?, ceo=?, license_info=?,
+                                    address=?, fiscal_year_end=?,
+                                    incorporation_date=?, registration_date=?
+               WHERE id=?""",
+            (payload.name, payload.business_no, payload.ceo, payload.license_info,
+             payload.address, payload.fiscal_year_end,
+             payload.incorporation_date, payload.registration_date, cid)
         )
     emit_event("CompanyUpdated",
                actors={"company_id": cid},
                payload={"name": payload.name, "business_no": payload.business_no,
-                        "ceo": payload.ceo, "license_info": payload.license_info},
+                        "ceo": payload.ceo, "address": payload.address},
                created_by=user["id"], source="admin_ui")
     return {"ok": True}
 
@@ -2612,6 +2645,152 @@ def list_all_worker_certs(_: dict = Depends(require_login)):
     with conn() as c:
         return rows(c.execute(
             "SELECT * FROM worker_certifications ORDER BY worker_id, cert_name").fetchall())
+
+@app.post("/api/workers/{wid}/certifications")
+def add_worker_cert(wid: int, payload: CertificationIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        w = c.execute("SELECT name FROM workers WHERE id=?", (wid,)).fetchone()
+        if not w: raise HTTPException(404, "worker not found")
+        cur = c.execute(
+            """INSERT INTO worker_certifications
+               (worker_id, cert_name, cert_level, cert_no, acquired_at, expires_at, related_business, note)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (wid, payload.cert_name, payload.cert_level, payload.cert_no,
+             payload.acquired_at, payload.expires_at, payload.related_business, payload.note))
+        cid = cur.lastrowid
+    emit_event("CertificationAdded",
+               actors={"worker_id": wid, "worker_name": w['name']},
+               payload={"cert_name": payload.cert_name, "cert_level": payload.cert_level},
+               created_by=user["id"], source="admin_ui")
+    return {"id": cid}
+
+@app.delete("/api/workers/{wid}/certifications/{cert_id}")
+def delete_worker_cert(wid: int, cert_id: int, user: dict = Depends(require_login)):
+    with conn() as c:
+        w = c.execute("SELECT name FROM workers WHERE id=?", (wid,)).fetchone()
+        cert = c.execute("SELECT cert_name FROM worker_certifications WHERE id=? AND worker_id=?",
+                         (cert_id, wid)).fetchone()
+        if not cert: raise HTTPException(404, "cert not found")
+        c.execute("DELETE FROM worker_certifications WHERE id=? AND worker_id=?", (cert_id, wid))
+    emit_event("CertificationRemoved",
+               actors={"worker_id": wid, "worker_name": w['name'] if w else None},
+               payload={"cert_name": cert['cert_name']},
+               created_by=user["id"], source="admin_ui")
+    return {"ok": True}
+
+@app.post("/api/companies/{cid}/shareholders")
+def add_shareholder(cid: int, payload: ShareholderIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        co = c.execute("SELECT name FROM companies WHERE id=?", (cid,)).fetchone()
+        if not co: raise HTTPException(404, "company not found")
+        cur = c.execute(
+            """INSERT INTO shareholders
+               (company_id, name, role, rrn, address, shares_pct, contribution,
+                registered_at, worker_id, note)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (cid, payload.name, payload.role, payload.rrn, payload.address,
+             payload.shares_pct, payload.contribution, payload.registered_at,
+             payload.worker_id, payload.note))
+        sid = cur.lastrowid
+    emit_event("ShareholderAdded",
+               actors={"company_id": cid},
+               payload={"name": payload.name, "role": payload.role,
+                        "shares_pct": payload.shares_pct},
+               created_by=user["id"], source="admin_ui")
+    return {"id": sid}
+
+@app.put("/api/shareholders/{sid}")
+def update_shareholder(sid: int, payload: ShareholderIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        existing = c.execute("SELECT * FROM shareholders WHERE id=?", (sid,)).fetchone()
+        if not existing: raise HTTPException(404, "shareholder not found")
+        c.execute(
+            """UPDATE shareholders SET name=?, role=?, rrn=?, address=?,
+               shares_pct=?, contribution=?, registered_at=?, worker_id=?, note=?
+               WHERE id=?""",
+            (payload.name, payload.role, payload.rrn, payload.address,
+             payload.shares_pct, payload.contribution, payload.registered_at,
+             payload.worker_id, payload.note, sid))
+    emit_event("ShareholderUpdated",
+               actors={"company_id": existing['company_id']},
+               payload={"name": payload.name},
+               created_by=user["id"], source="admin_ui")
+    return {"ok": True}
+
+@app.delete("/api/shareholders/{sid}")
+def delete_shareholder(sid: int, user: dict = Depends(require_login)):
+    with conn() as c:
+        existing = c.execute("SELECT * FROM shareholders WHERE id=?", (sid,)).fetchone()
+        if not existing: raise HTTPException(404, "shareholder not found")
+        c.execute("DELETE FROM shareholders WHERE id=?", (sid,))
+    emit_event("ShareholderDeleted",
+               actors={"company_id": existing['company_id']},
+               payload={"name": existing['name']},
+               created_by=user["id"], source="admin_ui")
+    return {"ok": True}
+
+# ====== 면허 종류별 보기 — '철근·콘크리트공사업' 면허를 가진 모든 회사 + 직원 ======
+@app.get("/api/licenses/by-type")
+def licenses_by_type(_: dict = Depends(require_login)):
+    """면허 종류별로 그룹화 — 각 종류마다 보유 회사 리스트(만료일·등재 직원)."""
+    with conn() as c:
+        all_licenses = rows(c.execute(
+            """SELECT l.*, co.name AS company_name, co.business_no, co.ceo
+               FROM licenses l JOIN companies co ON l.company_id=co.id
+               ORDER BY l.license_type, co.name""").fetchall())
+        # 등재 직원 수 + 이름들
+        for l in all_licenses:
+            ws = rows(c.execute(
+                """SELECT lw.worker_id, w.name, w.job_role, lw.role
+                   FROM license_workers lw JOIN workers w ON lw.worker_id=w.id
+                   WHERE lw.license_id=? ORDER BY w.name""", (l['id'],)).fetchall())
+            l['registered_workers'] = ws
+            l['registered_count'] = len(ws)
+    # 카탈로그에서 min_workers 가져와 충족도 계산
+    catalog_by_name = {x['name']: x for x in LICENSE_TYPES_CATALOG}
+    grouped = {}
+    for l in all_licenses:
+        t = l['license_type']
+        if t not in grouped:
+            cat = catalog_by_name.get(t, {})
+            grouped[t] = {
+                "license_type": t,
+                "category": cat.get('category', '기타'),
+                "min_workers": cat.get('min_workers', 2),
+                "min_capital": cat.get('min_capital', 0),
+                "companies": [],
+            }
+        # 충족 여부
+        satisfied = l['registered_count'] >= grouped[t]['min_workers']
+        # 만료까지 일수
+        days_to_expiry = None
+        if l.get('expires_at'):
+            try:
+                from datetime import datetime as dt
+                d = dt.fromisoformat(l['expires_at'][:10])
+                days_to_expiry = (d - dt.utcnow()).days
+            except: pass
+        grouped[t]['companies'].append({
+            "license_id": l['id'],
+            "company_id": l['company_id'],
+            "company_name": l['company_name'],
+            "business_no": l['business_no'],
+            "ceo": l['ceo'],
+            "license_no": l['license_no'],
+            "issued_at": l['issued_at'],
+            "expires_at": l['expires_at'],
+            "days_to_expiry": days_to_expiry,
+            "capacity_amount": l['capacity_amount'],
+            "status": l['status'],
+            "registered_workers": l['registered_workers'],
+            "registered_count": l['registered_count'],
+            "is_satisfied": satisfied,
+        })
+    # 카탈로그에 있지만 누구도 안 가진 면허도 노출 (선택)
+    return {
+        "groups": list(grouped.values()),
+        "catalog": LICENSE_TYPES_CATALOG,
+    }
 
 @app.get("/api/workers/{wid}/certifications")
 def get_worker_certs(wid: int, _: dict = Depends(require_login)):

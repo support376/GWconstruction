@@ -56,8 +56,13 @@ setInterval(tickClock, 1000); tickClock();
 // ============================================================
 // 모달
 // ============================================================
-function modal(title, bodyHtml, onSave) {
+function modal(title, bodyHtml, onSave, opts) {
+  opts = opts || {};
   const root = $('#modal-root');
+  const footHtml = opts.hideSubmit
+    ? `<button class="btn" id="m-cancel">닫기</button>`
+    : `<button class="btn" id="m-cancel">취소</button>
+       <button class="btn btn-primary" id="m-save">저장</button>`;
   root.innerHTML = `
     <div class="modal-bg" id="m-bg">
       <div class="modal" onclick="event.stopPropagation()">
@@ -66,17 +71,16 @@ function modal(title, bodyHtml, onSave) {
           <button class="close-x" id="m-close">×</button>
         </div>
         <div class="modal-body">${bodyHtml}</div>
-        <div class="modal-foot">
-          <button class="btn" id="m-cancel">취소</button>
-          <button class="btn btn-primary" id="m-save">저장</button>
-        </div>
+        <div class="modal-foot">${footHtml}</div>
       </div>
     </div>`;
   const close = () => { root.innerHTML = ''; };
   $('#m-close').onclick = close;
   $('#m-cancel').onclick = close;
   $('#m-bg').onclick = close;
-  $('#m-save').onclick = async () => { const ok = await onSave(); if (ok !== false) close(); };
+  if (!opts.hideSubmit) {
+    $('#m-save').onclick = async () => { const ok = await onSave(); if (ok !== false) close(); };
+  }
 }
 
 // ============================================================
@@ -2001,15 +2005,16 @@ async function getLicenseCatalog() {
   return _licCatalogCache;
 }
 
+let _licenseViewMode = 'by-type';  // 'by-type' | 'flat'
 route('/licenses', async () => {
-  const [licenses, companies, allWorkers, catalog] = await Promise.all([
+  const [licenses, companies, allWorkers, catalog, byType] = await Promise.all([
     api.get('/api/licenses'),
     api.get('/api/companies'),
     api.get('/api/workers?worker_type=office'),
     getLicenseCatalog(),
+    api.get('/api/licenses/by-type'),
   ]);
   const catalogByName = Object.fromEntries(catalog.map(x => [x.name, x]));
-  // 각 면허의 등재 직원 fetch (병렬)
   const workersByLic = {};
   await Promise.all(licenses.map(async l => {
     workersByLic[l.id] = await api.get('/api/licenses/' + l.id + '/workers');
@@ -2020,30 +2025,86 @@ route('/licenses', async () => {
     return Math.ceil((new Date(iso) - today) / 86400000);
   };
   const expiringSoon = licenses.filter(l => {
-    const d = daysToExpire(l.expires_at);
-    return d !== null && d >= 0 && d <= 90;
+    const d = daysToExpire(l.expires_at); return d !== null && d >= 0 && d <= 90;
   });
   const expired = licenses.filter(l => {
-    const d = daysToExpire(l.expires_at);
-    return d !== null && d < 0;
+    const d = daysToExpire(l.expires_at); return d !== null && d < 0;
   });
+
+  // ====== by-type 뷰 HTML ======
+  const groupsHtml = (byType.groups||[]).map(g => {
+    const cos = g.companies;
+    const allSatisfied = cos.length > 0 && cos.every(co => co.is_satisfied);
+    return `<div class="lic-type-card">
+      <div class="lt-head">
+        <div>
+          <div class="lt-name">${g.license_type}</div>
+          <div class="lt-meta">
+            <span class="badge badge-${g.category==='종합'?'blue':g.category==='전문'?'gray':'green'}">${g.category}</span>
+            <span style="color:var(--text-muted); font-size:11px">최소 ${g.min_workers}명 · 자본 ${fmtMoney(g.min_capital)} · 보유 ${cos.length}개사</span>
+          </div>
+        </div>
+        <div style="text-align:right">
+          <span class="compliance-badge ${allSatisfied?'ok':'short'}">${allSatisfied?'✓ 모두 충족':`${cos.filter(c=>c.is_satisfied).length}/${cos.length} 충족`}</span>
+        </div>
+      </div>
+      <div class="lt-body">
+        ${cos.length === 0 ? '<div style="color:var(--text-muted); font-size:12px; padding:8px">이 면허를 보유한 회사 없음</div>' :
+          cos.map(co => {
+            const days = co.days_to_expiry;
+            const dCls = days === null ? '' : days < 0 ? 'urgent' : days <= 60 ? 'warn' : 'ok';
+            const dLbl = days === null ? '-' : days < 0 ? `만료 ${-days}일` : `D-${days}`;
+            const regWs = co.registered_workers || [];
+            return `<div class="lt-co-row">
+              <div style="flex:1">
+                <a href="#/company/${co.company_id}" class="lt-co-name">${co.company_name}</a>
+                <span style="font-size:10.5px; color:var(--text-muted); margin-left:6px">${co.business_no||''}</span>
+                <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">
+                  ${co.license_no||'등록번호 미등록'} · 유효 ${(co.issued_at||'-').slice(0,10)} ~ ${(co.expires_at||'-').slice(0,10)}
+                  <span class="days-left ${dCls}" style="margin-left:6px">${dLbl}</span>
+                </div>
+              </div>
+              <div style="text-align:right; min-width:200px;">
+                <span class="compliance-badge ${co.is_satisfied?'ok':'short'}">${co.registered_count}/${g.min_workers}</span>
+                <div style="margin-top:4px;">
+                  ${regWs.length ? regWs.map(w => `<span class="staff-chip" style="font-size:10.5px">${w.name}</span>`).join('') :
+                    '<span style="color:#c0392b; font-size:10.5px">⚠ 등재 직원 없음</span>'}
+                </div>
+              </div>
+            </div>`;
+          }).join('')}
+      </div>
+    </div>`;
+  }).join('');
 
   $('#app').innerHTML = `
     <div class="page-header">
       <div>
         <div class="page-title">📜 면허 관리</div>
-        <div class="page-sub">전문건설업 면허 — 등록번호·시평액·갱신 만료 추적</div>
+        <div class="page-sub">면허 종류 ↔ 회사 ↔ 등재 직원 — 관계형 보기</div>
       </div>
-      <button class="btn btn-primary" id="add-lic">+ 면허 등록</button>
+      <div style="display:flex; gap:6px;">
+        <div class="view-toggle">
+          <button class="btn btn-sm ${_licenseViewMode==='by-type'?'btn-primary':''}" id="vt-type">📑 종류별</button>
+          <button class="btn btn-sm ${_licenseViewMode==='flat'?'btn-primary':''}" id="vt-flat">📋 일람표</button>
+        </div>
+        <button class="btn btn-primary" id="add-lic">+ 면허 등록</button>
+      </div>
     </div>
 
     <div class="stat-grid">
       <div class="stat accent"><div class="label">총 면허</div><div class="value">${licenses.length}</div></div>
       <div class="stat warning"><div class="label">만료 임박 (90일)</div><div class="value">${expiringSoon.length}</div><div class="delta">갱신 필요</div></div>
       <div class="stat ${expired.length>0?'warning':''}"><div class="label">만료됨</div><div class="value">${expired.length}</div></div>
-      <div class="stat success"><div class="label">활성 법인</div><div class="value">${new Set(licenses.map(l=>l.company_id)).size}</div></div>
+      <div class="stat success"><div class="label">면허 종류</div><div class="value">${byType.groups.length}</div><div class="delta">활성 법인 ${new Set(licenses.map(l=>l.company_id)).size}</div></div>
     </div>
 
+    ${_licenseViewMode === 'by-type' ? `
+      <div class="lic-type-grid">${groupsHtml}</div>
+      <div class="diff-banner" style="margin-top:14px">
+        💡 <b>면허 종류 단위 관리:</b> 한 종류(예: "철근·콘크리트공사업")를 어느 회사들이 보유 중인지, 각 회사의 등재 직원이 충족 인원을 채우는지 한눈에. 회사명을 클릭하면 그 법인 상세로.
+      </div>
+    ` : `
     <div class="card">
       <div class="card-head"><h3>면허 일람 (만료 임박순)</h3></div>
       <div class="lic-row" style="font-weight:700; background:#fafbfc; color:var(--text-muted); font-size:11px; text-transform:uppercase; letter-spacing:0.4px;">
@@ -2093,9 +2154,13 @@ route('/licenses', async () => {
       💡 만료 60일 내가 되면 자동으로 알림(/inbox)에 ⚠️ 경고가 뜨고, 30일 내는 🚨 긴급으로 올라갑니다.
       &nbsp; 갱신 후 만료일 수정하면 알림 자동 해소.
     </div>
+    `}
   `;
 
-  $('#add-lic').onclick = () => licenseModal(null, companies);
+  // 뷰 모드 토글
+  if ($('#vt-type')) $('#vt-type').onclick = () => { _licenseViewMode = 'by-type'; navigate(); };
+  if ($('#vt-flat')) $('#vt-flat').onclick = () => { _licenseViewMode = 'flat'; navigate(); };
+  if ($('#add-lic')) $('#add-lic').onclick = () => licenseModal(null, companies);
   $$('[data-lic-edit]').forEach(b => b.onclick = () => {
     const l = licenses.find(x => x.id == b.dataset.licEdit);
     licenseModal(l, companies);
@@ -2221,31 +2286,39 @@ async function openWorkerRegisterModal(licenseId, license, allOfficeWorkers, alr
   }, 30);
 }
 
-function licenseModal(l, companies) {
+async function licenseModal(l, companies, defaultCompanyId) {
   const isNew = !l;
-  const types = ['토목공사업','건축공사업','조경공사업','산업환경설비공사업','철근콘크리트공사업',
-                 '토공사업','지정공사업','금속구조물·창호공사업','기계설비공사업','상·하수도설비공사업',
-                 '가스시설공사업','난방시공업','시설물유지관리업','전기공사업','정보통신공사업','소방시설공사업','기타'];
-  modal(isNew ? '면허 등록' : '면허 수정', `
+  const catalog = await getLicenseCatalog();
+  // 카테고리별 그룹
+  const byCat = {};
+  catalog.forEach(c => { (byCat[c.category] = byCat[c.category] || []).push(c); });
+  const selectedType = l?.license_type;
+  const selectedCo = l?.company_id || defaultCompanyId;
+  modal(isNew ? '+ 면허 추가' : '면허 수정', `
     <div class="form-grid">
       <div class="form-row"><label>법인 *</label>
         <select id="f-company">
           <option value="">선택</option>
-          ${companies.map(c => `<option value="${c.id}" ${l?.company_id==c.id?'selected':''}>${c.name}</option>`).join('')}
+          ${companies.map(c => `<option value="${c.id}" ${selectedCo==c.id?'selected':''}>${c.name}</option>`).join('')}
         </select>
       </div>
       <div class="form-row"><label>업종 *</label>
         <select id="f-type">
-          ${types.map(t => `<option value="${t}" ${l?.license_type===t?'selected':''}>${t}</option>`).join('')}
+          <option value="">선택</option>
+          ${Object.entries(byCat).map(([cat, items]) => `
+            <optgroup label="${cat}">
+              ${items.map(t => `<option value="${t.name}" ${selectedType===t.name?'selected':''}>${t.name} (최소 ${t.min_workers}명)</option>`).join('')}
+            </optgroup>
+          `).join('')}
         </select>
       </div>
-      <div class="form-row"><label>등록번호</label><input id="f-no" value="${l?.license_no || ''}" placeholder="예: 서울-12345"></div>
+      <div class="form-row"><label>등록번호</label><input id="f-no" value="${l?.license_no || ''}" placeholder="예: 충북영동24-나-01"></div>
       <div class="form-row"><label>시평액 (원)</label><input id="f-cap" type="number" value="${l?.capacity_amount || 0}"></div>
       <div class="form-row"><label>발급일</label><input id="f-issued" type="date" value="${l?.issued_at?.slice(0,10) || ''}"></div>
       <div class="form-row"><label>만료일 *</label><input id="f-expires" type="date" value="${l?.expires_at?.slice(0,10) || ''}"></div>
       <div class="form-row"><label>상태</label>
         <select id="f-status">
-          <option value="active" ${l?.status==='active'?'selected':''}>활성</option>
+          <option value="active" ${(!l||l.status==='active')?'selected':''}>활성</option>
           <option value="suspended" ${l?.status==='suspended'?'selected':''}>정지</option>
           <option value="expired" ${l?.status==='expired'?'selected':''}>만료</option>
         </select>
@@ -2258,10 +2331,10 @@ function licenseModal(l, companies) {
       license_type: $('#f-type').value,
       license_no: $('#f-no').value.trim(),
       capacity_amount: +$('#f-cap').value || 0,
-      issued_at: $('#f-issued').value,
-      expires_at: $('#f-expires').value,
+      issued_at: $('#f-issued').value || null,
+      expires_at: $('#f-expires').value || null,
       status: $('#f-status').value,
-      note: $('#f-note').value,
+      note: $('#f-note').value || null,
     };
     if (!payload.company_id) { alert('법인을 선택해주세요'); return false; }
     if (!payload.license_type) { alert('업종을 선택해주세요'); return false; }
@@ -2710,13 +2783,14 @@ route('/company', async () => {
 });
 
 async function renderCompanyDetail(cid) {
-  const [data, sites, projects, workers, allCerts, shareholders] = await Promise.all([
+  const [data, sites, projects, workers, allCerts, shareholders, allCompanies] = await Promise.all([
     api.get(`/api/companies/${cid}/compliance`),
     api.get('/api/sites?active_only=false'),
     api.get('/api/projects?include_closed=true').catch(() => []),
     api.get('/api/workers'),
     api.get('/api/worker-certifications'),
     api.get(`/api/companies/${cid}/shareholders`),
+    api.get('/api/companies'),
   ]);
   const co = data.company;
   const licenses = data.licenses || [];
@@ -2725,39 +2799,48 @@ async function renderCompanyDetail(cid) {
   allCerts.forEach(c => { (certMap[c.worker_id] = certMap[c.worker_id] || []).push(c); });
   const myWorkers = workers.filter(w => w.company_id === cid);
   const mySites = sites.filter(s => s.company_id === cid);
-  const myProjects = projects.filter(p => p.company_id === cid);
-
   const totalContract = mySites.reduce((s,x) => s + (x.contract_amount||0), 0);
   const totalPaid = mySites.reduce((s,x) => s + (x.paid_amount||0), 0);
   const satisfied = licenses.filter(l => l.is_satisfied).length;
+  // 모든 정규직 — 직원 등재용 풀
+  const officeWorkers = workers.filter(w => w.worker_type === 'office' && (!w.resigned_at || w.resigned_at === ''));
+  const myRegulars = officeWorkers.filter(w => w.company_id === cid);
 
   $('#app').innerHTML = `
     <div class="page-header">
       <div>
         <div class="page-title">🏢 ${co.name}</div>
-        <div class="page-sub">사업자 ${co.business_no||'-'} · 대표 ${co.ceo||'-'} · 결산 ${co.fiscal_year_end||'-'}월${co.address?` · ${co.address}`:''}</div>
+        <div class="page-sub">
+          사업자 ${co.business_no||'-'} · 대표 ${co.ceo||'-'} · 결산 ${co.fiscal_year_end||'-'}월
+          ${co.address?` · ${co.address}`:''}
+        </div>
       </div>
-      <div>
+      <div style="display:flex; gap:6px;">
         <a class="btn" href="#/companies">← 목록</a>
+        <button class="btn" id="btn-edit-co">✏ 법인 정보 수정</button>
+        <button class="btn btn-danger" id="btn-del-co">🗑 법인 삭제</button>
       </div>
     </div>
 
     <div class="stat-grid">
       <div class="stat accent"><div class="label">보유 면허</div><div class="value">${licenses.length}</div><div class="delta">${satisfied}개 충족 / ${licenses.length-satisfied}개 미충족</div></div>
-      <div class="stat success"><div class="label">정규직</div><div class="value">${regulars.length}</div></div>
-      <div class="stat"><div class="label">전체 직원</div><div class="value">${myWorkers.length}</div><div class="delta">일용직 ${myWorkers.length-regulars.length}명</div></div>
+      <div class="stat success"><div class="label">정규직</div><div class="value">${myRegulars.length}</div></div>
+      <div class="stat"><div class="label">전체 직원</div><div class="value">${myWorkers.length}</div><div class="delta">퇴사자 포함</div></div>
       <div class="stat warning"><div class="label">계약·잔액</div><div class="value">${fmtMoney(totalContract - totalPaid)}</div><div class="delta">총 ${fmtMoney(totalContract)}</div></div>
     </div>
 
     <div class="card" style="margin-bottom:14px">
-      <div class="card-head"><h3>📜 보유 면허 + 충족 매트릭스 (${licenses.length})</h3></div>
+      <div class="card-head" style="display:flex; justify-content:space-between; align-items:center;">
+        <h3>📜 보유 면허 (${licenses.length})</h3>
+        <button class="btn btn-sm btn-primary" id="btn-add-lic">+ 면허 추가</button>
+      </div>
       <div class="card-pad">
-        ${licenses.length === 0 ? '<div style="color:var(--text-muted)">등록된 면허 없음 — <a href="#/licenses">/licenses</a> 에서 추가</div>' :
+        ${licenses.length === 0 ? '<div style="color:var(--text-muted)">등록된 면허 없음 — 위 "+ 면허 추가" 버튼으로 등록</div>' :
           licenses.map(l => {
             const days = l.expires_at ? Math.ceil((new Date(l.expires_at) - new Date()) / 86400000) : null;
             const expCls = days === null ? '' : days < 0 ? 'short' : days <= 60 ? 'expiring' : '';
-            const regNames = (l.registered_workers || []).map(w => w.name).join(', ');
-            return `<div style="padding:10px 0; border-bottom:1px solid #f0f1f4;">
+            const regWs = l.registered_workers || [];
+            return `<div class="lic-row" style="padding:10px 0; border-bottom:1px solid #f0f1f4;">
               <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
                 <div style="flex:1">
                   <b style="font-size:13px">${l.license_type}</b>
@@ -2768,47 +2851,67 @@ async function renderCompanyDetail(cid) {
                     ${l.capacity_amount ? ` · 시평 ${fmtMoney(l.capacity_amount)}` : ''}
                   </div>
                 </div>
-                <div style="text-align:right">
+                <div style="text-align:right; display:flex; gap:4px; align-items:center; flex-wrap:wrap;">
                   <span class="compliance-badge ${l.is_satisfied?'ok':'short'}">${l.is_satisfied?'✓ 충족':'⚠ 미충족'} ${l.registered_count}/${l.required_workers}</span>
+                  <button class="btn btn-sm" data-edit-lic="${l.id}">수정</button>
+                  <button class="btn btn-sm btn-danger" data-del-lic="${l.id}" data-lic-name="${l.license_type}">삭제</button>
                 </div>
               </div>
-              ${regNames ? `<div style="font-size:11.5px; color:#196f3d; margin-top:6px; padding-left:8px;">등재 직원: ${regNames}</div>` : '<div style="font-size:11.5px; color:#c0392b; margin-top:6px; padding-left:8px;">⚠ 등재된 기술자 없음</div>'}
+              <div style="margin-top:6px; padding-left:8px;">
+                <div style="display:flex; flex-wrap:wrap; gap:4px; align-items:center;">
+                  ${regWs.length ? regWs.map(rw => `<span class="reg-worker-chip">👷 ${rw.name}<button class="x" data-unreg-lic="${l.id}" data-unreg-w="${rw.worker_id}" data-w-name="${rw.name}" title="등재 해제">×</button></span>`).join('') :
+                    '<span style="font-size:11.5px; color:#c0392b">⚠ 등재된 기술자 없음</span>'}
+                  <button class="btn btn-sm" data-reg-lic="${l.id}" data-lic-type="${l.license_type}">+ 직원 등재</button>
+                </div>
+              </div>
             </div>`;
           }).join('')}
       </div>
     </div>
 
     <div class="card" style="margin-bottom:14px">
-      <div class="card-head"><h3>👥 정규직 + 자격증 (${regulars.length}명)</h3></div>
+      <div class="card-head" style="display:flex; justify-content:space-between; align-items:center;">
+        <h3>👥 정규직 + 자격증 (${myRegulars.length}명)</h3>
+        <button class="btn btn-sm btn-primary" id="btn-add-worker">+ 직원 추가</button>
+      </div>
       <div class="card-pad">
-        ${regulars.length === 0 ? '<div style="color:var(--text-muted)">정규직 없음</div>' :
-          '<table class="table"><thead><tr><th>이름</th><th>직책</th><th>입사일</th><th>보유 자격증</th></tr></thead><tbody>'
-          + regulars.map(w => {
-            const certs = (certMap[w.id]||[]).map(c => `<span class="worker-lic-chip" style="background:#e8f5e9; color:#1b5e20;">${c.cert_name}${c.cert_level?' '+c.cert_level:''}</span>`).join(' ');
+        ${myRegulars.length === 0 ? '<div style="color:var(--text-muted)">정규직 없음 — 위 "+ 직원 추가" 버튼으로 등록</div>' :
+          '<table class="table"><thead><tr><th>이름</th><th>직책</th><th>입사일</th><th>보유 자격증</th><th>액션</th></tr></thead><tbody>'
+          + myRegulars.map(w => {
+            const certs = (certMap[w.id]||[]).map(c => `<span class="worker-lic-chip" style="background:#e8f5e9; color:#1b5e20;">${c.cert_name}${c.cert_level?' '+c.cert_level:''}<button class="x" data-del-cert="${c.id}" data-w="${w.id}" title="삭제">×</button></span>`).join(' ');
             return `<tr>
-              <td><b>${w.name}</b></td>
+              <td><a href="#/workers" style="color:var(--primary); text-decoration:none; font-weight:600">${w.name}</a></td>
               <td style="font-size:12px">${w.job_role||'-'}</td>
               <td style="font-size:11px; color:var(--text-muted)">${w.hired_date||'-'}</td>
-              <td>${certs || '<span style="color:var(--text-muted); font-size:11px">-</span>'}</td>
+              <td>${certs || '<span style="color:var(--text-muted); font-size:11px">자격증 없음</span>'}</td>
+              <td><button class="btn btn-sm" data-add-cert="${w.id}" data-w-name="${w.name}">+ 자격증</button></td>
             </tr>`;
           }).join('') + '</tbody></table>'}
       </div>
     </div>
 
-    ${shareholders.length ? `<div class="card" style="margin-bottom:14px">
-      <div class="card-head"><h3>🏛 주주·임원 (${shareholders.length})</h3></div>
-      <table class="table">
-        <thead><tr><th>이름</th><th>역할</th><th>지분율</th><th>주민번호</th></tr></thead>
-        <tbody>
-          ${shareholders.map(s => `<tr>
-            <td><b>${s.name}</b></td>
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head" style="display:flex; justify-content:space-between; align-items:center;">
+        <h3>🏛 주주·임원 (${shareholders.length})</h3>
+        <button class="btn btn-sm btn-primary" id="btn-add-sh">+ 주주 추가</button>
+      </div>
+      <div class="card-pad">
+        ${shareholders.length === 0 ? '<div style="color:var(--text-muted)">등록된 주주 없음</div>' :
+          '<table class="table"><thead><tr><th>이름</th><th>역할</th><th style="text-align:right">지분율</th><th style="text-align:right">출자금</th><th>주민번호</th><th>주소</th><th>액션</th></tr></thead><tbody>'
+          + shareholders.map(s => `<tr>
+            <td><b>${s.name}</b>${s.worker_id ? ` <span style="font-size:10px; color:var(--text-muted)">↪ 직원</span>` : ''}</td>
             <td>${s.role||'-'}</td>
-            <td style="text-align:right">${s.shares_pct?s.shares_pct+'%':'-'}</td>
+            <td style="text-align:right">${s.shares_pct?s.shares_pct.toFixed(2)+'%':'-'}</td>
+            <td style="text-align:right">${s.contribution?fmtMoney(s.contribution):'-'}</td>
             <td style="font-size:11px; color:var(--text-muted)">${s.rrn||'-'}</td>
-          </tr>`).join('')}
-        </tbody>
-      </table>
-    </div>` : ''}
+            <td style="font-size:11px; color:var(--text-muted)">${(s.address||'').slice(0,20)}${(s.address||'').length>20?'…':''}</td>
+            <td>
+              <button class="btn btn-sm" data-edit-sh="${s.id}">수정</button>
+              <button class="btn btn-sm btn-danger" data-del-sh="${s.id}" data-sh-name="${s.name}">삭제</button>
+            </td>
+          </tr>`).join('') + '</tbody></table>'}
+      </div>
+    </div>
 
     <div class="card">
       <div class="card-head"><h3>🏗 운영 현장 (${mySites.length})</h3></div>
@@ -2827,6 +2930,226 @@ async function renderCompanyDetail(cid) {
       </table>
     </div>
   `;
+
+  // ========= 액션 바인딩 =========
+  $('#btn-edit-co').onclick = () => companyModal(co);
+  $('#btn-del-co').onclick = async () => {
+    if (!confirm(`"${co.name}" 법인을 삭제하시겠습니까?\n(이 법인을 참조하는 직원·현장이 있으면 거부됩니다)`)) return;
+    try {
+      await api.del('/api/companies/' + cid);
+      location.hash = '#/companies';
+    } catch (e) { alert('삭제 실패: 직원·현장이 참조 중입니다. 먼저 정리해주세요.'); }
+  };
+  $('#btn-add-lic').onclick = () => licenseModal(null, allCompanies, cid);
+  $$('[data-edit-lic]').forEach(b => b.onclick = async () => {
+    const lid = +b.dataset.editLic;
+    const lic = await api.get('/api/licenses').then(ls => ls.find(x => x.id === lid));
+    licenseModal(lic, allCompanies, cid);
+  });
+  $$('[data-del-lic]').forEach(b => b.onclick = async () => {
+    if (!confirm(`"${b.dataset.licName}" 면허를 삭제하시겠습니까?`)) return;
+    await api.del('/api/licenses/' + b.dataset.delLic);
+    navigate();
+  });
+  $$('[data-reg-lic]').forEach(b => b.onclick = () => {
+    licenseWorkerPickerModal(+b.dataset.regLic, b.dataset.licType, cid, officeWorkers, certMap);
+  });
+  $$('[data-unreg-lic]').forEach(b => b.onclick = async () => {
+    if (!confirm(`${b.dataset.wName} 의 등재를 해제하시겠습니까?`)) return;
+    await api.del(`/api/licenses/${b.dataset.unregLic}/workers/${b.dataset.unregW}`);
+    navigate();
+  });
+  $('#btn-add-worker').onclick = () => workerModalForCompany(null, cid, allCompanies);
+  $$('[data-add-cert]').forEach(b => b.onclick = () => {
+    certModal(+b.dataset.addCert, b.dataset.wName, null);
+  });
+  $$('[data-del-cert]').forEach(b => b.onclick = async () => {
+    if (!confirm('자격증을 삭제하시겠습니까?')) return;
+    await api.del(`/api/workers/${b.dataset.w}/certifications/${b.dataset.delCert}`);
+    navigate();
+  });
+  $('#btn-add-sh').onclick = () => shareholderModal(cid, null, myRegulars);
+  $$('[data-edit-sh]').forEach(b => b.onclick = () => {
+    const sh = shareholders.find(s => s.id == b.dataset.editSh);
+    shareholderModal(cid, sh, myRegulars);
+  });
+  $$('[data-del-sh]').forEach(b => b.onclick = async () => {
+    if (!confirm(`주주 "${b.dataset.shName}" 를 삭제하시겠습니까?`)) return;
+    await api.del('/api/shareholders/' + b.dataset.delSh);
+    navigate();
+  });
+}
+
+// ====== 면허에 직원 등재 — 가용 인력 풀에서 선택 ======
+function licenseWorkerPickerModal(licenseId, licenseType, companyId, allOfficeWorkers, certMap) {
+  // 키워드 매칭으로 추천 정렬: 같은 회사 + 자격증 매칭 > 같은 회사 > 다른 회사
+  const myCo = allOfficeWorkers.filter(w => w.company_id === companyId);
+  const otherCo = allOfficeWorkers.filter(w => w.company_id !== companyId);
+  const renderRow = (w, badge) => {
+    const certs = (certMap[w.id]||[]).map(c => `${c.cert_name}${c.cert_level?' '+c.cert_level:''}`).join(', ');
+    return `<tr>
+      <td><b>${w.name}</b> ${badge||''}</td>
+      <td style="font-size:11px; color:var(--text-muted)">${w.company_name||'-'}</td>
+      <td style="font-size:11px">${certs || '<span style="color:var(--text-muted)">자격증 없음</span>'}</td>
+      <td><button class="btn btn-sm btn-primary" data-pick-w="${w.id}" data-pick-name="${w.name}">등재</button></td>
+    </tr>`;
+  };
+  modal(`📜 ${licenseType} — 직원 등재`, `
+    <div style="font-size:12px; color:var(--text-muted); margin-bottom:10px">
+      이 면허에 기술인으로 등재할 정규직을 선택하세요. 같은 회사 직원이 우선 표시됩니다.
+    </div>
+    <div style="max-height:400px; overflow-y:auto">
+      <table class="table">
+        <thead><tr><th>이름</th><th>소속</th><th>자격증</th><th></th></tr></thead>
+        <tbody>
+          ${myCo.length ? myCo.map(w => renderRow(w, '<span style="color:#196f3d; font-size:10px">★ 같은 회사</span>')).join('') : ''}
+          ${otherCo.length ? otherCo.map(w => renderRow(w, '<span style="color:var(--text-muted); font-size:10px">↳ 타 회사</span>')).join('') : ''}
+        </tbody>
+      </table>
+    </div>
+  `, null, { hideSubmit: true });
+  // 모달 안 버튼 핸들러
+  setTimeout(() => {
+    $$('[data-pick-w]').forEach(b => b.onclick = async () => {
+      try {
+        await api.post(`/api/licenses/${licenseId}/workers`, {
+          worker_id: +b.dataset.pickW, role: '기술인'
+        });
+        navigate();  // 모달 자동 닫힘 (페이지 다시 그리기)
+      } catch (e) {
+        alert('등재 실패: ' + (e.message || e));
+      }
+    });
+  }, 50);
+}
+
+// ====== 자격증 추가 모달 ======
+function certModal(workerId, workerName, cert) {
+  const isNew = !cert;
+  modal(isNew ? `➕ ${workerName} — 자격증 추가` : `자격증 수정`, `
+    <div class="form-grid">
+      <div class="form-row"><label>자격증명 *</label>
+        <input id="f-cn" value="${cert?.cert_name||''}" placeholder="예: 토목, 건축, 굴삭기, 방수" list="cert-suggest">
+        <datalist id="cert-suggest">
+          <option value="토목"><option value="건축"><option value="기계설비"><option value="전기"><option value="정보통신">
+          <option value="소방"><option value="가스"><option value="건설안전"><option value="산업안전"><option value="콘크리트">
+          <option value="굴삭기"><option value="굴착기"><option value="비계"><option value="방수"><option value="석면">
+          <option value="실내건축"><option value="도장"><option value="습식"><option value="배관">
+        </datalist>
+      </div>
+      <div class="form-row"><label>등급</label>
+        <select id="f-cl">
+          <option value="">없음</option>
+          ${['특급','고급','중급','초급','기술사','산업기사','기능사','기사','2급','1급'].map(lv => `<option value="${lv}" ${cert?.cert_level===lv?'selected':''}>${lv}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>등록번호</label><input id="f-no" value="${cert?.cert_no||''}"></div>
+      <div class="form-row"><label>취득일</label><input id="f-acq" type="date" value="${(cert?.acquired_at||'').slice(0,10)}"></div>
+      <div class="form-row"><label>만료일</label><input id="f-exp" type="date" value="${(cert?.expires_at||'').slice(0,10)}"></div>
+      <div class="form-row"><label>관련 업종</label><input id="f-rb" value="${cert?.related_business||''}" placeholder="예: 토목, 철콘"></div>
+    </div>
+    <div class="form-row"><label>비고</label><input id="f-nt" value="${cert?.note||''}"></div>
+  `, async () => {
+    const payload = {
+      cert_name: $('#f-cn').value.trim(),
+      cert_level: $('#f-cl').value || null,
+      cert_no: $('#f-no').value.trim() || null,
+      acquired_at: $('#f-acq').value || null,
+      expires_at: $('#f-exp').value || null,
+      related_business: $('#f-rb').value.trim() || null,
+      note: $('#f-nt').value.trim() || null,
+    };
+    if (!payload.cert_name) { alert('자격증명을 입력하세요'); return false; }
+    if (isNew) await api.post(`/api/workers/${workerId}/certifications`, payload);
+    else { /* PUT 미구현 — 삭제 후 재생성 */ alert('수정은 추후 지원'); return false; }
+    navigate();
+  });
+}
+
+// ====== 주주 추가/수정 모달 ======
+function shareholderModal(companyId, sh, regulars) {
+  const isNew = !sh;
+  modal(isNew ? '➕ 주주·임원 추가' : '주주·임원 수정', `
+    <div class="form-grid">
+      <div class="form-row"><label>이름 *</label><input id="f-n" value="${sh?.name||''}"></div>
+      <div class="form-row"><label>직위</label>
+        <select id="f-r">
+          <option value="">선택</option>
+          ${['대표이사','이사','감사','사내이사','사외이사','주주'].map(r => `<option value="${r}" ${sh?.role===r?'selected':''}>${r}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>주민번호</label><input id="f-rrn" value="${sh?.rrn||''}" placeholder="000000-0000000"></div>
+      <div class="form-row"><label>지분율 (%)</label><input id="f-pct" type="number" step="0.01" value="${sh?.shares_pct||''}" placeholder="예: 50.00"></div>
+      <div class="form-row"><label>출자금 (원)</label><input id="f-co" type="number" value="${sh?.contribution||''}"></div>
+      <div class="form-row"><label>등기일</label><input id="f-rg" type="date" value="${(sh?.registered_at||'').slice(0,10)}"></div>
+    </div>
+    <div class="form-row"><label>주소</label><input id="f-ad" value="${sh?.address||''}"></div>
+    <div class="form-row"><label>연결 직원 (있다면)</label>
+      <select id="f-w">
+        <option value="">없음</option>
+        ${regulars.map(w => `<option value="${w.id}" ${sh?.worker_id==w.id?'selected':''}>${w.name}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-row"><label>비고</label><input id="f-nt" value="${sh?.note||''}"></div>
+  `, async () => {
+    const payload = {
+      name: $('#f-n').value.trim(),
+      role: $('#f-r').value || null,
+      rrn: $('#f-rrn').value.trim() || null,
+      address: $('#f-ad').value.trim() || null,
+      shares_pct: parseFloat($('#f-pct').value) || null,
+      contribution: parseInt($('#f-co').value) || null,
+      registered_at: $('#f-rg').value || null,
+      worker_id: $('#f-w').value ? +$('#f-w').value : null,
+      note: $('#f-nt').value.trim() || null,
+    };
+    if (!payload.name) { alert('이름을 입력하세요'); return false; }
+    if (isNew) await api.post(`/api/companies/${companyId}/shareholders`, payload);
+    else      await api.put(`/api/shareholders/${sh.id}`, payload);
+    navigate();
+  });
+}
+
+// ====== 직원 추가 (회사 상세에서) — 회사 미리 선택, 정규직(office) 기본 ======
+function workerModalForCompany(w, defaultCompanyId, allCompanies) {
+  const isNew = !w;
+  modal(isNew ? '➕ 직원 추가' : '직원 정보 수정', `
+    <div class="form-grid">
+      <div class="form-row"><label>이름 *</label><input id="f-n" value="${w?.name||''}"></div>
+      <div class="form-row"><label>법인 *</label>
+        <select id="f-co">
+          ${allCompanies.map(co => `<option value="${co.id}" ${(w?.company_id||defaultCompanyId)==co.id?'selected':''}>${co.name}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>구분</label>
+        <select id="f-wt">
+          <option value="office" ${(!w||w.worker_type==='office')?'selected':''}>정규직 (사무직)</option>
+          <option value="daily" ${w?.worker_type==='daily'?'selected':''}>일용직</option>
+        </select>
+      </div>
+      <div class="form-row"><label>직책</label><input id="f-jr" value="${w?.job_role||''}" placeholder="예: 정규직, 현장소장"></div>
+      <div class="form-row"><label>입사일</label><input id="f-h" type="date" value="${(w?.hired_date||'').slice(0,10)}"></div>
+      <div class="form-row"><label>전화번호</label><input id="f-p" value="${w?.phone||''}"></div>
+    </div>
+    <div class="form-row"><label>비고</label><input id="f-nt" value="${w?.note||''}"></div>
+    <div style="font-size:11px; color:var(--text-muted); margin-top:8px;">
+      ※ 추가 후 자격증·주민번호·계좌 등은 직원 카드의 "+ 자격증" 또는 직원 페이지에서 입력하세요.
+    </div>
+  `, async () => {
+    const payload = {
+      name: $('#f-n').value.trim(),
+      company_id: +$('#f-co').value,
+      worker_type: $('#f-wt').value,
+      job_role: $('#f-jr').value.trim() || null,
+      hired_date: $('#f-h').value || null,
+      phone: $('#f-p').value.trim() || null,
+      note: $('#f-nt').value.trim() || null,
+    };
+    if (!payload.name) { alert('이름을 입력하세요'); return false; }
+    if (isNew) await api.post('/api/workers', payload);
+    else      await api.put('/api/workers/' + w.id, payload);
+    navigate();
+  });
 }
 
 // ============================================================
@@ -2841,125 +3164,122 @@ route('/companies', async () => {
     getLicenseCatalog(),
   ]);
   const catalogByName = Object.fromEntries(catalog.map(x => [x.name, x]));
-  // 면허 → 등재 직원 카운트
   const licWorkerCount = {};
   await Promise.all(allLicenses.map(async l => {
     const ws = await api.get(`/api/licenses/${l.id}/workers`);
     licWorkerCount[l.id] = ws.length;
   }));
-  // 법인별 면허 그룹화
   const licByCompany = {};
   allLicenses.forEach(l => {
     (licByCompany[l.company_id] = licByCompany[l.company_id] || []).push(l);
   });
-  // 주주
   const shMap = {};
   await Promise.all(companies.map(async co => {
     shMap[co.id] = await api.get(`/api/companies/${co.id}/shareholders`);
   }));
-  const workerCnt = {}, siteCnt = {};
-  workers.forEach(w => { if (w.company_id) workerCnt[w.company_id] = (workerCnt[w.company_id]||0) + 1; });
-  sites.forEach(s   => { if (s.company_id) siteCnt[s.company_id] = (siteCnt[s.company_id]||0) + 1; });
+  const workerCnt = {}, regCnt = {}, siteCnt = {};
+  workers.forEach(w => {
+    if (!w.company_id) return;
+    workerCnt[w.company_id] = (workerCnt[w.company_id]||0) + 1;
+    if (w.worker_type === 'office' && (!w.resigned_at || w.resigned_at === '')) {
+      regCnt[w.company_id] = (regCnt[w.company_id]||0) + 1;
+    }
+  });
+  sites.forEach(s => { if (s.company_id) siteCnt[s.company_id] = (siteCnt[s.company_id]||0) + 1; });
 
   $('#app').innerHTML = `
     <div class="page-header">
       <div>
         <div class="page-title">🏢 법인 관리</div>
-        <div class="page-sub">전문건설업 그룹사 — 법인을 추가·수정·삭제</div>
+        <div class="page-sub">법인을 클릭하면 상세에서 면허·직원·주주를 추가/수정/삭제 가능합니다</div>
       </div>
-      <button class="btn btn-primary" id="add-company">+ 법인 등록</button>
+      <button class="btn btn-primary" id="add-company">+ 법인 추가</button>
     </div>
-    <div class="card">
-      <table class="table">
-        <thead><tr>
-          <th>법인명</th><th>사업자번호</th><th>대표</th><th>보유 면허 (객체)</th>
-          <th style="text-align:right">소속 직원</th><th style="text-align:right">진행 현장</th><th></th>
-        </tr></thead>
-        <tbody>
-          ${companies.length === 0 ? '<tr><td colspan="7" style="text-align:center; color:var(--text-muted)">등록된 법인 없음</td></tr>' :
-            companies.map(c => {
-              const sh = shMap[c.id] || [];
-              const ceoSh = sh.find(s => (s.role||'').includes('대표'));
-              return `<tr>
-                <td>
-                  <a href="#/company/${c.id}" style="color:var(--primary); text-decoration:none; font-weight:700;">${c.name}</a>
-                  ${c.fiscal_year_end ? `<div style="font-size:10.5px; color:var(--text-muted)">결산 ${c.fiscal_year_end}월</div>` : ''}
-                  ${c.address ? `<div style="font-size:10.5px; color:var(--text-muted)">${c.address.slice(0, 30)}...</div>` : ''}
-                </td>
-                <td>${c.business_no || '-'}</td>
-                <td>
-                  ${c.ceo || (ceoSh ? ceoSh.name : '-')}
-                  ${sh.length ? `<div style="font-size:10.5px; color:var(--text-muted)">주주 ${sh.length}명</div>` : ''}
-                </td>
-                <td>
-                  ${(licByCompany[c.id] || []).length === 0 ?
-                    `<span style="color:var(--text-muted); font-size:11px">등록된 면허 없음</span>` :
-                    `<div class="co-lic-chips">
-                      ${(licByCompany[c.id]||[]).map(l => {
-                        const reqN = catalogByName[l.license_type]?.min_workers || 2;
-                        const regN = licWorkerCount[l.id] || 0;
-                        const isShort = regN < reqN;
-                        const days = l.expires_at ? Math.ceil((new Date(l.expires_at) - new Date()) / 86400000) : null;
-                        const isExpiring = days !== null && days <= 60 && days >= 0;
-                        const cls = isShort ? 'short' : (isExpiring ? 'expiring' : '');
-                        const title = `${l.license_type} | ${l.license_no||'-'} | 등재 ${regN}/${reqN}${days!==null?' | D-'+days:''}`;
-                        return `<a class="co-lic-obj-chip ${cls}" href="#/licenses" title="${title}">${l.license_type.split('·')[0].slice(0,8)} <span class="cnt">${regN}/${reqN}</span></a>`;
-                      }).join('')}
-                    </div>`}
-                </td>
-                <td style="text-align:right">${workerCnt[c.id] || 0}명</td>
-                <td style="text-align:right">${siteCnt[c.id] || 0}개</td>
-                <td>
-                  <button class="btn btn-sm" data-edit="${c.id}">수정</button>
-                  <button class="btn btn-sm btn-danger" data-del="${c.id}" data-name="${c.name}">삭제</button>
-                </td>
-              </tr>`;
-            }).join('')}
-        </tbody>
-      </table>
+    <div class="company-grid">
+      ${companies.length === 0 ? '<div class="card card-pad" style="text-align:center; color:var(--text-muted)">등록된 법인 없음 — 우측 상단 "법인 추가" 버튼으로 시작하세요.</div>' :
+        companies.map(c => {
+          const sh = shMap[c.id] || [];
+          const ceoSh = sh.find(s => (s.role||'').includes('대표'));
+          const lics = licByCompany[c.id] || [];
+          const satisfied = lics.filter(l => (licWorkerCount[l.id]||0) >= (catalogByName[l.license_type]?.min_workers || 2)).length;
+          return `<a class="company-card" href="#/company/${c.id}">
+            <div class="cc-head">
+              <div class="cc-name">${c.name}</div>
+              <div class="cc-biz">${c.business_no || '사업자번호 미등록'}</div>
+            </div>
+            <div class="cc-grid">
+              <div><div class="cc-lbl">대표</div><div class="cc-val">${c.ceo || (ceoSh ? ceoSh.name : '-')}</div></div>
+              <div><div class="cc-lbl">결산</div><div class="cc-val">${c.fiscal_year_end ? c.fiscal_year_end + '월' : '-'}</div></div>
+              <div><div class="cc-lbl">정규직 / 전체</div><div class="cc-val">${regCnt[c.id]||0}/${workerCnt[c.id]||0}명</div></div>
+              <div><div class="cc-lbl">현장</div><div class="cc-val">${siteCnt[c.id]||0}개</div></div>
+            </div>
+            <div class="cc-licenses">
+              ${lics.length === 0 ? '<span style="color:var(--text-muted); font-size:11px">등록된 면허 없음</span>' :
+                lics.map(l => {
+                  const reqN = catalogByName[l.license_type]?.min_workers || 2;
+                  const regN = licWorkerCount[l.id] || 0;
+                  const days = l.expires_at ? Math.ceil((new Date(l.expires_at) - new Date()) / 86400000) : null;
+                  const cls = (regN < reqN) ? 'short' : (days !== null && days <= 60 && days >= 0 ? 'expiring' : '');
+                  return `<span class="co-lic-obj-chip ${cls}" title="${l.license_type} · ${l.license_no||''} · 등재 ${regN}/${reqN}${days!==null?' · D'+(days>=0?'-':'+')+Math.abs(days):''}">${l.license_type.split('·')[0].slice(0,10)} <span class="cnt">${regN}/${reqN}</span></span>`;
+                }).join('')}
+            </div>
+            <div class="cc-foot">
+              <span>📜 ${lics.length}개 면허 (${satisfied}개 충족)</span>
+              <span>🏛 주주 ${sh.length}명</span>
+            </div>
+          </a>`;
+        }).join('')}
     </div>
-    <div class="diff-banner" style="margin-top:8px">
-      💡 <b>법인 단위 운영:</b> 직원·현장 등록 시 소속 법인을 선택하면, 대시보드/3시점/그래프에서 법인별 분리 집계가 자동으로 됩니다.
-      법인을 삭제하려면 그 법인을 참조하는 직원·현장을 다른 법인으로 옮긴 뒤 삭제 가능합니다.
+    <div class="diff-banner" style="margin-top:14px">
+      💡 <b>관계형 연결:</b> 법인 ↔ 면허 ↔ 직원(자격증) 이 모두 DB로 묶여 있습니다.
+      법인 카드 → 상세에서 면허 추가/직원 등재/주주 관리, <a href="#/licenses">면허 페이지</a> 에서는 면허 종류별로 어느 회사들이 보유 중인지 조회됩니다.
     </div>
   `;
 
-  $('#add-company').onclick = () => companyModal(null);
-  $$('[data-edit]').forEach(b => b.onclick = () => {
-    const c = companies.find(x => x.id == b.dataset.edit);
-    companyModal(c);
-  });
-  $$('[data-del]').forEach(b => b.onclick = async () => {
-    if (!confirm(`"${b.dataset.name}" 법인을 삭제하시겠습니까?`)) return;
-    try {
-      await api.del('/api/companies/' + b.dataset.del);
-      navigate();
-    } catch (e) { alert('삭제 실패: 직원·현장이 참조 중입니다. 먼저 정리해주세요.'); }
-  });
+  $('#add-company').onclick = (e) => { e.preventDefault(); companyModal(null); };
 });
 
 function companyModal(c) {
   const isNew = !c;
-  modal(isNew ? '법인 등록' : '법인 수정', `
+  modal(isNew ? '법인 추가' : '법인 정보 수정', `
     <div class="form-row"><label>법인명 *</label><input id="f-name" value="${c?.name || ''}" placeholder="예: (주)지더블유종합건설"></div>
     <div class="form-grid">
       <div class="form-row"><label>사업자번호</label><input id="f-biz" value="${c?.business_no || ''}" placeholder="123-45-67890"></div>
       <div class="form-row"><label>대표자</label><input id="f-ceo" value="${c?.ceo || ''}" placeholder="홍길동"></div>
+      <div class="form-row"><label>법인등록일</label><input id="f-incorp" type="date" value="${(c?.incorporation_date||'').slice(0,10)}"></div>
+      <div class="form-row"><label>등기일</label><input id="f-reg" type="date" value="${(c?.registration_date||'').slice(0,10)}"></div>
+      <div class="form-row"><label>결산월</label>
+        <select id="f-fy">
+          <option value="">미지정</option>
+          ${[1,2,3,4,5,6,7,8,9,10,11,12].map(m => `<option value="${m}" ${c?.fiscal_year_end==String(m)?'selected':''}>${m}월</option>`).join('')}
+        </select>
+      </div>
     </div>
-    <div class="form-row"><label>보유 면허·업종</label>
-      <textarea id="f-lic" rows="3" placeholder="예: 토목공사업, 건축공사업, 철근콘크리트공사업">${c?.license_info || ''}</textarea>
+    <div class="form-row"><label>본사 주소</label><input id="f-addr" value="${c?.address || ''}" placeholder="예: 충북 영동군 양강면 국촌1길 6-6"></div>
+    <div class="form-row"><label>비고 (텍스트 메모 — 면허는 상세 페이지에서 객체로 관리)</label>
+      <textarea id="f-lic" rows="2" placeholder="">${c?.license_info || ''}</textarea>
     </div>
   `, async () => {
     const payload = {
       name: $('#f-name').value.trim(),
-      business_no: $('#f-biz').value.trim(),
-      ceo: $('#f-ceo').value.trim(),
-      license_info: $('#f-lic').value.trim(),
+      business_no: $('#f-biz').value.trim() || null,
+      ceo: $('#f-ceo').value.trim() || null,
+      address: $('#f-addr').value.trim() || null,
+      fiscal_year_end: $('#f-fy').value || null,
+      incorporation_date: $('#f-incorp').value || null,
+      registration_date: $('#f-reg').value || null,
+      license_info: $('#f-lic').value.trim() || null,
     };
     if (!payload.name) { alert('법인명을 입력하세요'); return false; }
-    if (isNew) await api.post('/api/companies', payload);
-    else      await api.put('/api/companies/' + c.id, payload);
-    navigate();
+    if (isNew) {
+      const r = await api.post('/api/companies', payload);
+      // 새 법인이면 바로 상세로 이동 (면허·직원 추가 유도)
+      if (r && r.id) location.hash = `#/company/${r.id}`;
+      else navigate();
+    } else {
+      await api.put('/api/companies/' + c.id, payload);
+      navigate();
+    }
   });
 }
 
