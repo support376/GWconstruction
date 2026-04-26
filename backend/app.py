@@ -1895,6 +1895,56 @@ class LicenseWorkerIn(BaseModel):
     role: Optional[str] = None
     note: Optional[str] = None
 
+# ---- 자격증 → 면허 매트릭스 (자동 매칭) ----
+# cert_name (또는 cert_name + level) → 매칭 가능한 license_type 목록
+# 매핑은 보수적으로 — 실제 시행령 제13조 기준 단순화
+CERT_TO_LICENSE_MAP = [
+    # 토목 자격
+    ("토목", None,  ["토목공사업", "토목건축공사업", "지반조성·포장공사업", "상·하수도설비공사업",
+                     "철도·궤도공사업", "수중·준설공사업", "철강구조물공사업"]),
+    # 건축 자격
+    ("건축", None,  ["건축공사업", "토목건축공사업", "실내건축공사업", "철근·콘크리트공사업",
+                     "도장·습식·방수·석공사업", "금속창호·지붕건축물조립공사업"]),
+    # 기계설비
+    ("기계설비", None,  ["기계가스설비공사업", "가스난방공사업"]),
+    ("건축설비", None,  ["기계가스설비공사업", "가스난방공사업"]),
+    # 전기·정보통신·소방
+    ("전기", None,      ["전기공사업"]),
+    ("정보통신", None,  ["정보통신공사업"]),
+    ("소방", None,      ["소방시설공사업"]),
+    # 가스
+    ("가스", None,      ["가스난방공사업", "기계가스설비공사업"]),
+    # 안전
+    ("건설안전", None,  ["구조물해체·비계공사업"]),  # 안전기사는 거의 모든 면허에 도움
+    ("산업안전", None,  ["구조물해체·비계공사업"]),
+    # 콘크리트
+    ("콘크리트", None,  ["철근·콘크리트공사업"]),
+    # 굴삭기·중장비
+    ("굴삭기", None,    ["지반조성·포장공사업", "구조물해체·비계공사업"]),
+    ("굴착기", None,    ["지반조성·포장공사업", "구조물해체·비계공사업"]),
+    # 비계
+    ("비계", None,      ["구조물해체·비계공사업"]),
+    # 방수
+    ("방수", None,      ["도장·습식·방수·석공사업"]),
+    # 석면
+    ("석면", None,      ["석면해체·제거업"]),
+    # 정밀안전점검
+    ("정밀안전", None,  ["정밀안전점검(시설물)"]),
+    # 시설물
+    ("시설물", None,    ["시설물유지관리업"]),
+]
+
+def find_matching_licenses(cert_name, cert_level=None):
+    """자격증 이름에서 가능한 면허 종류 목록 반환."""
+    if not cert_name: return []
+    name = str(cert_name).strip()
+    matches = []
+    for key, level_req, lic_list in CERT_TO_LICENSE_MAP:
+        if key in name:
+            if level_req is None or (cert_level and level_req == cert_level):
+                matches.extend(lic_list)
+    return list(set(matches))
+
 # ---- 표준 면허 종류 카탈로그 ----
 LICENSE_TYPES_CATALOG = [
     # 종합
@@ -2411,6 +2461,61 @@ def license_types_catalog(_: dict = Depends(require_login)):
     return LICENSE_TYPES_CATALOG
 
 # ----- 면허 등재 직원 (license_workers) -----
+@app.get("/api/licenses/{lid}/available-workers")
+def list_available_workers_for_license(lid: int, _: dict = Depends(require_login)):
+    """이 면허에 등재 가능한 정규직 추천 — 같은 회사 + 자격증 매칭."""
+    with conn() as c:
+        lic = c.execute("SELECT * FROM licenses WHERE id=?", (lid,)).fetchone()
+        if not lic: raise HTTPException(404, "license not found")
+        license_type = lic['license_type']
+        company_id = lic['company_id']
+        # 이 회사 정규직 + 미등재
+        workers_in_co = rows(c.execute(
+            """SELECT w.id, w.name, w.phone, w.position, w.job_role,
+                      EXISTS (SELECT 1 FROM license_workers WHERE license_id=? AND worker_id=w.id) AS is_registered
+               FROM workers w
+               WHERE w.company_id=? AND w.worker_type='office'
+                 AND (w.resigned_at IS NULL OR w.resigned_at='')
+               ORDER BY w.name""", (lid, company_id)).fetchall())
+        # 각 직원의 자격증
+        for w in workers_in_co:
+            certs = rows(c.execute(
+                "SELECT cert_name, cert_level FROM worker_certifications WHERE worker_id=?",
+                (w['id'],)).fetchall())
+            w['certifications'] = certs
+            # 자격증 → 면허 매칭
+            matched_certs = []
+            for cert in certs:
+                lics = find_matching_licenses(cert['cert_name'], cert['cert_level'])
+                if license_type in lics:
+                    matched_certs.append(cert)
+            w['matching_certs'] = matched_certs
+            w['is_qualified'] = len(matched_certs) > 0
+        # 그룹사 (다른 회사) 자격자도 참고로
+        other_co_workers = rows(c.execute(
+            """SELECT w.id, w.name, w.position, c.name AS company_name, c.id AS company_id
+               FROM workers w JOIN companies c ON w.company_id=c.id
+               WHERE c.id != ? AND w.worker_type='office'
+                 AND (w.resigned_at IS NULL OR w.resigned_at='')
+               ORDER BY c.name, w.name""", (company_id,)).fetchall())
+        for w in other_co_workers:
+            certs = rows(c.execute(
+                "SELECT cert_name, cert_level FROM worker_certifications WHERE worker_id=?",
+                (w['id'],)).fetchall())
+            matched = []
+            for cert in certs:
+                lics = find_matching_licenses(cert['cert_name'], cert['cert_level'])
+                if license_type in lics:
+                    matched.append(cert)
+            w['certifications'] = certs
+            w['matching_certs'] = matched
+        other_qualified = [w for w in other_co_workers if w['matching_certs']]
+    return {
+        "license": dict(lic),
+        "workers_in_company": workers_in_co,
+        "other_company_qualified": other_qualified[:20],
+    }
+
 @app.get("/api/licenses/{lid}/workers")
 def list_license_workers(lid: int, _: dict = Depends(require_login)):
     with conn() as c:
