@@ -292,13 +292,85 @@ def import_employee_directory(c, path):
     wb.close()
     return stats
 
-# ====== 2) 회사별 아웃라인 — 회사 정보 보강 ======
+# ====== 자격증 파싱 (메인 + 비고) ======
+def parse_cert_field(cert_str):
+    """ '토목+건축 초급' / '토목 특급, 건축 초급' / '토목기사(중급인정)' / '굴삭기운전기능사' 모두 처리. """
+    if not cert_str: return []
+    s = str(cert_str).strip()
+    levels = ['특급', '고급', '중급', '초급', '기능사', '기술사', '기사', '산업기사']
+    result = []
+    # "토목기사(중급인정)" 패턴
+    m = re.match(r'^(\S+?)기사\(([특고중초]급)인정\)$', s)
+    if m:
+        return [{"name": m.group(1), "level": m.group(2)}]
+    # "+" 으로 분리
+    if '+' in s:
+        last_level = None
+        for lv in levels:
+            if lv in s:
+                last_level = lv
+                s = s.replace(lv, '').strip()
+                break
+        for part in s.split('+'):
+            p = part.strip()
+            if p: result.append({"name": p, "level": last_level})
+        return result
+    # "," 으로 분리
+    if ',' in s:
+        for part in s.split(','):
+            p = part.strip()
+            sub_level = None
+            for lv in levels:
+                if lv in p:
+                    sub_level = lv
+                    p = p.replace(lv, '').strip()
+                    break
+            if p: result.append({"name": p, "level": sub_level})
+        return result
+    # 단일
+    for lv in levels:
+        if lv in s:
+            name = s.replace(lv, '').strip()
+            return [{"name": name or s, "level": lv}]
+    return [{"name": s, "level": None}]
+
+def parse_note_certs(note):
+    """비고 컬럼에서 추가 자격증 추출."""
+    if not note: return []
+    s = str(note).strip()
+    if not s: return []
+    out = []
+    for m in re.finditer(r'([가-힣\w]+?)(기능사|산업기사|기사|기술사|특급|고급|중급|초급)\s*\(([A-Z0-9]+)\)', s):
+        out.append({"name": m.group(1).strip(), "level": m.group(2).strip(), "cert_no": m.group(3).strip()})
+    if not out and '운전기능사' in s:
+        for piece in re.split(r'[,、/]', s):
+            p = piece.strip()
+            m2 = re.match(r'^([가-힣]+)\s*운전기능사', p)
+            if m2:
+                out.append({"name": m2.group(1) + '운전', "level": "기능사", "cert_no": None})
+    return out
+
+def parse_license_no_pair(no_str):
+    """'G00629876 (#0630375)' → ('G00629876', '0630375')"""
+    if not no_str: return (None, None)
+    s = str(no_str).strip()
+    main = None; sub = None
+    m = re.match(r'^([A-Z0-9-]+)', s)
+    if m: main = m.group(1)
+    m2 = re.search(r'\(#?([A-Z0-9]+)\)', s)
+    if m2: sub = m2.group(1)
+    if not main:
+        m3 = re.search(r'[A-Z0-9]{8,}', s)
+        if m3: main = m3.group(0)
+    return (main, sub)
+
+# ====== 2) 회사별 아웃라인 — 회사 정보 보강 + 기술자 정밀 임포트 ======
 def import_company_outline(c, path):
     if not path.exists():
         print(f"  [skip] {path.name} 없음")
-        return {"companies_updated": 0, "tech_added": 0}
+        return {"companies_updated": 0, "tech_added": 0, "auto_registered": 0}
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    stats = {"companies_updated": 0, "tech_added": 0}
+    stats = {"companies_updated": 0, "tech_added": 0, "auto_registered": 0}
 
     # ===== 아웃라인(2) — 사업자번호·국민연금·결산일 =====
     if "아웃라인(2)" in wb.sheetnames:
@@ -336,77 +408,165 @@ def import_company_outline(c, path):
                         c.execute("UPDATE companies SET address=COALESCE(address,?) WHERE id=?", (val_s, co_id))
                 stats["companies_updated"] += 1
 
-    # ===== 기술자 시트 — 기존 직원에 자격증 보강 =====
+    # ===== 기술자 시트 — 정밀 임포트 (메인+비고 자격증 + 자동 면허 등재) =====
     if "기술자" in wb.sheetnames:
         ws = wb["기술자"]
         current_co_id = None
-        # 헤더 추정: R5 또는 그 근처에 '성명', '주민번호', '자격종목 및 등록번호', '취득일', '입사일'
+        in_resignation_block = False  # "퇴사현황" 블록 여부
         rows_data = list(ws.iter_rows(values_only=True))
-        col_map = None
-        for ri, row in enumerate(rows_data):
-            cells = [str(x or '').strip() for x in row]
-            joined = ' '.join(cells)
-            # 회사명 행 감지
-            if any('건설' in str(x) or '아이엔' in str(x) for x in cells if x):
-                co_match = next((x for x in cells if x and ('건설' in x or '아이엔' in x)), None)
-                if co_match:
-                    cid = get_or_create_company(c, co_match)
-                    if cid: current_co_id = cid
-            # 헤더 행 감지
-            if '성명' in cells and ('주민' in joined or '자격' in joined):
-                col_map = {}
-                for ci, cell in enumerate(cells):
-                    if '성명' in cell: col_map['name'] = ci
-                    elif '주민' in cell: col_map['rrn'] = ci
-                    elif '자격' in cell or '등록번호' in cell: col_map['cert'] = ci
-                    elif '취득' in cell: col_map['acquired'] = ci
-                    elif '입사' in cell: col_map['hired'] = ci
-                    elif '직책' in cell: col_map['position'] = ci
-                continue
-            if not col_map: continue
-            # 데이터 행
-            name_idx = col_map.get('name')
-            if name_idx is None or name_idx >= len(row): continue
-            name = clean_name(row[name_idx])
-            if not name: continue
-            rrn = str(row[col_map['rrn']]).strip() if col_map.get('rrn') is not None and row[col_map['rrn']] else None
-            cert_info = str(row[col_map['cert']]).strip() if col_map.get('cert') is not None and row[col_map['cert']] else None
-            acquired = normalize_date(row[col_map['acquired']]) if col_map.get('acquired') is not None else None
-            position = str(row[col_map['position']]).strip() if col_map.get('position') is not None and row[col_map['position']] else None
+        # 컬럼 인덱스 — 시트 R5 헤더 기반 (고정)
+        # 0:성명 1:직책 2:주민번호 3:주소 4:자격종목 5:등록번호 6:취득일 7:입사일 8:퇴사일 9:급여 10:연락처 11:비고
+        col = {'name': 0, 'position': 1, 'rrn': 2, 'address': 3,
+               'cert_main': 4, 'cert_no': 5, 'acquired': 6,
+               'hired': 7, 'resigned': 8, 'salary': 9, 'phone': 10, 'note': 11}
 
+        for ri, row in enumerate(rows_data):
+            if not row: continue
+            cells = [str(x or '').strip() for x in row]
+            first = cells[0] if cells else ''
+            # "퇴사현황" 블록 진입
+            if '퇴사' in first and '현황' in first:
+                in_resignation_block = True
+                continue
+            # 회사명 행 감지 — 건설·아이엔이 cell[0] 에 있고 다른 셀들은 비어있음
+            if first and ('건설' in first or '아이엔' in first or '유신' in first or '인우' in first or '새암' in first):
+                # 헤더가 아닌 첫 셀에 회사명만 있는 행
+                if all(not c for c in cells[1:8]):
+                    cid = get_or_create_company(c, first, strict=False)
+                    if cid:
+                        current_co_id = cid
+                        in_resignation_block = False
+                    continue
+            # 헤더 행 ('성명') 스킵
+            if first == '성명': continue
+            # 데이터 행 — current_co_id 필요
             if not current_co_id: continue
-            # 직원 찾기
-            w = c.execute("SELECT id FROM workers WHERE name=? AND company_id=?", (name, current_co_id)).fetchone()
-            if not w:
-                cur = c.execute(
-                    "INSERT INTO workers(company_id, name, rrn, worker_type, position) VALUES(?,?,?,'office',?)",
-                    (current_co_id, name, rrn, position))
-                wid = cur.lastrowid
+            if not first: continue
+            name = clean_name(first)
+            if not name: continue
+
+            rrn = re.sub(r'\s+', '', cells[col['rrn']]) if col['rrn'] < len(cells) else None
+            position = cells[col['position']] if col['position'] < len(cells) else None
+            address = cells[col['address']] if col['address'] < len(cells) else None
+            cert_main = cells[col['cert_main']] if col['cert_main'] < len(cells) else None
+            cert_no_raw = cells[col['cert_no']] if col['cert_no'] < len(cells) else None
+            acquired = normalize_date(row[col['acquired']]) if col['acquired'] < len(row) else None
+            hired = normalize_date(row[col['hired']]) if col['hired'] < len(row) else None
+            resigned = normalize_date(row[col['resigned']]) if col['resigned'] < len(row) else None
+            salary_raw = row[col['salary']] if col['salary'] < len(row) else None
+            phone = cells[col['phone']] if col['phone'] < len(cells) else None
+            note = cells[col['note']] if col['note'] < len(cells) else None
+
+            # 직원 찾기/생성 (정규직 사무직)
+            existing = None
+            if rrn:
+                existing = c.execute("SELECT id FROM workers WHERE name=? AND rrn=?", (name, rrn)).fetchone()
+            if not existing:
+                existing = c.execute("SELECT id FROM workers WHERE name=? AND company_id=?",
+                                     (name, current_co_id)).fetchone()
+            if existing:
+                wid = existing[0]
+                c.execute("""UPDATE workers SET
+                    company_id=COALESCE(?,company_id),
+                    rrn=COALESCE(NULLIF(rrn,''),?),
+                    address=COALESCE(NULLIF(address,''),?),
+                    position=COALESCE(NULLIF(position,''),?),
+                    phone=COALESCE(NULLIF(phone,''),?),
+                    hired_date=COALESCE(hired_date,?),
+                    resigned_at=COALESCE(?,resigned_at),
+                    worker_type='office'
+                    WHERE id=?""",
+                    (current_co_id, rrn, address, position, phone, hired,
+                     resigned if in_resignation_block else None, wid))
             else:
-                wid = w[0]
-                if position:
-                    c.execute("UPDATE workers SET position=COALESCE(NULLIF(position,''),?) WHERE id=?", (position, wid))
-            # 자격증 정보 추가
-            if cert_info:
-                # "토목+건축 초급, G00629876 #0630375" 같은 형식
-                # 자격명만 추출
-                cert_name_part = cert_info.split(',')[0].strip()
-                cert_no_match = re.search(r'[A-Z0-9]{6,}', cert_info[len(cert_name_part):])
-                cert_no = cert_no_match.group(0) if cert_no_match else None
-                certs = parse_certifications(cert_name_part)
-                for cert in certs:
-                    dup = c.execute(
-                        "SELECT id FROM worker_certifications WHERE worker_id=? AND cert_name=?",
-                        (wid, cert["name"])).fetchone()
-                    if not dup:
-                        c.execute(
-                            """INSERT INTO worker_certifications(worker_id, cert_name, cert_level, cert_no, acquired_at)
-                               VALUES(?,?,?,?,?)""",
-                            (wid, cert["name"], cert.get("level"), cert_no, acquired))
-                        stats["tech_added"] += 1
-                    elif cert_no:
-                        c.execute("UPDATE worker_certifications SET cert_no=COALESCE(cert_no,?), acquired_at=COALESCE(acquired_at,?) WHERE worker_id=? AND cert_name=?",
-                                  (cert_no, acquired, wid, cert["name"]))
+                cur = c.execute(
+                    """INSERT INTO workers(company_id,name,rrn,address,position,phone,hired_date,
+                                            resigned_at,worker_type)
+                       VALUES(?,?,?,?,?,?,?,?,'office')""",
+                    (current_co_id, name, rrn, address, position, phone, hired,
+                     resigned if in_resignation_block else None))
+                wid = cur.lastrowid
+
+            # 메인 자격증 파싱 + 등록번호 분리
+            (cert_no_main, cert_no_sub) = parse_license_no_pair(cert_no_raw)
+            main_certs = parse_cert_field(cert_main)
+            for cert in main_certs:
+                # 중복 방지 (같은 사람·자격명·레벨)
+                dup = c.execute(
+                    "SELECT id FROM worker_certifications WHERE worker_id=? AND cert_name=? AND IFNULL(cert_level,'')=IFNULL(?,'')",
+                    (wid, cert["name"], cert.get("level"))).fetchone()
+                if not dup:
+                    c.execute(
+                        """INSERT INTO worker_certifications(worker_id,cert_name,cert_level,cert_no,acquired_at,note)
+                           VALUES(?,?,?,?,?,?)""",
+                        (wid, cert["name"], cert.get("level"), cert_no_main, acquired,
+                         f"sub: {cert_no_sub}" if cert_no_sub else None))
+                    stats["tech_added"] += 1
+                else:
+                    # 등록번호 보강
+                    c.execute(
+                        "UPDATE worker_certifications SET cert_no=COALESCE(cert_no,?), acquired_at=COALESCE(acquired_at,?) WHERE id=?",
+                        (cert_no_main, acquired, dup[0]))
+
+            # 비고 칼럼에서 추가 자격증 추출
+            for nc in parse_note_certs(note):
+                dup = c.execute(
+                    "SELECT id FROM worker_certifications WHERE worker_id=? AND cert_name=?",
+                    (wid, nc["name"])).fetchone()
+                if not dup:
+                    c.execute(
+                        """INSERT INTO worker_certifications(worker_id,cert_name,cert_level,cert_no,note)
+                           VALUES(?,?,?,?,?)""",
+                        (wid, nc["name"], nc.get("level"), nc.get("cert_no"), '비고에서 추출'))
+                    stats["tech_added"] += 1
+
+            # 석면 인력 표시 (cell 12, 13 등에서 '석면' 검출)
+            asbestos = any('석면' in (cells[k] or '') for k in range(12, min(15, len(cells))))
+            if asbestos:
+                c.execute("UPDATE workers SET asbestos_certified=1 WHERE id=?", (wid,))
+
+            # 자동 면허 등재 — 이 직원이 이 회사의 어느 면허 요건에 매칭되는지
+            # 이 회사의 모든 면허에 대해, 직원 자격증과 매칭되면 license_workers에 추가
+            if not in_resignation_block:
+                co_licenses = c.execute(
+                    "SELECT id, license_type FROM licenses WHERE company_id=? AND status='active'",
+                    (current_co_id,)).fetchall()
+                worker_certs = c.execute(
+                    "SELECT cert_name, cert_level FROM worker_certifications WHERE worker_id=?",
+                    (wid,)).fetchall()
+                for lic_id, lic_type in co_licenses:
+                    matched = False
+                    for cert_name, cert_level in worker_certs:
+                        # 키워드 매칭 — CERT_TO_LICENSE_MAP 단순 적용 (포함 검사)
+                        for key, lvl_req, lic_list in [
+                            ("토목", None, ["토목공사업","토목건축공사업","지반조성·포장공사업","상·하수도설비공사업"]),
+                            ("건축", None, ["건축공사업","토목건축공사업","실내건축공사업","철근·콘크리트공사업","도장·습식·방수·석공사업","금속창호·지붕건축물조립공사업"]),
+                            ("기계설비", None, ["기계가스설비공사업","가스난방공사업"]),
+                            ("전기", None, ["전기공사업"]),
+                            ("정보통신", None, ["정보통신공사업"]),
+                            ("소방", None, ["소방시설공사업"]),
+                            ("가스", None, ["가스난방공사업","기계가스설비공사업"]),
+                            ("건설안전", None, ["구조물해체·비계공사업"]),
+                            ("산업안전", None, ["구조물해체·비계공사업"]),
+                            ("콘크리트", None, ["철근·콘크리트공사업"]),
+                            ("굴삭기", None, ["지반조성·포장공사업","구조물해체·비계공사업"]),
+                            ("굴착기", None, ["지반조성·포장공사업","구조물해체·비계공사업"]),
+                            ("비계", None, ["구조물해체·비계공사업"]),
+                            ("방수", None, ["도장·습식·방수·석공사업"]),
+                            ("석면", None, ["석면해체·제거업"]),
+                        ]:
+                            if key in (cert_name or '') and lic_type in lic_list:
+                                matched = True; break
+                        if matched: break
+                    if matched:
+                        try:
+                            c.execute(
+                                """INSERT OR IGNORE INTO license_workers(license_id,worker_id,role,note)
+                                   VALUES(?,?,?,?)""",
+                                (lic_id, wid, '기술인 (엑셀 자동매칭)', '엑셀 임포트 시 자격 매칭으로 자동 등재'))
+                            if c.execute("SELECT changes()").fetchone()[0]:
+                                stats["auto_registered"] += 1
+                        except Exception: pass
     wb.close()
     return stats
 
