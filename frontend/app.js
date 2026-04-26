@@ -12,6 +12,8 @@ const today = () => new Date().toISOString().slice(0,10);
 
 function _handle401(r) {
   if (r.status === 401) {
+    // 현재 hash 를 보존해서 로그인 후 돌아오게 (자동 화면 전환 방지)
+    try { sessionStorage.setItem('gwc_post_login_hash', location.hash || ''); } catch (e) {}
     location.href = '/login';
     return new Promise(() => {}); // 더 이상 진행 안 함
   }
@@ -524,6 +526,9 @@ route('/workers', async () => {
         <div class="page-sub">정규직 ${officeWorkers.length}명 · 일용직 ${workers.length - officeWorkers.length}명 · 표시 ${filtered.length}명</div>
       </div>
       <div style="display:flex; gap:6px; align-items:center;">
+        <a class="btn" href="/api/workers/excel-template" download="직원_주주명부_표준양식.xlsx" title="이 양식을 받아서 채운 후 '엑셀 올리기' 버튼으로 다시 업로드">
+          📋 양식 받기
+        </a>
         <label class="btn" id="btn-upload-label">
           📥 엑셀 올리기
           <input type="file" id="upload-input" accept=".xlsx,.xlsm,.xls" style="display:none">
@@ -532,27 +537,29 @@ route('/workers', async () => {
       </div>
     </div>
 
-    <div class="card card-pad" style="margin-bottom:14px; padding:12px 14px;">
-      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-        <input id="w-search" type="text" placeholder="이름·연락처·직책·자격증 검색" value="${_workerSearchQ}" style="min-width:220px; padding:6px 10px; border:1px solid var(--border); border-radius:5px;">
-        <select id="w-co-filter" style="padding:6px 10px; border:1px solid var(--border); border-radius:5px;">
-          <option value="">법인 전체 (${workers.length})</option>
-          ${companies.map(co => `<option value="${co.id}" ${String(_workerCompanyFilter)===String(co.id)?'selected':''}>${co.name} (${cntByCo[co.id]||0})</option>`).join('')}
-          <option value="0" ${_workerCompanyFilter==='0'?'selected':''}>법인 미배정</option>
-        </select>
-        <span style="color:var(--text-muted); font-size:11px">|</span>
-        <button class="filter-btn ${_workerFilter==='all'?'active':''}" data-wf="all">전체</button>
-        <button class="filter-btn ${_workerFilter==='office'?'active':''}" data-wf="office">정규직 (${officeWorkers.length})</button>
-        <button class="filter-btn ${_workerFilter==='daily'?'active':''}" data-wf="daily">일용직 (${workers.length-officeWorkers.length})</button>
-        <button class="filter-btn ${_workerFilter==='active'?'active':''}" data-wf="active">재직</button>
-        <button class="filter-btn ${_workerFilter==='resigned'?'active':''}" data-wf="resigned">퇴사</button>
-        <span style="flex:1"></span>
-        <button class="btn btn-sm btn-danger" id="btn-wipe">🗑 직원·자격증 전체 와이프</button>
-      </div>
+    <div class="card workers-toolbar" style="margin-bottom:14px;">
+      <input id="w-search" type="text" placeholder="이름·연락처·직책·자격증 검색" value="${_workerSearchQ}" style="min-width:200px;">
+      <select id="w-co-filter">
+        <option value="">법인 전체 (${workers.length})</option>
+        ${companies.map(co => `<option value="${co.id}" ${String(_workerCompanyFilter)===String(co.id)?'selected':''}>${co.name} (${cntByCo[co.id]||0})</option>`).join('')}
+        <option value="0" ${_workerCompanyFilter==='0'?'selected':''}>법인 미배정</option>
+      </select>
+      <span style="color:var(--text-muted); font-size:11px">|</span>
+      <button class="filter-btn ${_workerFilter==='all'?'active':''}" data-wf="all">전체</button>
+      <button class="filter-btn ${_workerFilter==='office'?'active':''}" data-wf="office">정규직 (${officeWorkers.length})</button>
+      <button class="filter-btn ${_workerFilter==='daily'?'active':''}" data-wf="daily">일용직 (${workers.length-officeWorkers.length})</button>
+      <button class="filter-btn ${_workerFilter==='active'?'active':''}" data-wf="active">재직</button>
+      <button class="filter-btn ${_workerFilter==='resigned'?'active':''}" data-wf="resigned">퇴사</button>
+      <span style="flex:1"></span>
+      <button class="btn btn-sm btn-danger" id="btn-wipe" title="모든 직원·자격증·면허등재·주주 삭제 (회사·면허는 유지)">🗑 전체 와이프</button>
     </div>
 
     <div class="card">
-      <table class="table">
+      <table class="table workers-table">
+        <colgroup>
+          <col class="col-name"><col class="col-type"><col class="col-company">
+          <col class="col-certs"><col class="col-phone"><col class="col-hired"><col class="col-actions">
+        </colgroup>
         <thead><tr>
           ${sortHdr('name', '이름')}
           ${sortHdr('type', '구분')}
@@ -563,39 +570,34 @@ route('/workers', async () => {
           <th></th>
         </tr></thead>
         <tbody>
-          ${filtered.length === 0 ? '<tr><td colspan="7" style="text-align:center; padding:30px; color:var(--text-muted)">조건에 맞는 직원이 없습니다. 위 "엑셀 올리기" 또는 "직원 추가" 로 시작하세요.</td></tr>' :
+          ${filtered.length === 0 ? '<tr><td colspan="7" style="text-align:center; padding:30px; color:var(--text-muted)">조건에 맞는 직원이 없습니다. 위 "📋 양식 받기" 로 표준 양식 다운로드 → 채워서 "📥 엑셀 올리기" 또는 "+ 직원 추가" 로 시작하세요.</td></tr>' :
             filtered.map(w => {
               const lics = (w.worker_type === 'office' ? wlMap[w.id] : null) || [];
               const certs = certMap[w.id] || [];
               const matchingLicenses = w.worker_type === 'office' ? findMatchingLicenseTypes(certs, certLicMap) : [];
               const registeredTypes = new Set(lics.map(l => l.license_type));
               const matchingNotRegistered = matchingLicenses.filter(lt => !registeredTypes.has(lt));
-              const resigned = w.resigned_at ? `<div style="font-size:10.5px; color:#c0392b; margin-top:2px;">⊗ 퇴사 ${w.resigned_at}</div>` : '';
-              return `<tr ${w.resigned_at ? 'style="opacity:0.55;background:#fafbfc"' : ''}>
-                <td>
-                  <b>${w.name}</b>
-                  ${w.position ? `<span style="font-size:10.5px; color:var(--text-muted)"> · ${w.position}</span>` : ''}
-                  ${w.asbestos_certified ? '<span class="badge badge-orange" style="margin-left:4px; font-size:9.5px;">석면</span>' : ''}
+              const resigned = w.resigned_at ? `<div style="font-size:10.5px; color:#c0392b; margin-top:1px;">⊗ ${w.resigned_at}</div>` : '';
+              const allCertChips = [
+                ...certs.map(c => `<span class="worker-lic-chip" title="${c.cert_no?'등록 '+c.cert_no:''}${c.acquired_at?' · 취득 '+c.acquired_at:''}">${c.cert_name}${c.cert_level?' '+c.cert_level:''}</span>`),
+                ...lics.map(l => `<a class="registered-lic-chip" href="#/company/${l.company_id}" title="${l.company_name} · ${l.role||'기술인'}">📜 ${l.license_type.split('·')[0].slice(0,6)}</a>`),
+                ...matchingNotRegistered.slice(0,3).map(lt => `<span class="worker-lic-chip match" title="자격으로 등재 가능">↳ ${lt.split('·')[0].slice(0,6)}</span>`),
+              ];
+              return `<tr ${w.resigned_at ? 'style="opacity:0.55"' : ''}>
+                <td class="col-name" title="${w.name}${w.position?' · '+w.position:''}">
+                  <b>${w.name}</b>${w.asbestos_certified ? ' <span style="font-size:9.5px; color:#a35907">석면</span>' : ''}
+                  ${w.position ? `<div style="font-size:10.5px; color:var(--text-muted)">${w.position}</div>` : ''}
                   ${resigned}
                 </td>
-                <td><span class="badge ${w.worker_type==='office'?'badge-orange':'badge-blue'}">${w.worker_type==='office'?'정규직':'일용직'}</span></td>
-                <td>${w.company_id ? `<a href="#/company/${w.company_id}" style="color:var(--primary); text-decoration:none">${w.company_name||'-'}</a>` : '<span style="color:var(--text-muted)">미배정</span>'}</td>
-                <td>
-                  ${w.job_role ? `<span style="font-size:11px; color:var(--text-muted)">${w.job_role}</span>` : ''}
-                  ${certs.length ? `<div class="worker-lic-chips" style="margin-top:3px;">
-                    ${certs.map(c => `<span class="worker-lic-chip" style="background:#e8f5e9; color:#1b5e20;" title="${c.cert_no?'등록 '+c.cert_no:''}${c.acquired_at?' · 취득 '+c.acquired_at:''}">${c.cert_name}${c.cert_level?' '+c.cert_level:''}</span>`).join('')}
-                  </div>` : ''}
-                  ${lics.length ? `<div class="worker-lic-chips" style="margin-top:3px;">
-                    ${lics.map(l => `<a class="registered-lic-chip" href="#/company/${l.company_id}" title="${l.role||'기술인'}">📜 ${l.license_type.split('·')[0].slice(0,8)} <span class="co">${(l.company_name||'').slice(0,4)}</span></a>`).join('')}
-                  </div>` : ''}
-                  ${matchingNotRegistered.length ? `<div class="worker-lic-chips" style="margin-top:3px;">
-                    ${matchingNotRegistered.slice(0,4).map(lt => `<span class="match-chip" title="이 자격증으로 등재 가능">↳ ${lt.split('·')[0].slice(0,8)}</span>`).join('')}
-                  </div>` : ''}
-                  ${(w.worker_type==='office' && !certs.length && !lics.length) ? '<span style="font-size:10.5px; color:var(--text-muted)">자격증 없음</span>' : ''}
+                <td class="col-type"><span class="badge ${w.worker_type==='office'?'badge-orange':'badge-blue'}" style="font-size:10.5px">${w.worker_type==='office'?'정규':'일용'}</span></td>
+                <td class="col-company">${w.company_id ? `<a href="#/company/${w.company_id}" style="color:var(--primary); text-decoration:none" title="${w.company_name||''}">${w.company_name||'-'}</a>` : '<span style="color:var(--text-muted)">미배정</span>'}</td>
+                <td class="col-certs">
+                  ${w.job_role ? `<span style="font-size:10.5px; color:var(--text-muted); display:inline-block; margin-right:4px;">[${w.job_role}]</span>` : ''}
+                  ${allCertChips.length ? allCertChips.join('') : '<span style="font-size:10.5px; color:var(--text-muted)">-</span>'}
                 </td>
-                <td>${w.phone || '-'}</td>
-                <td>${w.hired_date || '-'}</td>
-                <td>
+                <td class="col-phone">${w.phone || '-'}</td>
+                <td class="col-hired">${w.hired_date || '-'}</td>
+                <td class="col-actions">
                   <button class="btn btn-sm" data-edit="${w.id}">수정</button>
                   <button class="btn btn-sm btn-danger" data-del="${w.id}">삭제</button>
                 </td>
@@ -604,9 +606,10 @@ route('/workers', async () => {
         </tbody>
       </table>
     </div>
-    <div class="diff-banner" style="margin-top:8px">
-      💡 <b>관계형 연결:</b> 자격증 → 매칭 가능 면허 → 실제 등재된 면허(법인). 자격증 칩을 추가/삭제하려면 직원 행의 <b>수정</b>, 또는 <a href="#/companies">법인 상세</a> 에서 직원 단위로 관리.
-      &nbsp; 일정한 회사 직원만 보려면 위 "법인 전체" 드롭다운에서 회사 선택.
+    <div class="diff-banner" style="margin-top:8px; font-size:11.5px;">
+      💡 자격증 = 직원 본인이 가진 것 (예: <span class="worker-lic-chip" style="display:inline-block">건축 초급</span>) ·
+      📜 등재 면허 = 그 자격증으로 회사 면허에 기술인으로 등재됨 (클릭하면 법인 상세) ·
+      ↳ 매칭 가능 = 자격은 있지만 아직 어떤 면허에도 안 들어간 것
     </div>
   `;
 
@@ -2428,6 +2431,142 @@ async function openWorkerRegisterModal(licenseId, license, allOfficeWorkers, alr
   }, 30);
 }
 
+// ============================================================
+// 면허 일괄 편집 — 모든 회사의 모든 면허를 한 표에서 편집 후 저장
+// ============================================================
+route('/licenses-bulk', async () => {
+  const [licenses, companies, catalog] = await Promise.all([
+    api.get('/api/licenses'),
+    api.get('/api/companies'),
+    getLicenseCatalog(),
+  ]);
+  const types = catalog.map(c => c.name);
+  const coById = Object.fromEntries(companies.map(c => [c.id, c.name]));
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">📋 면허 일괄 편집</div>
+        <div class="page-sub">모든 법인의 모든 면허를 한 표에서 등록번호·만료일·시평액·상태 일괄 수정 (변경된 행만 노란색)</div>
+      </div>
+      <div style="display:flex; gap:6px;">
+        <button class="btn btn-primary" id="btn-add-row">+ 새 면허 행</button>
+        <button class="btn btn-primary" id="btn-save-all" style="background:#196f3d; border-color:#196f3d;">💾 변경된 것만 일괄 저장</button>
+      </div>
+    </div>
+
+    <div class="card" style="overflow-x:auto;">
+      <table class="lic-bulk-table" id="lic-bulk-tbl">
+        <colgroup>
+          <col class="col-co"><col class="col-type"><col class="col-no">
+          <col class="col-issued"><col class="col-expires"><col class="col-cap">
+          <col class="col-status"><col class="col-act">
+        </colgroup>
+        <thead><tr>
+          <th>법인</th><th>업종</th><th>등록번호</th>
+          <th>발급일</th><th>만료일</th><th>시평액(원)</th>
+          <th>상태</th><th></th>
+        </tr></thead>
+        <tbody id="lic-bulk-body">
+          ${licenses.length === 0 ? '<tr><td colspan="8" style="text-align:center; padding:30px; color:var(--text-muted)">등록된 면허 없음 — "+ 새 면허 행" 으로 시작</td></tr>' :
+            licenses.map(l => licBulkRow(l, companies, types)).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div class="diff-banner" style="margin-top:8px">
+      💡 셀을 직접 수정하면 그 행이 노란색으로 변하고, "💾 변경된 것만 일괄 저장" 누르면 한 번에 PUT 됩니다.
+      &nbsp; 새 면허는 "+ 새 면허 행" → 채우고 저장 → 자동으로 POST 됨.
+    </div>
+  `;
+
+  // ====== 행 변경 감지 ======
+  document.querySelectorAll('#lic-bulk-tbl tbody tr').forEach(tr => {
+    tr.querySelectorAll('input,select').forEach(inp => {
+      inp.addEventListener('input', () => tr.classList.add('dirty'));
+      inp.addEventListener('change', () => tr.classList.add('dirty'));
+    });
+  });
+
+  $('#btn-add-row').onclick = () => {
+    const tbody = $('#lic-bulk-body');
+    if (tbody.querySelector('td[colspan]')) tbody.innerHTML = '';
+    const tmp = document.createElement('tbody');
+    tmp.innerHTML = licBulkRow({id:'NEW_'+Date.now(), company_id:'', license_type:'', license_no:'',
+                                 issued_at:'', expires_at:'', capacity_amount:0, status:'active'},
+                                companies, types);
+    const newTr = tmp.firstElementChild;
+    newTr.classList.add('dirty');
+    tbody.appendChild(newTr);
+    newTr.querySelectorAll('input,select').forEach(inp => {
+      inp.addEventListener('input', () => newTr.classList.add('dirty'));
+      inp.addEventListener('change', () => newTr.classList.add('dirty'));
+    });
+  };
+
+  $('#btn-save-all').onclick = async () => {
+    const dirty = document.querySelectorAll('#lic-bulk-tbl tbody tr.dirty');
+    if (dirty.length === 0) { alert('변경된 행이 없습니다.'); return; }
+    if (!confirm(`${dirty.length}개 행을 저장합니다. 계속할까요?`)) return;
+    let okCount = 0, failCount = 0;
+    for (const tr of dirty) {
+      tr.classList.remove('dirty'); tr.classList.add('saving');
+      const lid = tr.dataset.lid;
+      const payload = {
+        company_id: +tr.querySelector('[data-f=co]').value,
+        license_type: tr.querySelector('[data-f=type]').value,
+        license_no: tr.querySelector('[data-f=no]').value,
+        issued_at: tr.querySelector('[data-f=issued]').value || null,
+        expires_at: tr.querySelector('[data-f=expires]').value || null,
+        capacity_amount: +tr.querySelector('[data-f=cap]').value || 0,
+        status: tr.querySelector('[data-f=status]').value,
+        note: null,
+      };
+      if (!payload.company_id || !payload.license_type) {
+        alert('법인 + 업종은 필수: ' + (tr.querySelector('[data-f=co]').selectedOptions[0]?.text || '미선택'));
+        tr.classList.add('dirty'); tr.classList.remove('saving');
+        failCount++; continue;
+      }
+      try {
+        if (String(lid).startsWith('NEW_')) {
+          await api.post('/api/licenses', payload);
+        } else {
+          await api.put('/api/licenses/' + lid, payload);
+        }
+        okCount++;
+      } catch (e) {
+        tr.classList.add('dirty'); tr.classList.remove('saving');
+        failCount++;
+        console.error(e);
+      }
+    }
+    alert(`저장 완료: 성공 ${okCount}건${failCount?` / 실패 ${failCount}건`:''}`);
+    navigate();
+  };
+});
+
+function licBulkRow(l, companies, types) {
+  return `<tr data-lid="${l.id}">
+    <td><select data-f="co">
+      <option value="">선택</option>
+      ${companies.map(c => `<option value="${c.id}" ${l.company_id==c.id?'selected':''}>${c.name}</option>`).join('')}
+    </select></td>
+    <td><select data-f="type">
+      <option value="">선택</option>
+      ${types.map(t => `<option value="${t}" ${l.license_type===t?'selected':''}>${t}</option>`).join('')}
+    </select></td>
+    <td><input data-f="no" type="text" value="${(l.license_no||'').replace(/"/g,'&quot;')}" placeholder="예: 충북영동24-나-01"></td>
+    <td><input data-f="issued" type="date" value="${(l.issued_at||'').slice(0,10)}"></td>
+    <td><input data-f="expires" type="date" value="${(l.expires_at||'').slice(0,10)}"></td>
+    <td><input data-f="cap" type="number" value="${l.capacity_amount||0}" step="100000000"></td>
+    <td><select data-f="status">
+      <option value="active" ${l.status==='active'?'selected':''}>활성</option>
+      <option value="suspended" ${l.status==='suspended'?'selected':''}>정지</option>
+      <option value="expired" ${l.status==='expired'?'selected':''}>만료</option>
+    </select></td>
+    <td>${String(l.id).startsWith('NEW_') ? '신규' : `<button class="btn btn-sm btn-danger" onclick="if(confirm('삭제?')) fetch('/api/licenses/${l.id}',{method:'DELETE'}).then(()=>navigate())">삭제</button>`}</td>
+  </tr>`;
+}
+
 async function licenseModal(l, companies, defaultCompanyId) {
   const isNew = !l;
   const catalog = await getLicenseCatalog();
@@ -3697,9 +3836,18 @@ route('/competitors', async () => {
       });
     });
   } catch (e) {
+    try { sessionStorage.setItem('gwc_post_login_hash', location.hash || ''); } catch(_) {}
     location.href = '/login';
     return;
   }
+  // 로그인 직후 hash 복원 — 이전 페이지로 돌아가기 (자동 화면 전환 방지)
+  try {
+    const saved = sessionStorage.getItem('gwc_post_login_hash');
+    if (saved && saved !== '#' && location.hash === '') {
+      sessionStorage.removeItem('gwc_post_login_hash');
+      location.hash = saved.replace(/^#/, '');
+    }
+  } catch(_) {}
   navigate();
   refreshNotifBadge();
   setInterval(refreshNotifBadge, 60000); // 1분마다 알림 카운트 갱신

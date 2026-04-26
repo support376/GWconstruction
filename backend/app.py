@@ -3319,6 +3319,103 @@ def mobile_page():
 def register_page():
     return FileResponse(os.path.join(FRONTEND_DIR, "register.html"))
 
+@app.get("/api/workers/excel-template")
+def download_workers_template(_: dict = Depends(require_login)):
+    """직원 일괄 등록용 표준 엑셀 양식. /workers 페이지에서 다운로드해서 채워서 다시 업로드.
+    구조: 직원현황 시트 + 회사별 주주 시트 6개 (건우/아이엔/인우/새암/다우/유신).
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from io import BytesIO
+    except ImportError:
+        raise HTTPException(500, "openpyxl 미설치")
+    wb = openpyxl.Workbook()
+    # 첫 시트 = 직원현황
+    ws = wb.active
+    ws.title = "직원현황"
+    headers = ["회사명", "이   름", "주민번호", "입사일", "퇴사일",
+               "자격증종류", "관련업종", "석면", "비  고"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2D4A8A")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    # 컬럼 폭
+    widths = [16, 12, 16, 12, 12, 22, 16, 10, 30]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[chr(64+i)].width = w
+    # 샘플 행 (안내·예시)
+    samples = [
+        ["[건우건설]", "1.안 경 이",   "650228-2226831", "11.05.20", "",
+         "건축,토목 초급", "실내건축", "석면인력", "대표이사"],
+        ["",            "2.김 성 헌",   "650616-1386114", "23.02.07", "",
+         "토목특급,건축초급", "토목", "석면인력", ""],
+        ["",            "3.박 인 식",   "570228-1387118", "17.12.01", "",
+         "토목특급",     "토목", "", ""],
+        ["",            "임 상 철",     "580417-1386719", "24.10.07", "25.03.31",
+         "토목중급",     "", "", "퇴사 후 아이엔 입사"],
+        ["[아이엔]",    "1.이 건 우",   "601116-1386715", "16.04.25", "",
+         "건축.토목초급", "토공", "석면인력", "대표이사"],
+        ["",            "2.김강석",     "790310-1386129", "24.10.21", "",
+         "토목초급",     "포장", "", ""],
+    ]
+    for row in samples:
+        ws.append(row)
+    # 안내 행
+    ws.append([])
+    info_row = ws.max_row + 1
+    ws.cell(info_row, 1, "📌 작성 규칙:").font = Font(bold=True, color="C0392B")
+    rules = [
+        "1) 회사명은 [건우건설]/[아이엔]/[인우건설]/[새암건설]/[다우건설] 처럼 대괄호로 — 그 아래 직원들이 그 회사 소속",
+        "2) 이름 앞에 '1.', '2.' 가 붙으면 정규직 (현재 등록된 기술인). 번호 없으면 일반 직원/퇴사자",
+        "3) 입사일/퇴사일은 'YY.MM.DD' (예: 23.07.01) 또는 'YYYY-MM-DD' 둘 다 OK",
+        "4) 자격증종류는 콤마(,) 또는 점(.) 으로 여러 개. 마지막 등급(초급/중급/특급/기능사)은 앞 자격증에도 자동 적용",
+        "5) 석면 컬럼에 '석면인력' 입력하면 석면 자격자 표시",
+        "6) 같은 사람이 여러 회사에 입사/퇴사 반복은 그냥 회사별 블록에 따로 행 추가",
+    ]
+    for i, r in enumerate(rules):
+        ws.cell(info_row + 1 + i, 1, r).alignment = Alignment(wrap_text=True)
+
+    # 주주명부 시트들 — 각 회사별
+    for sn in ["건우", "아이엔", "인우", "새암", "다우", "유신"]:
+        sh = wb.create_sheet(sn)
+        sh["B3"] = "주   주   명   부"
+        sh["B3"].font = Font(bold=True, size=14)
+        sh.merge_cells("B3:G3")
+        sh["B3"].alignment = Alignment(horizontal="center")
+        # 헤더 R7
+        sh_headers = ["", "직  위", "성명", "주민등록번호", "주      소", "주식수", "비  율"]
+        for ci, h in enumerate(sh_headers, 1):
+            cell = sh.cell(7, ci, h)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="2D4A8A")
+            cell.alignment = Alignment(horizontal="center")
+        # 컬럼 폭
+        for i, w in enumerate([3, 10, 12, 16, 30, 12, 8], 1):
+            sh.column_dimensions[chr(64+i)].width = w
+        # 예시 (건우만)
+        if sn == "건우":
+            sh.cell(8, 2, "대표이사"); sh.cell(8, 3, "안경이"); sh.cell(8, 4, "650228-2226831")
+            sh.cell(8, 5, "충북영동군양강면국촌1길6-6"); sh.cell(8, 6, 41250); sh.cell(8, 7, 0.5)
+            sh.cell(9, 2, "이    사"); sh.cell(9, 3, "이건우"); sh.cell(9, 4, "601116-1386715")
+            sh.cell(9, 5, "충북영동군양강면국촌1길6-6"); sh.cell(9, 6, 41250); sh.cell(9, 7, 0.5)
+            sh.cell(11, 2, "계"); sh.cell(11, 3, "2명"); sh.cell(11, 6, 82500); sh.cell(11, 7, 1)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    from fastapi.responses import Response
+    fname = "직원_주주명부_표준양식.xlsx"
+    # RFC 5987 인코딩 (한글 파일명)
+    import urllib.parse
+    fname_enc = urllib.parse.quote(fname)
+    return Response(
+        content=buf.read(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname_enc}"}
+    )
+
 @app.post("/api/workers/wipe")
 def wipe_all_workers(user: dict = Depends(require_login)):
     """모든 직원·자격증·면허등재·주주 삭제 (회사·면허는 유지). 관리자 전용."""

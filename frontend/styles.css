@@ -1058,3 +1058,67 @@ body { display: flex; min-height: 100vh; }
 .badge-blue { background: #dbeafe; color: #1e40af;}
 .badge-gray { background: #e5e7eb; color: #374151;}
 .badge-green { background: #d1fae5; color: #065f46;}
+
+/* ===== /workers 테이블 — 칸 폭 고정, 줄바꿈 제어 ===== */
+.workers-table { table-layout: fixed; width: 100%; font-size: 12.5px;}
+.workers-table th { padding: 8px 8px; vertical-align: middle;}
+.workers-table td { padding: 8px 8px; vertical-align: top; word-break: keep-all;}
+.workers-table .col-name    { width: 110px;}
+.workers-table .col-type    { width: 60px;}
+.workers-table .col-company { width: 120px;}
+.workers-table .col-certs   { width: auto;}    /* flex 영역 */
+.workers-table .col-phone   { width: 110px;}
+.workers-table .col-hired   { width: 90px;}
+.workers-table .col-actions { width: 110px;}
+.workers-table td.col-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+.workers-table td.col-company { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+.workers-table td.col-phone { white-space: nowrap; font-size: 11.5px; color: var(--text-muted);}
+.workers-table td.col-hired { white-space: nowrap; font-size: 11.5px; color: var(--text-muted);}
+
+/* 자격증 칩 — 컴팩트화: 좁은 공간에서도 보기 좋게 */
+.workers-table .worker-lic-chip {
+  display: inline-block; padding: 1px 6px; border-radius: 8px;
+  font-size: 10.5px; font-weight: 500;
+  margin: 1px 2px 1px 0; white-space: nowrap;
+  background: #e8f5e9; color: #1b5e20;
+  max-width: 100%;
+}
+.workers-table .worker-lic-chip.match { background: #fff3e0; color: #b56708;}
+.workers-table .registered-lic-chip {
+  display: inline-block; padding: 1px 6px; border-radius: 8px;
+  font-size: 10.5px; font-weight: 500;
+  margin: 1px 2px 1px 0; white-space: nowrap;
+  background: #e3f2fd; color: #0d47a1; text-decoration: none;
+}
+.workers-table .registered-lic-chip:hover { background: #bbdefb;}
+
+/* 컬럼 헤더 정렬 표시 */
+.workers-table th[data-sort] { user-select: none;}
+.workers-table th[data-sort]:hover { color: var(--primary); cursor: pointer;}
+
+/* 검색·필터 바 */
+.workers-toolbar {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  padding: 10px 12px;
+}
+.workers-toolbar input[type=text],
+.workers-toolbar select {
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: 5px; font-size: 12.5px;
+}
+.workers-toolbar .filter-btn { font-size: 12px;}
+
+/* /licenses 일괄 편집 표 */
+.lic-bulk-table { table-layout: fixed; width: 100%; font-size: 12px;}
+.lic-bulk-table th { padding: 8px 6px; background: #fafbfc; vertical-align: middle;}
+.lic-bulk-table td { padding: 4px 6px; vertical-align: middle;}
+.lic-bulk-table input, .lic-bulk-table select { padding: 4px 6px; width: 100%; font-size: 12px; border: 1px solid var(--border); border-radius: 4px;}
+.lic-bulk-table .col-co     { width: 130px;}
+.lic-bulk-table .col-type   { width: 200px;}
+.lic-bulk-table .col-no     { width: 150px;}
+.lic-bulk-table .col-issued { width: 130px;}
+.lic-bulk-table .col-expires{ width: 130px;}
+.lic-bulk-table .col-cap    { width: 140px;}
+.lic-bulk-table .col-status { width: 80px;}
+.lic-bulk-table .col-act    { width: 80px;}
+.lic-bulk-table tr.dirty td { background: #fff7e6;}
+.lic-bulk-table tr.saving td { background: #e7f6ec;}
