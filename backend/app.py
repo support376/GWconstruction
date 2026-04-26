@@ -186,6 +186,78 @@ CREATE TABLE IF NOT EXISTS licenses (
 CREATE INDEX IF NOT EXISTS lic_company ON licenses(company_id);
 CREATE INDEX IF NOT EXISTS lic_expiry  ON licenses(expires_at);
 
+-- 면허 ↔ 직원 등재 (한 면허에 어느 정규직이 기술자로 등재됐는지)
+CREATE TABLE IF NOT EXISTS license_workers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  license_id INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+  worker_id  INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  role TEXT,                              -- 등재 역할 (현장대리인·기술인 등)
+  registered_at TEXT DEFAULT (datetime('now')),
+  note TEXT,
+  UNIQUE(license_id, worker_id)
+);
+CREATE INDEX IF NOT EXISTS lw_license ON license_workers(license_id);
+CREATE INDEX IF NOT EXISTS lw_worker  ON license_workers(worker_id);
+
+-- 직원이 보유한 자격증 (worker가 가진 — '면허 등재'와 다름)
+CREATE TABLE IF NOT EXISTS worker_certifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  cert_name TEXT NOT NULL,                -- '토목기사', '석면해체감리원', '건축초급'
+  cert_no TEXT,                           -- 등록번호
+  cert_level TEXT,                        -- '초급'|'중급'|'고급'|'특급'|'기능사'|'기사'|'기술사'
+  acquired_at TEXT,
+  expires_at TEXT,                        -- 일부만 갱신 필요
+  related_business TEXT,                  -- '토목', '건축', '안전' 등 관련 업종
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS wc_worker ON worker_certifications(worker_id);
+
+-- 주주·임원 명부
+CREATE TABLE IF NOT EXISTS shareholders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  role TEXT,                              -- '대표','이사','감사','주주'
+  rrn TEXT,                               -- 주민번호
+  address TEXT,
+  shares_pct REAL,                        -- 지분율
+  contribution INTEGER,                   -- 출자금
+  registered_at TEXT,                     -- 등기일
+  worker_id INTEGER REFERENCES workers(id),  -- 직원과 동일인이면 연결
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS sh_company ON shareholders(company_id);
+
+-- 급여 기록 (월별 정규화)
+CREATE TABLE IF NOT EXISTS payroll_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  company_id INTEGER REFERENCES companies(id),
+  year_month TEXT NOT NULL,               -- '2025-10'
+  base_salary INTEGER DEFAULT 0,
+  allowances TEXT,                        -- JSON {meal, vehicle, position, tenure, site, skill, ...}
+  deductions TEXT,                        -- JSON {income_tax, pension, health, emp_ins, ...}
+  gross_pay INTEGER DEFAULT 0,
+  total_deductions INTEGER DEFAULT 0,
+  net_pay INTEGER DEFAULT 0,
+  pay_date TEXT,
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(worker_id, year_month)
+);
+CREATE INDEX IF NOT EXISTS pr_worker_month ON payroll_records(worker_id, year_month);
+
+-- 직종별 일당 단가표
+CREATE TABLE IF NOT EXISTS wage_rates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_role TEXT NOT NULL,                 -- '보통인부', '직영인부', '철근공' 등
+  wage_per_day INTEGER NOT NULL,
+  effective_from TEXT,
+  effective_to TEXT,
+  note TEXT
+);
+
 CREATE TABLE IF NOT EXISTS process_instances (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   workflow TEXT NOT NULL,                  -- 'sales'|'hr_onboarding'|'daily_ops'|...
@@ -293,6 +365,20 @@ SCHEMA_MIGRATIONS = [
     # 기존 테이블에 컬럼 추가 (있으면 IGNORE)
     "ALTER TABLE sites ADD COLUMN site_category TEXT",
     "ALTER TABLE sites ADD COLUMN required_license TEXT",
+    # workers 확장 — 엑셀 임포트용
+    "ALTER TABLE workers ADD COLUMN rrn TEXT",
+    "ALTER TABLE workers ADD COLUMN address TEXT",
+    "ALTER TABLE workers ADD COLUMN bank_name TEXT",
+    "ALTER TABLE workers ADD COLUMN account_holder TEXT",
+    "ALTER TABLE workers ADD COLUMN job_specialty TEXT",
+    "ALTER TABLE workers ADD COLUMN asbestos_certified INTEGER DEFAULT 0",
+    "ALTER TABLE workers ADD COLUMN resigned_at TEXT",
+    "ALTER TABLE workers ADD COLUMN position TEXT",  -- 직책
+    # companies 확장
+    "ALTER TABLE companies ADD COLUMN incorporation_date TEXT",
+    "ALTER TABLE companies ADD COLUMN registration_date TEXT",
+    "ALTER TABLE companies ADD COLUMN fiscal_year_end TEXT",
+    "ALTER TABLE companies ADD COLUMN address TEXT",
 ]
 
 def init_db():
@@ -1804,6 +1890,43 @@ class LicenseIn(BaseModel):
     status: Optional[str] = "active"
     note: Optional[str] = None
 
+class LicenseWorkerIn(BaseModel):
+    worker_id: int
+    role: Optional[str] = None
+    note: Optional[str] = None
+
+# ---- 표준 면허 종류 카탈로그 ----
+LICENSE_TYPES_CATALOG = [
+    # 종합
+    {"name": "토목공사업", "category": "종합", "min_workers": 6, "min_capital": 500_000_000},
+    {"name": "건축공사업", "category": "종합", "min_workers": 6, "min_capital": 500_000_000},
+    {"name": "토목건축공사업", "category": "종합", "min_workers": 12, "min_capital": 1_200_000_000},
+    # 전문 (2022 대업종 14)
+    {"name": "지반조성·포장공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "실내건축공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "금속창호·지붕건축물조립공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "도장·습식·방수·석공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "조경식재·시설물공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "철근·콘크리트공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "구조물해체·비계공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "상·하수도설비공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "철도·궤도공사업", "category": "전문", "min_workers": 2, "min_capital": 200_000_000},
+    {"name": "철강구조물공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "수중·준설공사업", "category": "전문", "min_workers": 2, "min_capital": 200_000_000},
+    {"name": "승강기·삭도공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "기계가스설비공사업", "category": "전문", "min_workers": 2, "min_capital": 150_000_000},
+    {"name": "가스난방공사업", "category": "전문", "min_workers": 1, "min_capital": 100_000_000},
+    # 특수·환경
+    {"name": "석면해체·제거업", "category": "특수", "min_workers": 2, "min_capital": 50_000_000},
+    {"name": "정밀안전점검(시설물)", "category": "특수", "min_workers": 2, "min_capital": 30_000_000},
+    {"name": "시설물유지관리업", "category": "특수", "min_workers": 4, "min_capital": 200_000_000},
+    # 별도법
+    {"name": "전기공사업", "category": "별도법", "min_workers": 3, "min_capital": 150_000_000},
+    {"name": "정보통신공사업", "category": "별도법", "min_workers": 3, "min_capital": 150_000_000},
+    {"name": "소방시설공사업", "category": "별도법", "min_workers": 2, "min_capital": 100_000_000},
+    {"name": "문화재수리업", "category": "별도법", "min_workers": 2, "min_capital": 200_000_000},
+]
+
 @app.get("/api/procurement/tenders")
 def list_tenders(
     review_status: Optional[str] = None,
@@ -2282,6 +2405,127 @@ def list_expiring_licenses(days: int = 90, _: dict = Depends(require_login)):
                ORDER BY l.expires_at""",
             (days,)).fetchall())
 
+@app.get("/api/license-types-catalog")
+def license_types_catalog(_: dict = Depends(require_login)):
+    """표준 면허 종류 카탈로그 — 태그 입력용 자동완성 목록."""
+    return LICENSE_TYPES_CATALOG
+
+# ----- 면허 등재 직원 (license_workers) -----
+@app.get("/api/licenses/{lid}/workers")
+def list_license_workers(lid: int, _: dict = Depends(require_login)):
+    with conn() as c:
+        rs = rows(c.execute(
+            """SELECT lw.*, w.name AS worker_name, w.phone, w.job_role, w.worker_type, w.note AS worker_note
+               FROM license_workers lw JOIN workers w ON lw.worker_id=w.id
+               WHERE lw.license_id=? ORDER BY w.name""",
+            (lid,)).fetchall())
+    return rs
+
+@app.post("/api/licenses/{lid}/workers")
+def add_license_worker(lid: int, payload: LicenseWorkerIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        lic = c.execute("SELECT license_type, company_id FROM licenses WHERE id=?", (lid,)).fetchone()
+        if not lic: raise HTTPException(404, "license not found")
+        w = c.execute("SELECT name, worker_type FROM workers WHERE id=?", (payload.worker_id,)).fetchone()
+        if not w: raise HTTPException(404, "worker not found")
+        if w['worker_type'] != 'office':
+            raise HTTPException(400, "정규직(사무직)만 면허 기술자로 등재할 수 있습니다")
+        try:
+            c.execute(
+                "INSERT INTO license_workers(license_id,worker_id,role,note) VALUES(?,?,?,?)",
+                (lid, payload.worker_id, payload.role, payload.note)
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "이미 등재된 직원입니다")
+    emit_event("LicenseWorkerRegistered",
+               actors={"worker_id": payload.worker_id, "worker_name": w['name'],
+                       "company_id": lic['company_id']},
+               payload={"license_id": lid, "license_type": lic['license_type'],
+                        "role": payload.role},
+               created_by=user["id"], source="admin_ui")
+    add_relation('Person', payload.worker_id, 'registered_for', 'License', lid,
+                 metadata={"role": payload.role})
+    return {"ok": True}
+
+@app.delete("/api/licenses/{lid}/workers/{wid}")
+def remove_license_worker(lid: int, wid: int, user: dict = Depends(require_login)):
+    with conn() as c:
+        lic = c.execute("SELECT license_type FROM licenses WHERE id=?", (lid,)).fetchone()
+        w = c.execute("SELECT name FROM workers WHERE id=?", (wid,)).fetchone()
+        c.execute("DELETE FROM license_workers WHERE license_id=? AND worker_id=?", (lid, wid))
+    emit_event("LicenseWorkerRemoved",
+               actors={"worker_id": wid, "worker_name": w['name'] if w else None},
+               payload={"license_id": lid, "license_type": lic['license_type'] if lic else None},
+               created_by=user["id"], source="admin_ui")
+    remove_relations(subject_type='Person', subject_id=wid,
+                     predicate='registered_for', object_type='License', object_id=lid)
+    return {"ok": True}
+
+@app.get("/api/worker-certifications")
+def list_all_worker_certs(_: dict = Depends(require_login)):
+    """모든 직원의 자격증 — frontend에서 worker_id로 인덱싱."""
+    with conn() as c:
+        return rows(c.execute(
+            "SELECT * FROM worker_certifications ORDER BY worker_id, cert_name").fetchall())
+
+@app.get("/api/workers/{wid}/certifications")
+def get_worker_certs(wid: int, _: dict = Depends(require_login)):
+    with conn() as c:
+        return rows(c.execute(
+            "SELECT * FROM worker_certifications WHERE worker_id=? ORDER BY cert_name",
+            (wid,)).fetchall())
+
+@app.get("/api/companies/{cid}/shareholders")
+def list_company_shareholders(cid: int, _: dict = Depends(require_login)):
+    with conn() as c:
+        return rows(c.execute(
+            "SELECT sh.*, w.name AS worker_name FROM shareholders sh "
+            "LEFT JOIN workers w ON sh.worker_id=w.id "
+            "WHERE sh.company_id=? ORDER BY "
+            "CASE sh.role WHEN '대표' THEN 1 WHEN '대표이사' THEN 1 WHEN '이사' THEN 2 "
+            "WHEN '감사' THEN 3 ELSE 4 END, sh.id",
+            (cid,)).fetchall())
+
+@app.get("/api/workers/{wid}/licenses")
+def list_worker_licenses(wid: int, _: dict = Depends(require_login)):
+    """이 직원이 어느 법인의 어느 면허에 기술자로 등재되어 있는지."""
+    with conn() as c:
+        return rows(c.execute(
+            """SELECT lw.*, l.license_type, l.license_no, l.expires_at, l.status AS license_status,
+                      c.name AS company_name, c.id AS company_id
+               FROM license_workers lw
+               JOIN licenses l ON lw.license_id=l.id
+               JOIN companies c ON l.company_id=c.id
+               WHERE lw.worker_id=? ORDER BY c.name, l.license_type""",
+            (wid,)).fetchall())
+
+@app.get("/api/companies/{cid}/compliance")
+def company_compliance(cid: int, _: dict = Depends(require_login)):
+    """법인의 면허별 충족 현황 — 등재 직원 수 vs 요구 인원."""
+    catalog = {x['name']: x for x in LICENSE_TYPES_CATALOG}
+    with conn() as c:
+        company = c.execute("SELECT * FROM companies WHERE id=?", (cid,)).fetchone()
+        if not company: raise HTTPException(404, "company not found")
+        licenses = rows(c.execute("SELECT * FROM licenses WHERE company_id=? ORDER BY license_type", (cid,)).fetchall())
+        regular_workers = rows(c.execute(
+            "SELECT id, name, phone, job_role, hired_date FROM workers "
+            "WHERE company_id=? AND worker_type='office' ORDER BY name",
+            (cid,)).fetchall())
+        for lic in licenses:
+            workers_in = rows(c.execute(
+                """SELECT lw.id AS lw_id, w.id AS worker_id, w.name, w.phone, w.job_role, lw.role
+                   FROM license_workers lw JOIN workers w ON lw.worker_id=w.id
+                   WHERE lw.license_id=? ORDER BY w.name""",
+                (lic['id'],)).fetchall())
+            lic['registered_workers'] = workers_in
+            lic['registered_count'] = len(workers_in)
+            req = catalog.get(lic['license_type'])
+            lic['required_workers'] = req['min_workers'] if req else 2
+            lic['required_capital'] = req['min_capital'] if req else 150_000_000
+            lic['category'] = req['category'] if req else '미분류'
+            lic['is_satisfied'] = lic['registered_count'] >= lic['required_workers']
+    return {"company": dict(company), "licenses": licenses, "regular_workers": regular_workers}
+
 # ----- Notifications + Rules Engine (Phase 5) -----
 def _upsert_notification(unique_key, rule_type, severity, title, message=None, link=None,
                          related_type=None, related_id=None):
@@ -2383,6 +2627,28 @@ def _evaluate_rules():
                     f"{s['name']} 현장 — 착공 60일 넘었는데 기성 청구 0회",
                     "기성 청구 사이클을 시작해야 자금 흐름이 정상화됩니다.",
                     '#/lens', 'Place', s['id'])
+
+            # === RULE: 면허 등재 인원 미충족 ===
+            catalog_by_name = {x['name']: x for x in LICENSE_TYPES_CATALOG}
+            for r in c.execute(
+                """SELECT l.id, l.license_type, comp.name AS cname,
+                          (SELECT COUNT(*) FROM license_workers WHERE license_id=l.id) AS reg
+                   FROM licenses l JOIN companies comp ON l.company_id=comp.id
+                   WHERE l.status='active'""").fetchall():
+                req = catalog_by_name.get(r['license_type'])
+                required = req['min_workers'] if req else 2
+                if r['reg'] < required:
+                    lack = required - r['reg']
+                    _upsert_notification(
+                        f"lic_understaff_{r['id']}", 'license_understaffed',
+                        'urgent' if lack >= 2 else 'warning',
+                        f"⚠️ 면허 인원 미충족: {r['cname']} {r['license_type']}",
+                        f"필요 {required}명 / 등재 {r['reg']}명 — {lack}명 추가 등재 필요",
+                        '#/licenses', 'License', r['id'])
+            c.execute("UPDATE notifications SET resolved=1, resolved_at=datetime('now') "
+                      "WHERE rule_type='license_understaffed' AND resolved=0 AND related_entity_id IN ("
+                      "  SELECT l.id FROM licenses l WHERE "
+                      "    (SELECT COUNT(*) FROM license_workers WHERE license_id=l.id) >= 2)")
 
             # === RULE: 면허 만료 임박 (90일 이내) ===
             for l in c.execute(
@@ -2707,6 +2973,28 @@ def mobile_page():
 @app.get("/register")
 def register_page():
     return FileResponse(os.path.join(FRONTEND_DIR, "register.html"))
+
+@app.post("/api/admin/import-excel")
+def admin_import_excel(user: dict = Depends(require_login)):
+    """엑셀 4종 일괄 임포트 (admin 전용). backend/initial_data/ 의 파일 사용."""
+    if user.get("role") != "admin":
+        raise HTTPException(403, "관리자 전용입니다")
+    try:
+        import import_excel
+        report = import_excel.import_all(db_path=DB_PATH)
+    except Exception as e:
+        import traceback
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[:2000]}
+    emit_event("ExcelImportRun",
+               actors={"user_id": user["id"]},
+               payload={"final": report.get("final", {}),
+                        "employees": report.get("employees", {}),
+                        "outline": report.get("outline", {}),
+                        "payroll": report.get("payroll", {})},
+               created_by=user["id"], source="admin_ui")
+    # 임포트 후 룰 재평가
+    _evaluate_rules()
+    return {"ok": True, "report": report}
 
 @app.get("/login")
 def login_page():

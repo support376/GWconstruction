@@ -743,6 +743,88 @@ body { display: flex; min-height: 100vh; }
 .lic-row .days-left.warn { background: #fef0e0; color: #a35907;}
 .lic-row .days-left.ok { background: #e7f6ec; color: #15803d;}
 
+/* ===== License worker chips & compliance ===== */
+.staff-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; align-items: center;}
+.staff-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #eef3fc; color: #2a4a8a;
+  padding: 2px 4px 2px 8px; border-radius: 12px;
+  font-size: 11px; font-weight: 600;
+}
+.staff-chip .x {
+  background: rgba(192, 57, 43, 0.15); color: #c0392b;
+  border: none; cursor: pointer;
+  width: 16px; height: 16px; border-radius: 50%; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700;
+}
+.staff-chip .x:hover { background: #c0392b; color: #fff;}
+.staff-chip-add {
+  background: transparent; border: 1px dashed var(--border);
+  color: var(--primary); cursor: pointer;
+  padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;
+  font-family: inherit;
+}
+.staff-chip-add:hover { background: #eef3fc; border-style: solid;}
+
+.compliance-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 8px;
+  font-size: 10.5px; font-weight: 700;
+}
+.compliance-badge.ok { background: #d5f5e3; color: #196f3d;}
+.compliance-badge.short { background: #fdedec; color: #922b21;}
+
+.lic-detail-panel {
+  grid-column: 1 / -1;
+  background: #fafbfc; border-top: 1px solid var(--border);
+  padding: 12px 16px;
+  font-size: 12px;
+}
+.lic-detail-panel .req-line {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 0; border-bottom: 1px dashed #e6e8ec;
+}
+.lic-detail-panel .req-line:last-child { border: none;}
+.lic-detail-panel .req-line .label { color: var(--text-muted);}
+.lic-detail-panel .req-line .val { font-weight: 600;}
+
+/* Worker license chips (workers page) */
+.worker-lic-chips { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 3px;}
+.worker-lic-chip {
+  background: #f0e6f7; color: #6b46c1;
+  padding: 1px 6px; border-radius: 6px;
+  font-size: 10px; font-weight: 500;
+}
+.worker-lic-chip.short { background: #fdedec; color: #922b21;}
+
+/* Company license tags (companies page) */
+.lic-tags { display: flex; flex-wrap: wrap; gap: 3px;}
+.lic-tag {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: #eef3fc; color: #2a4a8a;
+  padding: 2px 4px 2px 8px; border-radius: 10px;
+  font-size: 10.5px; font-weight: 500;
+  cursor: pointer;
+}
+.lic-tag:hover { background: #d4e6f7;}
+.lic-tag.short { background: #fdedec; color: #922b21;}
+.lic-tag.expiring { background: #fef0e0; color: #a35907;}
+.lic-tag .x {
+  background: rgba(192, 57, 43, 0.15); color: #c0392b;
+  border: none; cursor: pointer;
+  width: 14px; height: 14px; border-radius: 50%; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 700;
+}
+.lic-tag .x:hover { background: #c0392b; color: #fff;}
+.lic-tag-add {
+  background: transparent; border: 1px dashed var(--border);
+  color: var(--primary); cursor: pointer;
+  padding: 1px 8px; border-radius: 10px; font-size: 10.5px; font-weight: 600;
+  font-family: inherit;
+}
+.lic-tag-add:hover { background: #eef3fc; border-style: solid;}
+
 /* ===== Project (큰 카드) ===== */
 .project-card {
   background: var(--card);
