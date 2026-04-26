@@ -10,12 +10,13 @@ import os
 import math
 import json
 import sqlite3
+from pathlib import Path
 import secrets
 from datetime import date, datetime
 from contextlib import contextmanager
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Query, Body, Depends, Request
+from fastapi import FastAPI, HTTPException, Query, Body, Depends, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -678,6 +679,15 @@ class WorkerIn(BaseModel):
     rrn_last: Optional[str] = None
     bank_account: Optional[str] = None
     note: Optional[str] = None
+    # 확장 필드 (직원,주주명부 / 급여대장 등에서)
+    rrn: Optional[str] = None
+    address: Optional[str] = None
+    position: Optional[str] = None
+    resigned_at: Optional[str] = None
+    bank_name: Optional[str] = None
+    account_holder: Optional[str] = None
+    asbestos_certified: Optional[int] = 0
+    job_specialty: Optional[str] = None
 
 class RegisterIn(BaseModel):
     name: str
@@ -1216,11 +1226,16 @@ def list_workers(worker_type: Optional[str] = None, q: Optional[str] = None,
 def create_worker(payload: WorkerIn, user: dict = Depends(require_login)):
     with conn() as c:
         cur = c.execute(
-            """INSERT INTO workers(company_id,name,phone,worker_type,daily_wage,job_role,hired_date,rrn_last,bank_account,note)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO workers(company_id,name,phone,worker_type,daily_wage,job_role,hired_date,
+                                    rrn_last,bank_account,note,rrn,address,position,resigned_at,
+                                    bank_name,account_holder,asbestos_certified,job_specialty)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (payload.company_id, payload.name, payload.phone, payload.worker_type or "daily",
              payload.daily_wage or 0, payload.job_role, payload.hired_date, payload.rrn_last,
-             payload.bank_account, payload.note)
+             payload.bank_account, payload.note,
+             payload.rrn, payload.address, payload.position, payload.resigned_at,
+             payload.bank_name, payload.account_holder, payload.asbestos_certified or 0,
+             payload.job_specialty)
         )
         new_id = cur.lastrowid
     emit_event("WorkerCreated",
@@ -1237,10 +1252,16 @@ def update_worker(wid: int, payload: WorkerIn, user: dict = Depends(require_logi
     with conn() as c:
         c.execute(
             """UPDATE workers SET company_id=?, name=?, phone=?, worker_type=?, daily_wage=?,
-               job_role=?, hired_date=?, rrn_last=?, bank_account=?, note=? WHERE id=?""",
+               job_role=?, hired_date=?, rrn_last=?, bank_account=?, note=?,
+               rrn=?, address=?, position=?, resigned_at=?,
+               bank_name=?, account_holder=?, asbestos_certified=?, job_specialty=?
+               WHERE id=?""",
             (payload.company_id, payload.name, payload.phone, payload.worker_type or "daily",
              payload.daily_wage or 0, payload.job_role, payload.hired_date, payload.rrn_last,
-             payload.bank_account, payload.note, wid)
+             payload.bank_account, payload.note,
+             payload.rrn, payload.address, payload.position, payload.resigned_at,
+             payload.bank_name, payload.account_holder, payload.asbestos_certified or 0,
+             payload.job_specialty, wid)
         )
     emit_event("WorkerUpdated",
                actors={"worker_id": wid, "company_id": payload.company_id},
@@ -3297,6 +3318,97 @@ def mobile_page():
 @app.get("/register")
 def register_page():
     return FileResponse(os.path.join(FRONTEND_DIR, "register.html"))
+
+@app.post("/api/workers/wipe")
+def wipe_all_workers(user: dict = Depends(require_login)):
+    """모든 직원·자격증·면허등재·주주 삭제 (회사·면허는 유지). 관리자 전용."""
+    if user.get("role") != "admin":
+        raise HTTPException(403, "관리자 전용입니다")
+    with conn() as c:
+        deleted = {}
+        for tbl in ["license_workers", "worker_certifications", "shareholders"]:
+            cur = c.execute(f"DELETE FROM {tbl}")
+            deleted[tbl] = cur.rowcount
+        cur = c.execute("DELETE FROM workers")
+        deleted["workers"] = cur.rowcount
+    emit_event("WorkersWiped", payload=deleted, created_by=user["id"], source="admin_ui")
+    return {"ok": True, "deleted": deleted}
+
+@app.post("/api/workers/upload-excel")
+async def upload_workers_excel(
+    file: UploadFile = File(...),
+    replace: bool = Form(False),
+    user: dict = Depends(require_login),
+):
+    """직원,주주명부 엑셀 업로드 → backend/initial_data 에 저장 후 임포트.
+    replace=true 면 기존 직원/자격증/주주 모두 와이프 후 재구축.
+    """
+    if user.get("role") != "admin":
+        raise HTTPException(403, "관리자 전용입니다")
+    if not file.filename.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        raise HTTPException(400, "엑셀 파일(.xlsx)만 업로드 가능합니다")
+    # 저장
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "initial_data")
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "직원,주주명부-5개회사 (자동 저장됨).xlsx")
+    content = await file.read()
+    with open(save_path, "wb") as f:
+        f.write(content)
+    # 임포트
+    try:
+        import import_excel, importlib
+        importlib.reload(import_excel)
+        c = sqlite3.connect(DB_PATH)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA foreign_keys = ON")
+        emp_stats = import_excel.import_employee_directory(c, Path(save_path), replace=replace)
+        # 자동 면허 등재
+        auto_n = import_excel.auto_register_workers_to_licenses(c)
+        c.commit()
+        final = {
+            "workers": c.execute("SELECT COUNT(*) FROM workers").fetchone()[0],
+            "office":  c.execute("SELECT COUNT(*) FROM workers WHERE worker_type='office'").fetchone()[0],
+            "active":  c.execute("SELECT COUNT(*) FROM workers WHERE resigned_at IS NULL OR resigned_at=''").fetchone()[0],
+            "certs":   c.execute("SELECT COUNT(*) FROM worker_certifications").fetchone()[0],
+            "shareholders": c.execute("SELECT COUNT(*) FROM shareholders").fetchone()[0],
+            "license_workers": c.execute("SELECT COUNT(*) FROM license_workers").fetchone()[0],
+        }
+        c.close()
+    except Exception as e:
+        import traceback
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[:2000]}
+    emit_event("WorkersExcelUploaded",
+               actors={"user_id": user["id"]},
+               payload={"filename": file.filename, "replace": replace, "final": final, "stats": emp_stats},
+               created_by=user["id"], source="admin_ui")
+    return {"ok": True, "stats": emp_stats, "auto_registered": auto_n, "final": final}
+
+@app.post("/api/companies/upload-outline")
+async def upload_company_outline_excel(
+    file: UploadFile = File(...),
+    user: dict = Depends(require_login),
+):
+    """회사별 아웃라인 엑셀 업로드 → 회사 정보 + 기술자 보강."""
+    if user.get("role") != "admin":
+        raise HTTPException(403, "관리자 전용입니다")
+    if not file.filename.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        raise HTTPException(400, "엑셀 파일만 업로드 가능합니다")
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "initial_data")
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "회사별아웃라인-(기술인력보유현황포함).xlsx")
+    content = await file.read()
+    with open(save_path, "wb") as f: f.write(content)
+    try:
+        import import_excel, importlib
+        importlib.reload(import_excel)
+        c = sqlite3.connect(DB_PATH)
+        c.row_factory = sqlite3.Row
+        stats = import_excel.import_company_outline(c, Path(save_path))
+        c.commit(); c.close()
+    except Exception as e:
+        import traceback
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[:2000]}
+    return {"ok": True, "stats": stats}
 
 @app.post("/api/admin/import-excel")
 def admin_import_excel(replace: bool = False, user: dict = Depends(require_login)):
