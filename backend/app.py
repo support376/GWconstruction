@@ -7,6 +7,7 @@ GW Construction Management - Backend API
     * 출퇴근은 GPS 좌표를 받아 현장 지오펜스 안인지 검증
 """
 import os
+import re
 import math
 import json
 import sqlite3
@@ -76,7 +77,7 @@ CREATE TABLE IF NOT EXISTS workers (
 CREATE TABLE IF NOT EXISTS deployments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
-  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,  -- nullable (급여 그리드는 현장 무관)
   date TEXT NOT NULL,
   kind TEXT NOT NULL DEFAULT 'plan',  -- 'plan' | 'actual' | 'reported'
   note TEXT,
@@ -332,6 +333,136 @@ CREATE TABLE IF NOT EXISTS users (
   company_id INTEGER REFERENCES companies(id),
   created_at TEXT DEFAULT (datetime('now'))
 );
+-- ====== 급여·노무 모듈 (Phase 7) ======
+-- 외주 협력사 (형틀반·철근반·방수반 등 — 노무비 직접 신고 X, 사업자 거래)
+CREATE TABLE IF NOT EXISTS subcontractors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  business_no TEXT,
+  work_type TEXT,                          -- 형틀/철근/방수/조경/...
+  bank_name TEXT,
+  account_holder TEXT,
+  account_no TEXT,
+  leader_name TEXT,                        -- 외주반장 이름
+  phone TEXT,
+  address TEXT,
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- 특고직 (특수형태근로종사자) — 장비기사. 사업자등록번호 가진 사람들
+CREATE TABLE IF NOT EXISTS equipment_operators (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  rrn TEXT,                                -- 주민번호
+  business_no TEXT,                        -- 사업자등록번호
+  equipment_type TEXT,                     -- B/H, D/T15TON, 5T살수, 추레라 등
+  vendor_name TEXT,                        -- 소속 회사 (글로벌운수·통일중기 등)
+  daily_rate INTEGER DEFAULT 0,            -- 일 단가 (원)
+  phone TEXT,
+  bank_name TEXT,
+  account_holder TEXT,
+  account_no TEXT,
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- 직종별 표준 일당 (worker.daily_wage 의 default 또는 신규 입력 시 자동 채움)
+CREATE TABLE IF NOT EXISTS wage_rates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_role TEXT NOT NULL,                  -- 목공/철근공/보통인부/작업반장/특별인부 등
+  daily_wage INTEGER NOT NULL,
+  effective_from TEXT,                     -- 적용 시작일 (NULL = 항상)
+  effective_to TEXT,
+  note TEXT,
+  UNIQUE(job_role, effective_from)
+);
+
+-- 공제율 마스터 (수정 가능 — 매년 변경됨)
+CREATE TABLE IF NOT EXISTS tax_rates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  year INTEGER NOT NULL,                   -- 적용 연도
+  rate_type TEXT NOT NULL,                 -- pension/health/ltc/employment/income_tax/local_tax/income_tax_exempt/retirement_fund_per_day
+  rate REAL NOT NULL,                      -- 비율 (%) 또는 금액 (원)
+  is_amount INTEGER DEFAULT 0,             -- 1=금액(원), 0=비율
+  note TEXT,
+  UNIQUE(year, rate_type)
+);
+
+-- 월 단위 급여 마감
+CREATE TABLE IF NOT EXISTS payroll_periods (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  year_month TEXT NOT NULL,                -- '2025-10'
+  company_id INTEGER REFERENCES companies(id),
+  status TEXT DEFAULT 'draft',             -- draft|closed|reported
+  closed_at TEXT,
+  closed_by INTEGER REFERENCES users(id),
+  note TEXT,
+  UNIQUE(year_month, company_id)
+);
+
+-- 명세서 한 줄 (사람 × 월 × 회사). 직영 일용직만. 외주/특고직은 별도 처리.
+CREATE TABLE IF NOT EXISTS payroll_lines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  period_id INTEGER NOT NULL REFERENCES payroll_periods(id) ON DELETE CASCADE,
+  worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  site_id INTEGER REFERENCES sites(id),    -- 주 현장 (선택)
+  days_worked INTEGER DEFAULT 0,
+  daily_wage INTEGER DEFAULT 0,
+  gross_pay INTEGER DEFAULT 0,
+  -- 공제 항목 (각각 원 단위)
+  national_pension INTEGER DEFAULT 0,
+  health_insurance INTEGER DEFAULT 0,
+  ltc_insurance INTEGER DEFAULT 0,
+  employment_insurance INTEGER DEFAULT 0,
+  income_tax INTEGER DEFAULT 0,
+  local_tax INTEGER DEFAULT 0,
+  retirement_fund INTEGER DEFAULT 0,        -- 사업주 부담 (참고용)
+  -- 합계
+  total_deductions INTEGER DEFAULT 0,
+  net_pay INTEGER DEFAULT 0,
+  -- 신고 분류
+  is_subject_4ins INTEGER DEFAULT 0,        -- 8일 이상 또는 220만원 이상
+  reported_at TEXT,                         -- 근로내용확인신고 완료 시각
+  -- 생성 시점 스냅샷
+  bank_name TEXT,
+  account_holder TEXT,
+  account_no TEXT,
+  note TEXT,
+  calculated_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(period_id, worker_id)
+);
+CREATE INDEX IF NOT EXISTS pl_period ON payroll_lines(period_id);
+CREATE INDEX IF NOT EXISTS pl_worker ON payroll_lines(worker_id);
+
+-- 외주 노무비 입금 내역 (협력사 단위 — 노무비 신고 X)
+CREATE TABLE IF NOT EXISTS subcontractor_payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  period_id INTEGER REFERENCES payroll_periods(id) ON DELETE CASCADE,
+  subcontractor_id INTEGER NOT NULL REFERENCES subcontractors(id),
+  site_id INTEGER REFERENCES sites(id),
+  work_period TEXT,                        -- "2025-10-01 ~ 10-31"
+  amount INTEGER NOT NULL,
+  paid_at TEXT,
+  invoice_no TEXT,
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- 특고직 노무비 입금 내역
+CREATE TABLE IF NOT EXISTS equipment_payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  period_id INTEGER REFERENCES payroll_periods(id) ON DELETE CASCADE,
+  operator_id INTEGER NOT NULL REFERENCES equipment_operators(id),
+  site_id INTEGER REFERENCES sites(id),
+  days_worked INTEGER DEFAULT 0,
+  daily_rate INTEGER DEFAULT 0,
+  amount INTEGER NOT NULL,
+  paid_at TEXT,
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS clock_records (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
@@ -388,7 +519,40 @@ SCHEMA_MIGRATIONS = [
     "ALTER TABLE companies ADD COLUMN phone TEXT",
     "ALTER TABLE companies ADD COLUMN email TEXT",
     "ALTER TABLE companies ADD COLUMN representative_phone TEXT",
+    # workers 급여 모듈 추가 컬럼
+    "ALTER TABLE workers ADD COLUMN birth_date TEXT",                  # 생년월일 (만나이/고용보험 제외 판정용)
+    "ALTER TABLE workers ADD COLUMN exempt_employment_ins INTEGER DEFAULT 0",  # 1952년 이전 출생자 = 고용보험 제외
+    "ALTER TABLE workers ADD COLUMN subcontractor_id INTEGER",         # 외주 협력사 소속이면 (보통 NULL — 직영)
 ]
+
+def _migrate_deployments_nullable_site():
+    """deployments.site_id 의 NOT NULL 제거 (이미 nullable 이면 noop)."""
+    try:
+        with conn() as c:
+            cols = c.execute("PRAGMA table_info(deployments)").fetchall()
+            site_col = next((col for col in cols if col[1] == 'site_id'), None)
+            if site_col is None: return  # 테이블 자체 없음
+            # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)
+            if site_col[3] == 0: return   # 이미 nullable
+            print("[migrate] deployments.site_id 를 nullable 로 변경 중...")
+            c.executescript("""
+                CREATE TABLE deployments_new (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+                  site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+                  date TEXT NOT NULL,
+                  kind TEXT NOT NULL DEFAULT 'plan',
+                  note TEXT,
+                  UNIQUE(worker_id, date, kind)
+                );
+                INSERT INTO deployments_new(id, worker_id, site_id, date, kind, note)
+                  SELECT id, worker_id, site_id, date, kind, note FROM deployments;
+                DROP TABLE deployments;
+                ALTER TABLE deployments_new RENAME TO deployments;
+            """)
+            print("[migrate] deployments.site_id nullable 변환 완료")
+    except Exception as e:
+        print(f"[migrate deployments] {e}")
 
 def init_db():
     with conn() as c:
@@ -399,6 +563,8 @@ def init_db():
         for stmt in SCHEMA_MIGRATIONS:
             try: c.execute(stmt)
             except sqlite3.OperationalError: pass  # column exists
+    # 별도 마이그레이션 (CREATE/INSERT/DROP/ALTER 한 번에)
+    _migrate_deployments_nullable_site()
 
 # ========================================================================
 # Helpers
@@ -649,6 +815,45 @@ class CompanyIn(BaseModel):
     incorporation_date: Optional[str] = None
     registration_date: Optional[str] = None
 
+class SubcontractorIn(BaseModel):
+    name: str
+    business_no: Optional[str] = None
+    work_type: Optional[str] = None
+    bank_name: Optional[str] = None
+    account_holder: Optional[str] = None
+    account_no: Optional[str] = None
+    leader_name: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    note: Optional[str] = None
+
+class EquipmentOperatorIn(BaseModel):
+    name: str
+    rrn: Optional[str] = None
+    business_no: Optional[str] = None
+    equipment_type: Optional[str] = None
+    vendor_name: Optional[str] = None
+    daily_rate: Optional[int] = 0
+    phone: Optional[str] = None
+    bank_name: Optional[str] = None
+    account_holder: Optional[str] = None
+    account_no: Optional[str] = None
+    note: Optional[str] = None
+
+class WageRateIn(BaseModel):
+    job_role: str
+    daily_wage: int
+    effective_from: Optional[str] = None
+    effective_to: Optional[str] = None
+    note: Optional[str] = None
+
+class TaxRateIn(BaseModel):
+    year: int
+    rate_type: str
+    rate: float
+    is_amount: Optional[int] = 0
+    note: Optional[str] = None
+
 class CertificationIn(BaseModel):
     cert_name: str
     cert_level: Optional[str] = None
@@ -747,6 +952,22 @@ class ClockIn(BaseModel):
 app = FastAPI(title="GW Construction Management API")
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="gwc_sess",
                    max_age=60*60*24*14, https_only=False, same_site="lax")
+
+from fastapi.responses import JSONResponse
+from fastapi.requests import Request as _StarReq
+
+@app.exception_handler(Exception)
+async def _global_error_handler(request: _StarReq, exc: Exception):
+    """모든 예상치 못한 에러를 JSON 으로 반환 — 클라이언트가 'Internal Server Error' HTML 받고 JSON 파싱 실패하는 문제 방지."""
+    import traceback
+    if isinstance(exc, HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    print(f"[ERR] {request.method} {request.url.path}: {exc}")
+    print(traceback.format_exc())
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc), "trace": traceback.format_exc()[-1500:]}
+    )
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=False,
@@ -861,6 +1082,147 @@ def _seed_mock_vehicles_licenses():
     except Exception as e:
         print(f"[mock_vehicles_licenses] {e}")
 
+def _seed_payroll_defaults():
+    """공제율·표준일당 기본값 시드 — 빈 DB 일 때만."""
+    try:
+        with conn() as c:
+            if c.execute("SELECT COUNT(*) FROM tax_rates").fetchone()[0] == 0:
+                year = 2025
+                rates = [
+                    # rate_type, rate, is_amount, note
+                    ("pension", 0.045, 0, "국민연금 4.5% (사업장가입자)"),
+                    ("health", 0.03545, 0, "건강보험 3.545%"),
+                    ("ltc", 0.06475, 0, "장기요양 6.475% (건강보험액 기준)"),
+                    ("employment", 0.009, 0, "고용보험 0.9% (1952년 이전 출생자 제외)"),
+                    ("income_tax", 0.06, 0, "갑근세 6%"),
+                    ("income_tax_reduction", 0.55, 0, "근로소득세액공제 55% (감면)"),
+                    ("local_tax", 0.10, 0, "주민세 = 갑근세 × 10%"),
+                    ("income_tax_exempt", 150_000, 1, "갑근세 면세점 일 150,000원"),
+                    ("retirement_fund_per_day", 6_500, 1, "건설근로자 퇴직공제 일 6,500원 (사업주 부담)"),
+                    ("ins_threshold_days", 8, 1, "4대보험 적용 기준 일수 (월 8일 이상)"),
+                    ("ins_threshold_amount", 2_200_000, 1, "4대보험 적용 기준 금액 (월 220만원 이상)"),
+                ]
+                for rt, val, is_amt, note in rates:
+                    c.execute(
+                        "INSERT OR IGNORE INTO tax_rates(year, rate_type, rate, is_amount, note) VALUES(?,?,?,?,?)",
+                        (year, rt, val, is_amt, note))
+            if c.execute("SELECT COUNT(*) FROM wage_rates").fetchone()[0] == 0:
+                # 일용직명단 분석 결과 기반
+                std = [
+                    ("작업반장", 200_000),
+                    ("목공",     180_000),
+                    ("철근공",    180_000),
+                    ("석공",     200_000),
+                    ("형틀목수",   200_000),
+                    ("미장공",    180_000),
+                    ("타일공",    180_000),
+                    ("방수공",    170_000),
+                    ("도장공",    170_000),
+                    ("전기공",    180_000),
+                    ("배관공",    180_000),
+                    ("울타리공",   170_000),
+                    ("보통인부",   160_000),
+                    ("단순노무자",  150_000),
+                    ("직영인부",   150_000),
+                    ("특별인부",   170_000),
+                    ("굴삭기기사",  250_000),
+                    ("지게차기사",  200_000),
+                ]
+                for jr, dw in std:
+                    c.execute("INSERT OR IGNORE INTO wage_rates(job_role, daily_wage, effective_from) VALUES(?,?,?)",
+                              (jr, dw, "2025-01-01"))
+            print("[startup] payroll defaults seed 완료 (tax_rates + wage_rates)")
+    except Exception as e:
+        print(f"[seed_payroll_defaults] {e}")
+
+# ===== 급여 계산 엔진 =====
+def _get_tax_rates(year=None):
+    """현재 연도의 공제율을 dict 로 반환."""
+    if year is None: year = date.today().year
+    out = {}
+    with conn() as c:
+        for r in c.execute("SELECT rate_type, rate, is_amount FROM tax_rates WHERE year=?", (year,)).fetchall():
+            out[r['rate_type']] = (r['rate'], bool(r['is_amount']))
+        # 없으면 이전 연도 fallback
+        if not out:
+            for r in c.execute("SELECT rate_type, rate, is_amount FROM tax_rates ORDER BY year DESC").fetchall():
+                if r['rate_type'] not in out:
+                    out[r['rate_type']] = (r['rate'], bool(r['is_amount']))
+    return out
+
+def calculate_payroll(daily_wage: int, days: int, exempt_employment_ins: bool = False, year=None):
+    """일당·일수 → 갑근세·주민세·4대보험·실수령 자동 계산.
+    리턴: dict — gross / income_tax / local_tax / employment / pension / health / ltc /
+                 retirement_fund / total_deductions / net_pay / is_subject_4ins
+    """
+    if days <= 0 or daily_wage <= 0:
+        return {
+            "gross_pay": 0, "income_tax": 0, "local_tax": 0,
+            "employment_insurance": 0, "national_pension": 0, "health_insurance": 0,
+            "ltc_insurance": 0, "retirement_fund": 0,
+            "total_deductions": 0, "net_pay": 0, "is_subject_4ins": False,
+        }
+    rates = _get_tax_rates(year)
+    def r(key, default=0):
+        v = rates.get(key)
+        return v[0] if v else default
+
+    gross = daily_wage * days
+
+    # 갑근세 = (일당 - 면세점) × 6% × 0.55 × 일수
+    exempt_amt = r('income_tax_exempt', 150_000)
+    if daily_wage <= exempt_amt:
+        income_tax = 0
+    else:
+        per_day_tax = (daily_wage - exempt_amt) * r('income_tax', 0.06) * (1 - r('income_tax_reduction', 0.55))
+        # 위 공식: 6% × (1 - 55%) = 2.7%. 하지만 자료에 따라 0.55 가 곱해지는 식으로 표기되기도.
+        # 우리 시트 기준: 0.06 × 0.55 = 0.033 이 아니라 0.027 (= 6% × 0.45). 그래서 (1 - 0.55) 로 처리.
+        # 실제로 자비스/소득세계산기 사이트 = (일당-15만) × 6% × 0.55 = 직접곱 — 이게 맞음
+        # 근로소득세액공제 = 산출세액의 55% 공제 → 잔여 45%만 부담 → (일당-15만) × 6% × 0.45 가 정확
+        # 한국 일용직 갑근세 = 산출세액(6%) - 근로소득세액공제(55%) = 6% × (1-0.55) = 2.7% → 우리 시트와 일치
+        # 따라서 (1 - reduction) 으로 계산
+        income_tax = round(per_day_tax * days)
+        # 999원 이하 자동 면세
+        if income_tax <= 999:
+            income_tax = 0
+    local_tax = round(income_tax * r('local_tax', 0.10))
+
+    # 4대보험 적용 여부 (8일 이상 OR 220만원 이상)
+    ins_days = int(r('ins_threshold_days', 8))
+    ins_amt = int(r('ins_threshold_amount', 2_200_000))
+    is_subject = (days >= ins_days) or (gross >= ins_amt)
+
+    # 고용보험 — 1952년 이전 출생자 제외
+    employment = 0 if exempt_employment_ins else round(gross * r('employment', 0.009))
+
+    # 국민연금·건강·장기요양 — 4대보험 대상자만
+    if is_subject:
+        pension = round(gross * r('pension', 0.045))
+        health = round(gross * r('health', 0.03545))
+        ltc = round(health * r('ltc', 0.06475))
+    else:
+        pension = health = ltc = 0
+
+    # 퇴직공제 (사업주 부담, 직원 공제는 아님 — 표시용)
+    retirement_fund = int(r('retirement_fund_per_day', 6_500)) * days
+
+    total_ded = income_tax + local_tax + employment + pension + health + ltc
+    net = gross - total_ded
+
+    return {
+        "gross_pay": gross,
+        "income_tax": income_tax,
+        "local_tax": local_tax,
+        "employment_insurance": employment,
+        "national_pension": pension,
+        "health_insurance": health,
+        "ltc_insurance": ltc,
+        "retirement_fund": retirement_fund,
+        "total_deductions": total_ded,
+        "net_pay": net,
+        "is_subject_4ins": is_subject,
+    }
+
 def _seed_mock_competitor_bids():
     """경쟁사 + 일부 입찰 기록 시연 데이터."""
     try:
@@ -907,6 +1269,7 @@ def _startup():
             _seed_mock_competitor_bids()
     except Exception as e: print(f"[startup mock tenders] {e}")
     _seed_mock_vehicles_licenses()
+    _seed_payroll_defaults()
     _evaluate_rules()
 
 # ----- Auth -----
@@ -3678,6 +4041,370 @@ def download_workers_template(_: dict = Depends(require_login)):
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname_enc}"}
     )
 
+# ====================================================================
+# 급여·노무 모듈 (Phase 7)
+# ====================================================================
+
+# ----- 공제율 (tax_rates) -----
+@app.get("/api/payroll/tax-rates")
+def list_tax_rates(year: Optional[int] = None, _: dict = Depends(require_login)):
+    sql = "SELECT * FROM tax_rates"
+    args = []
+    if year: sql += " WHERE year=?"; args.append(year)
+    sql += " ORDER BY year DESC, rate_type"
+    with conn() as c:
+        return rows(c.execute(sql, args).fetchall())
+
+@app.put("/api/payroll/tax-rates/{rid}")
+def update_tax_rate(rid: int, payload: TaxRateIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute("UPDATE tax_rates SET year=?, rate_type=?, rate=?, is_amount=?, note=? WHERE id=?",
+                  (payload.year, payload.rate_type, payload.rate, payload.is_amount or 0, payload.note, rid))
+    return {"ok": True}
+
+@app.post("/api/payroll/tax-rates")
+def create_tax_rate(payload: TaxRateIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        cur = c.execute("INSERT OR REPLACE INTO tax_rates(year, rate_type, rate, is_amount, note) VALUES(?,?,?,?,?)",
+                        (payload.year, payload.rate_type, payload.rate, payload.is_amount or 0, payload.note))
+    return {"id": cur.lastrowid}
+
+# ----- 직종별 일당 (wage_rates) -----
+@app.get("/api/payroll/wage-rates")
+def list_wage_rates(_: dict = Depends(require_login)):
+    with conn() as c:
+        return rows(c.execute("SELECT * FROM wage_rates ORDER BY job_role").fetchall())
+
+@app.post("/api/payroll/wage-rates")
+def create_wage_rate(payload: WageRateIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        cur = c.execute(
+            "INSERT OR REPLACE INTO wage_rates(job_role, daily_wage, effective_from, effective_to, note) VALUES(?,?,?,?,?)",
+            (payload.job_role, payload.daily_wage, payload.effective_from, payload.effective_to, payload.note))
+    return {"id": cur.lastrowid}
+
+@app.put("/api/payroll/wage-rates/{rid}")
+def update_wage_rate(rid: int, payload: WageRateIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute("UPDATE wage_rates SET job_role=?, daily_wage=?, effective_from=?, effective_to=?, note=? WHERE id=?",
+                  (payload.job_role, payload.daily_wage, payload.effective_from, payload.effective_to, payload.note, rid))
+    return {"ok": True}
+
+@app.delete("/api/payroll/wage-rates/{rid}")
+def delete_wage_rate(rid: int, user: dict = Depends(require_login)):
+    with conn() as c: c.execute("DELETE FROM wage_rates WHERE id=?", (rid,))
+    return {"ok": True}
+
+# ----- 협력사 (subcontractors) -----
+@app.get("/api/payroll/subcontractors")
+def list_subcontractors(_: dict = Depends(require_login)):
+    with conn() as c:
+        return rows(c.execute("SELECT * FROM subcontractors ORDER BY name").fetchall())
+
+@app.post("/api/payroll/subcontractors")
+def create_subcontractor(payload: SubcontractorIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO subcontractors(name, business_no, work_type, bank_name, account_holder,
+                                          account_no, leader_name, phone, address, note)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (payload.name, payload.business_no, payload.work_type, payload.bank_name, payload.account_holder,
+             payload.account_no, payload.leader_name, payload.phone, payload.address, payload.note))
+    return {"id": cur.lastrowid}
+
+@app.put("/api/payroll/subcontractors/{sid}")
+def update_subcontractor(sid: int, payload: SubcontractorIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute(
+            """UPDATE subcontractors SET name=?, business_no=?, work_type=?, bank_name=?, account_holder=?,
+               account_no=?, leader_name=?, phone=?, address=?, note=? WHERE id=?""",
+            (payload.name, payload.business_no, payload.work_type, payload.bank_name, payload.account_holder,
+             payload.account_no, payload.leader_name, payload.phone, payload.address, payload.note, sid))
+    return {"ok": True}
+
+@app.delete("/api/payroll/subcontractors/{sid}")
+def delete_subcontractor(sid: int, user: dict = Depends(require_login)):
+    with conn() as c: c.execute("DELETE FROM subcontractors WHERE id=?", (sid,))
+    return {"ok": True}
+
+# ----- 특고직 (equipment_operators) -----
+@app.get("/api/payroll/equipment-operators")
+def list_equipment_operators(_: dict = Depends(require_login)):
+    with conn() as c:
+        return rows(c.execute("SELECT * FROM equipment_operators ORDER BY name").fetchall())
+
+@app.post("/api/payroll/equipment-operators")
+def create_eq_operator(payload: EquipmentOperatorIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO equipment_operators(name, rrn, business_no, equipment_type, vendor_name,
+                                               daily_rate, phone, bank_name, account_holder, account_no, note)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (payload.name, payload.rrn, payload.business_no, payload.equipment_type, payload.vendor_name,
+             payload.daily_rate or 0, payload.phone, payload.bank_name, payload.account_holder,
+             payload.account_no, payload.note))
+    return {"id": cur.lastrowid}
+
+@app.put("/api/payroll/equipment-operators/{oid}")
+def update_eq_operator(oid: int, payload: EquipmentOperatorIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        c.execute(
+            """UPDATE equipment_operators SET name=?, rrn=?, business_no=?, equipment_type=?, vendor_name=?,
+               daily_rate=?, phone=?, bank_name=?, account_holder=?, account_no=?, note=? WHERE id=?""",
+            (payload.name, payload.rrn, payload.business_no, payload.equipment_type, payload.vendor_name,
+             payload.daily_rate or 0, payload.phone, payload.bank_name, payload.account_holder,
+             payload.account_no, payload.note, oid))
+    return {"ok": True}
+
+@app.delete("/api/payroll/equipment-operators/{oid}")
+def delete_eq_operator(oid: int, user: dict = Depends(require_login)):
+    with conn() as c: c.execute("DELETE FROM equipment_operators WHERE id=?", (oid,))
+    return {"ok": True}
+
+# ----- 출역 그리드 — 메인 입력 -----
+def _payroll_grid_data(year_month: str, company_id: Optional[int] = None):
+    """순수 함수: 그리드 데이터 계산. 다른 엔드포인트(monthly 등)에서도 재사용."""
+    if not re.match(r'^\d{4}-\d{2}$', year_month):
+        raise HTTPException(400, "year_month 형식: YYYY-MM")
+    year, month = year_month.split('-')
+    from datetime import timedelta as _td
+    first = date(int(year), int(month), 1)
+    if int(month) == 12: last = date(int(year)+1, 1, 1) - _td(days=1)
+    else: last = date(int(year), int(month)+1, 1) - _td(days=1)
+    days_in_month = last.day
+
+    with conn() as c:
+        # 일용직 — w.* 로 가져와 컬럼 존재 여부 무관하게 안전
+        sql = """SELECT w.*, co.name AS company_name
+                 FROM workers w LEFT JOIN companies co ON w.company_id=co.id
+                 WHERE w.worker_type='daily' AND (w.resigned_at IS NULL OR w.resigned_at='')"""
+        args = []
+        if company_id:
+            sql += " AND w.company_id=?"; args.append(company_id)
+        sql += " ORDER BY w.job_role, w.name"
+        workers_rows = rows(c.execute(sql, args).fetchall())
+
+        deps = c.execute(
+            """SELECT worker_id, site_id, date, kind FROM deployments
+               WHERE date BETWEEN ? AND ? AND kind='actual'""",
+            (first.isoformat(), last.isoformat())).fetchall()
+        dep_map = {}
+        for d in deps:
+            try: day = int(d['date'][8:10])
+            except: continue
+            dep_map.setdefault(d['worker_id'], set()).add(day)
+
+        results = []
+        for w in workers_rows:
+            attended = sorted(list(dep_map.get(w.get('id'), set())))
+            days = len(attended)
+            wage = w.get('daily_wage') or 0
+            exempt = bool(w.get('exempt_employment_ins') or 0)
+            calc = calculate_payroll(wage, days, exempt)
+            results.append({
+                **w,
+                "attended_days": attended,
+                "days_worked": days,
+                **calc,
+            })
+
+    return {
+        "year_month": year_month,
+        "days_in_month": days_in_month,
+        "workers": results,
+    }
+
+@app.get("/api/payroll/grid")
+def payroll_grid(year_month: str, company_id: Optional[int] = None,
+                 _: dict = Depends(require_login)):
+    return _payroll_grid_data(year_month, company_id)
+
+class PayrollDayIn(BaseModel):
+    worker_id: int
+    date: str       # YYYY-MM-DD
+    site_id: Optional[int] = None
+    attended: bool
+
+@app.post("/api/payroll/grid/toggle")
+def payroll_toggle(payload: PayrollDayIn, user: dict = Depends(require_login)):
+    """출역 그리드의 한 셀 토글 — 출근/결근 변경."""
+    with conn() as c:
+        if payload.attended:
+            # INSERT or REPLACE — actual 배치
+            c.execute("DELETE FROM deployments WHERE worker_id=? AND date=? AND kind='actual'",
+                      (payload.worker_id, payload.date))
+            c.execute(
+                """INSERT INTO deployments(worker_id, site_id, date, kind, note)
+                   VALUES(?,?,?,'actual','출역그리드')""",
+                (payload.worker_id, payload.site_id or None, payload.date))
+        else:
+            c.execute("DELETE FROM deployments WHERE worker_id=? AND date=? AND kind='actual'",
+                      (payload.worker_id, payload.date))
+    return {"ok": True}
+
+# ----- 월별 명세서 + 분류 -----
+@app.get("/api/payroll/monthly")
+def payroll_monthly(year_month: str, company_id: Optional[int] = None,
+                    _: dict = Depends(require_login)):
+    """월별 명세서 — payroll/grid 와 같은 데이터를 명세서 형식으로.
+    추가로 외주 협력사·특고직 입금 내역도 포함."""
+    g = _payroll_grid_data(year_month, company_id)
+    workers = g['workers']
+    # 분류
+    subject_4ins = [w for w in workers if w['is_subject_4ins']]
+    not_subject = [w for w in workers if not w['is_subject_4ins'] and w['days_worked'] > 0]
+    no_attendance = [w for w in workers if w['days_worked'] == 0]
+
+    # 합계
+    totals = {
+        "gross_pay": sum(w['gross_pay'] for w in workers),
+        "income_tax": sum(w['income_tax'] for w in workers),
+        "local_tax": sum(w['local_tax'] for w in workers),
+        "employment_insurance": sum(w['employment_insurance'] for w in workers),
+        "national_pension": sum(w['national_pension'] for w in workers),
+        "health_insurance": sum(w['health_insurance'] for w in workers),
+        "ltc_insurance": sum(w['ltc_insurance'] for w in workers),
+        "retirement_fund": sum(w['retirement_fund'] for w in workers),
+        "total_deductions": sum(w['total_deductions'] for w in workers),
+        "net_pay": sum(w['net_pay'] for w in workers),
+        "total_days": sum(w['days_worked'] for w in workers),
+        "subject_4ins_count": len(subject_4ins),
+        "not_subject_count": len(not_subject),
+        "active_workers": len(subject_4ins) + len(not_subject),
+    }
+    return {
+        "year_month": year_month,
+        "days_in_month": g['days_in_month'],
+        "workers_all": workers,
+        "subject_4ins": subject_4ins,
+        "not_subject": not_subject,
+        "no_attendance": no_attendance,
+        "totals": totals,
+    }
+
+# ----- 외주 협력사 / 특고직 입금 -----
+class SubPaymentIn(BaseModel):
+    subcontractor_id: int
+    site_id: Optional[int] = None
+    work_period: Optional[str] = None
+    amount: int
+    paid_at: Optional[str] = None
+    invoice_no: Optional[str] = None
+    note: Optional[str] = None
+    period_id: Optional[int] = None
+
+@app.get("/api/payroll/subcontractor-payments")
+def list_sub_payments(year_month: Optional[str] = None, _: dict = Depends(require_login)):
+    sql = """SELECT sp.*, sc.name AS subcontractor_name, sc.work_type, sc.account_no, sc.bank_name,
+                    s.name AS site_name
+             FROM subcontractor_payments sp
+             JOIN subcontractors sc ON sp.subcontractor_id=sc.id
+             LEFT JOIN sites s ON sp.site_id=s.id
+             WHERE 1=1"""
+    args = []
+    if year_month:
+        sql += " AND sp.work_period LIKE ?"
+        args.append(f"%{year_month}%")
+    sql += " ORDER BY sp.paid_at DESC"
+    with conn() as c:
+        return rows(c.execute(sql, args).fetchall())
+
+@app.post("/api/payroll/subcontractor-payments")
+def create_sub_payment(payload: SubPaymentIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO subcontractor_payments(period_id, subcontractor_id, site_id, work_period,
+                                                  amount, paid_at, invoice_no, note)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (payload.period_id, payload.subcontractor_id, payload.site_id, payload.work_period,
+             payload.amount, payload.paid_at, payload.invoice_no, payload.note))
+    return {"id": cur.lastrowid}
+
+@app.delete("/api/payroll/subcontractor-payments/{pid}")
+def delete_sub_payment(pid: int, _: dict = Depends(require_login)):
+    with conn() as c: c.execute("DELETE FROM subcontractor_payments WHERE id=?", (pid,))
+    return {"ok": True}
+
+class EqPaymentIn(BaseModel):
+    operator_id: int
+    site_id: Optional[int] = None
+    days_worked: Optional[int] = 0
+    daily_rate: Optional[int] = 0
+    amount: int
+    paid_at: Optional[str] = None
+    note: Optional[str] = None
+    period_id: Optional[int] = None
+
+@app.get("/api/payroll/equipment-payments")
+def list_eq_payments(_: dict = Depends(require_login)):
+    with conn() as c:
+        return rows(c.execute(
+            """SELECT ep.*, eo.name AS operator_name, eo.equipment_type, eo.vendor_name,
+                      eo.business_no, s.name AS site_name
+               FROM equipment_payments ep
+               JOIN equipment_operators eo ON ep.operator_id=eo.id
+               LEFT JOIN sites s ON ep.site_id=s.id
+               ORDER BY ep.paid_at DESC""").fetchall())
+
+@app.post("/api/payroll/equipment-payments")
+def create_eq_payment(payload: EqPaymentIn, user: dict = Depends(require_login)):
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO equipment_payments(period_id, operator_id, site_id, days_worked, daily_rate,
+                                              amount, paid_at, note)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (payload.period_id, payload.operator_id, payload.site_id, payload.days_worked or 0,
+             payload.daily_rate or 0, payload.amount, payload.paid_at, payload.note))
+    return {"id": cur.lastrowid}
+
+@app.delete("/api/payroll/equipment-payments/{pid}")
+def delete_eq_payment(pid: int, _: dict = Depends(require_login)):
+    with conn() as c: c.execute("DELETE FROM equipment_payments WHERE id=?", (pid,))
+    return {"ok": True}
+
+# ----- 월별 노무비 대시보드 -----
+@app.get("/api/payroll/dashboard")
+def payroll_dashboard(year: Optional[int] = None, _: dict = Depends(require_login)):
+    """연간 월별 노무비 추이 — 직영/외주/특고직 별도."""
+    if not year: year = date.today().year
+    out = []
+    for m in range(1, 13):
+        ym = f"{year}-{m:02d}"
+        first = date(year, m, 1)
+        from datetime import timedelta as _td
+        if m == 12: last = date(year+1, 1, 1) - _td(days=1)
+        else: last = date(year, m+1, 1) - _td(days=1)
+        with conn() as c:
+            # 직영 일용직 — deployments 기반 임금
+            direct = c.execute("""
+                SELECT IFNULL(SUM(w.daily_wage),0) AS total, COUNT(*) AS person_days,
+                       COUNT(DISTINCT d.worker_id) AS unique_workers
+                FROM deployments d JOIN workers w ON d.worker_id=w.id
+                WHERE d.kind='actual' AND d.date BETWEEN ? AND ?
+                  AND w.worker_type='daily'""", (first.isoformat(), last.isoformat())).fetchone()
+            # 외주 협력사 입금
+            sub = c.execute("""
+                SELECT IFNULL(SUM(amount),0) AS total, COUNT(*) AS payments
+                FROM subcontractor_payments WHERE work_period LIKE ?""",
+                (f"%{ym}%",)).fetchone()
+            # 특고직
+            eq = c.execute("""
+                SELECT IFNULL(SUM(amount),0) AS total, COUNT(*) AS payments
+                FROM equipment_payments WHERE paid_at LIKE ?""",
+                (f"{ym}%",)).fetchone()
+        out.append({
+            "year_month": ym,
+            "direct_labor": direct['total'] or 0,
+            "direct_person_days": direct['person_days'] or 0,
+            "direct_unique_workers": direct['unique_workers'] or 0,
+            "subcontractor_total": sub['total'] or 0,
+            "subcontractor_count": sub['payments'] or 0,
+            "equipment_total": eq['total'] or 0,
+            "equipment_count": eq['payments'] or 0,
+            "grand_total": (direct['total'] or 0) + (sub['total'] or 0) + (eq['total'] or 0),
+        })
+    return {"year": year, "months": out}
+
 @app.post("/api/admin/full-reset")
 def admin_full_reset(user: dict = Depends(require_login)):
     """전체 데이터 초기화 — 회사·면허·직원·자격증·주주·현장·배치·차량 모두 삭제 후
@@ -3791,6 +4518,159 @@ async def upload_workers_excel(
                payload={"filename": file.filename, "replace": replace, "final": final, "stats": emp_stats},
                created_by=user["id"], source="admin_ui")
     return {"ok": True, "stats": emp_stats, "auto_registered": auto_n, "final": final}
+
+class PasteDailyIn(BaseModel):
+    text: str
+    replace: Optional[bool] = False
+
+@app.post("/api/payroll/paste-daily-workers")
+def paste_daily_workers(payload: PasteDailyIn, user: dict = Depends(require_login)):
+    """엑셀 행 복사 → paste 로 일용직 일괄 등록.
+    한 줄 = 한 사람 (탭으로 구분):
+      이름 / 공종 / 주민번호 / 주소 / 은행 / 예금주 / 계좌 / 일당 / 연락처 / 비고
+    Excel 에서 행 선택 → Ctrl+C → 우리 textarea 에 Ctrl+V 하면 자동 탭 형식으로 들어옴.
+    """
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(400, "텍스트가 비어있습니다")
+    lines = [ln for ln in text.split('\n') if ln.strip()]
+    added = 0
+    updated = 0
+    skipped_header = 0
+    skipped_dup = 0
+    skipped_invalid = 0
+    error_lines = []
+
+    with conn() as c:
+        if payload.replace:
+            c.execute("DELETE FROM workers WHERE worker_type='daily'")
+
+        for line_no, ln in enumerate(lines, start=1):
+            # 탭 또는 다중공백 구분
+            cells = [x.strip() for x in re.split(r'\t', ln.rstrip('\r'))]
+            # 단일 공백으로 구분된 경우 (탭이 없는 경우) — 보통 안 그렇지만
+            if len(cells) < 2 and '  ' in ln:
+                cells = [x.strip() for x in re.split(r' {2,}', ln) if x.strip()]
+            if not cells: continue
+            name_raw = cells[0]
+            if not name_raw: continue
+
+            # 헤더 라인 스킵
+            if name_raw in {'이름', '성명', '이 름', '직 영', '#'}:
+                skipped_header += 1
+                continue
+            # 한글 이름 검증 (공백 제거 후)
+            name = name_raw.replace(' ', '').strip()
+            if not re.match(r'^[가-힣]{2,4}$', name):
+                skipped_invalid += 1
+                error_lines.append(f"L{line_no}: 이름 형식 이상 → {name_raw[:30]}")
+                continue
+
+            job_role = cells[1] if len(cells) > 1 and cells[1] else None
+            rrn = None
+            if len(cells) > 2:
+                rrn_raw = re.sub(r'\s+', '', cells[2])
+                if re.match(r'^\d{6}-\d{7}$', rrn_raw):
+                    rrn = rrn_raw
+            address = cells[3] if len(cells) > 3 else None
+            bank_name = cells[4] if len(cells) > 4 else None
+            account_holder = cells[5] if len(cells) > 5 else None
+            account_no = cells[6] if len(cells) > 6 else None
+            daily_wage = 0
+            if len(cells) > 7 and cells[7]:
+                try: daily_wage = int(re.sub(r'[^\d]', '', cells[7]) or '0')
+                except: daily_wage = 0
+            phone = cells[8] if len(cells) > 8 else None
+            note = cells[9] if len(cells) > 9 else None
+
+            # 1952년 이전 출생자 = 고용보험 제외 (rrn 7번째 자리로 1900s/2000s 판정)
+            exempt = 0; birth_date = None
+            if rrn and len(rrn) >= 8:
+                try:
+                    yy = int(rrn[:2])
+                    third = rrn[7]
+                    full_year = 1900 + yy if third in '12569' else 2000 + yy
+                    if full_year < 1953: exempt = 1
+                    birth_date = f"{full_year}-{rrn[2:4]}-{rrn[4:6]}"
+                except: pass
+
+            # 이미 같은 RRN 또는 이름+전화 직원 있나
+            existing = None
+            if rrn:
+                existing = c.execute("SELECT id FROM workers WHERE rrn=?", (rrn,)).fetchone()
+            if not existing and phone:
+                existing = c.execute(
+                    "SELECT id FROM workers WHERE name=? AND phone=?", (name, phone)).fetchone()
+
+            try:
+                if existing:
+                    c.execute(
+                        """UPDATE workers SET worker_type='daily',
+                            address=COALESCE(NULLIF(address,''),?),
+                            bank_name=COALESCE(NULLIF(bank_name,''),?),
+                            account_holder=COALESCE(NULLIF(account_holder,''),?),
+                            bank_account=COALESCE(NULLIF(bank_account,''),?),
+                            daily_wage=CASE WHEN ?>0 THEN ? ELSE daily_wage END,
+                            phone=COALESCE(NULLIF(phone,''),?),
+                            job_role=COALESCE(NULLIF(job_role,''),?),
+                            birth_date=COALESCE(birth_date,?),
+                            exempt_employment_ins=?,
+                            note=COALESCE(NULLIF(note,''),?)
+                           WHERE id=?""",
+                        (address, bank_name, account_holder, account_no,
+                         daily_wage, daily_wage, phone, job_role, birth_date,
+                         exempt, note, existing[0]))
+                    updated += 1
+                else:
+                    c.execute(
+                        """INSERT INTO workers(name, rrn, worker_type, address, bank_name, account_holder,
+                                                bank_account, daily_wage, phone, job_role,
+                                                birth_date, exempt_employment_ins, note)
+                           VALUES(?,?,'daily',?,?,?,?,?,?,?,?,?,?)""",
+                        (name, rrn, address, bank_name, account_holder, account_no,
+                         daily_wage, phone, job_role, birth_date, exempt, note))
+                    added += 1
+            except Exception as e:
+                error_lines.append(f"L{line_no}: {str(e)[:100]} ({name})")
+
+    return {
+        "ok": True,
+        "total_lines": len(lines),
+        "added": added,
+        "updated": updated,
+        "skipped_header": skipped_header,
+        "skipped_invalid": skipped_invalid,
+        "skipped_dup": skipped_dup,
+        "errors": error_lines[:20],   # 처음 20개만
+    }
+
+@app.post("/api/payroll/upload-daily-workers")
+async def upload_daily_workers_excel(
+    file: UploadFile = File(...),
+    replace: bool = Form(False),
+    user: dict = Depends(require_login),
+):
+    """일용직 + 특고직 + 협력사 엑셀 업로드 (2025년10월-일용-총괄.xlsx 형식)."""
+    if not file.filename.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        raise HTTPException(400, "엑셀 파일만")
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "initial_data")
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "2025년10월-일용-총괄.xlsx")
+    content = await file.read()
+    with open(save_path, "wb") as f: f.write(content)
+    try:
+        import import_excel, importlib
+        importlib.reload(import_excel)
+        c = sqlite3.connect(DB_PATH, timeout=30.0)
+        c.row_factory = sqlite3.Row
+        stats = import_excel.import_daily_workers(c, Path(save_path), replace=replace)
+        c.commit(); c.close()
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[upload-daily-workers ERR] {e}\n{tb}")
+        return {"ok": False, "error": str(e), "trace": tb[:2500]}
+    return {"ok": True, "stats": stats}
 
 @app.post("/api/companies/upload-outline")
 async def upload_company_outline_excel(

@@ -272,6 +272,202 @@ def _split_dates(s):
         if iso: iso_dates.append(iso)
     return iso_dates
 
+def import_daily_workers(c, path, replace=False):
+    """2025년10월-일용-총괄.xlsx 의 [일용직명단] 시트 → workers (worker_type='daily').
+    또한 [특고직] → equipment_operators, [업체계좌] → subcontractors 도 같이 임포트.
+    """
+    if not path.exists():
+        print(f"  [skip] {path.name} 없음")
+        return {"daily_workers_added": 0, "operators_added": 0, "subcontractors_added": 0}
+
+    # 파일 진단 — 형식 검증
+    file_size = path.stat().st_size
+    with open(path, 'rb') as _f:
+        sig = _f.read(8)
+    if file_size < 100:
+        raise IOError(f"파일이 너무 작음 ({file_size} bytes). 업로드 실패 또는 빈 파일.")
+    if sig.startswith(b'PK\x03\x04'):
+        fmt = 'xlsx (Office Open XML zip)'
+    elif sig.startswith(b'\xd0\xcf\x11\xe0'):
+        fmt = 'xls (Excel 97-2003 binary) — openpyxl 미지원'
+        raise IOError(f"이 파일은 옛날 .xls 포맷입니다 ({sig.hex()}, {file_size} bytes). "
+                      f"Excel 에서 열어 [다른 이름으로 저장] → '.xlsx' 로 저장 후 다시 업로드해주세요.")
+    else:
+        fmt = f'알 수 없음 (시그니처: {sig.hex()})'
+        raise IOError(f"엑셀 파일이 아닌 것 같습니다 (시그니처={sig.hex()}, 크기={file_size} bytes). "
+                      f"Excel 에서 .xlsx 형식으로 다시 저장해주세요.")
+    print(f"  [import_daily_workers] 파일 {file_size:,} bytes, 형식: {fmt}")
+
+    # 1차 시도 — read_only=True (메모리 효율)
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    except Exception as e1:
+        print(f"  [WARN] read_only=True 로 열기 실패: {e1}. 일반 모드로 재시도...")
+        try:
+            wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
+        except Exception as e2:
+            raise IOError(
+                f"openpyxl 로 파일을 열 수 없습니다.\n"
+                f"  read_only=True: {e1}\n"
+                f"  read_only=False: {e2}\n"
+                f"⇒ Excel 에서 파일을 열어 다른 이름으로 저장 (.xlsx) 후 다시 업로드해주세요. "
+                f"또는 파일이 다른 프로그램(Excel)에서 열려 있다면 닫고 재시도."
+            )
+    stats = {"daily_workers_added": 0, "daily_workers_updated": 0,
+             "operators_added": 0, "subcontractors_added": 0}
+
+    if replace:
+        c.execute("DELETE FROM workers WHERE worker_type='daily'")
+        c.execute("DELETE FROM equipment_operators")
+        c.execute("DELETE FROM subcontractors")
+
+    # ===== [일용직명단] — 279명 =====
+    if "일용직명단" in wb.sheetnames:
+        ws = wb["일용직명단"]
+        # R1: "고용보험 제외 1952년 이전 출생자(2011년 현재..."
+        # R2: 헤더 (이름/공종/주민등록번호/주소/은행명/예금주/계좌번호/일당/연락처/비고/우편번호)
+        # R3~ 데이터
+        for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            if i < 3: continue
+            cells = [str(x or '').strip() for x in row]
+            if len(cells) < 4: continue
+            name_raw = cells[0]
+            if not name_raw or len(name_raw) < 2: continue
+            name = clean_name(name_raw)
+            if not name or name in {'이름','성명'}: continue
+
+            job_role = cells[1] or None
+            rrn = re.sub(r'\s+', '', cells[2]) if len(cells) > 2 else ''
+            if rrn and not re.match(r'^\d{6}-\d{7}$', rrn): rrn = None
+            address = cells[3] if len(cells) > 3 else None
+            bank_name = cells[4] if len(cells) > 4 else None
+            account_holder = cells[5] if len(cells) > 5 else None
+            account_no = cells[6] if len(cells) > 6 else None
+            try: daily_wage = int(float(cells[7])) if len(cells) > 7 and cells[7] else 0
+            except: daily_wage = 0
+            phone = cells[8] if len(cells) > 8 else None
+            note = cells[9] if len(cells) > 9 else None
+
+            # 1952년 이전 출생자 = 고용보험 제외 (rrn 앞 6자리에서 판정)
+            exempt = 0
+            birth_date = None
+            if rrn and len(rrn) >= 8:
+                yy = int(rrn[:2])
+                third = rrn[7]  # 성별 자리
+                # 1900년대인지 2000년대인지: 주민번호 7번째 자리 1,2,5,6 = 1900s / 3,4,7,8 = 2000s
+                if third in '12569':
+                    full_year = 1900 + yy
+                else:
+                    full_year = 2000 + yy
+                if full_year < 1953:
+                    exempt = 1
+                try:
+                    birth_date = f"{full_year}-{rrn[2:4]}-{rrn[4:6]}"
+                except: pass
+
+            # 동일 RRN 또는 동일 이름+전화 직원이 이미 있나
+            existing = None
+            if rrn:
+                existing = c.execute("SELECT id FROM workers WHERE rrn=?", (rrn,)).fetchone()
+            if not existing and phone:
+                existing = c.execute(
+                    "SELECT id FROM workers WHERE name=? AND phone=?", (name, phone)).fetchone()
+            if existing:
+                wid = existing[0]
+                c.execute(
+                    """UPDATE workers SET worker_type='daily', name=?, rrn=COALESCE(?,rrn),
+                        address=COALESCE(NULLIF(address,''),?), bank_name=COALESCE(NULLIF(bank_name,''),?),
+                        account_holder=COALESCE(NULLIF(account_holder,''),?),
+                        bank_account=COALESCE(NULLIF(bank_account,''),?), daily_wage=?,
+                        phone=COALESCE(NULLIF(phone,''),?), job_role=COALESCE(NULLIF(job_role,''),?),
+                        birth_date=COALESCE(birth_date,?), exempt_employment_ins=?,
+                        note=COALESCE(NULLIF(note,''),?)
+                       WHERE id=?""",
+                    (name, rrn, address, bank_name, account_holder, account_no, daily_wage,
+                     phone, job_role, birth_date, exempt, note, wid))
+                stats["daily_workers_updated"] += 1
+            else:
+                c.execute(
+                    """INSERT INTO workers(name, rrn, worker_type, address, bank_name, account_holder,
+                                            bank_account, daily_wage, phone, job_role,
+                                            birth_date, exempt_employment_ins, note)
+                       VALUES(?,?,'daily',?,?,?,?,?,?,?,?,?,?)""",
+                    (name, rrn, address, bank_name, account_holder, account_no,
+                     daily_wage, phone, job_role, birth_date, exempt, note))
+                stats["daily_workers_added"] += 1
+
+    # ===== [특고직] — 23명 =====
+    if "특고직" in wb.sheetnames:
+        ws = wb["특고직"]
+        # R6 부터 데이터 (R3~5는 헤더·라벨)
+        for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            if i < 6: continue
+            cells = [str(x or '').strip() for x in row]
+            equipment = cells[0] if len(cells) > 0 else ''
+            vendor_full = cells[1] if len(cells) > 1 else ''   # "글로벌운수(권갑철)" 식
+            biz = cells[2] if len(cells) > 2 else None
+            rrn = cells[3] if len(cells) > 3 else None
+            if not equipment and not vendor_full: continue
+
+            # vendor_full 에서 사람 이름 추출
+            m = re.match(r'^(.+?)\s*\(([가-힣]{2,4})\)$', vendor_full)
+            if m:
+                vendor_name = m.group(1).strip()
+                operator_name = m.group(2).strip()
+            else:
+                vendor_name = vendor_full
+                operator_name = vendor_full
+            if not operator_name or len(operator_name) < 2: continue
+            if not re.match(r'^[가-힣]{2,4}$', operator_name): continue
+
+            if rrn:
+                rrn = re.sub(r'\s+', '', rrn)
+                if not re.match(r'^\d{6}-\d{7}$', rrn): rrn = None
+            if biz: biz = re.sub(r'\s+', '', biz)
+
+            # 중복 방지
+            dup = c.execute(
+                "SELECT id FROM equipment_operators WHERE name=? AND IFNULL(business_no,'')=IFNULL(?,'')",
+                (operator_name, biz or '')).fetchone()
+            if dup: continue
+            c.execute(
+                """INSERT INTO equipment_operators(name, rrn, business_no, equipment_type, vendor_name)
+                   VALUES(?,?,?,?,?)""",
+                (operator_name, rrn, biz, equipment, vendor_name))
+            stats["operators_added"] += 1
+
+    # ===== [업체계좌] — 형틀노무비 협력사 — 35행 =====
+    if "업체계좌" in wb.sheetnames:
+        ws = wb["업체계좌"]
+        for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            if i < 4: continue   # R1~3 헤더
+            cells = [str(x or '').strip() for x in row]
+            company = cells[1] if len(cells) > 1 else ''
+            usage = cells[2] if len(cells) > 2 else ''       # "형틀노무비"
+            account_full = cells[6] if len(cells) > 6 else ''
+            if not company or company.startswith('#') or company in {'합  계','합계'}: continue
+            if not account_full: continue
+
+            # account_full = "농협 401143-52-236161 조성전" 패턴
+            parts = account_full.split()
+            if len(parts) < 3: continue
+            bank = parts[0]
+            account_no = parts[1]
+            holder = ' '.join(parts[2:])
+
+            dup = c.execute(
+                "SELECT id FROM subcontractors WHERE name=? AND IFNULL(account_no,'')=IFNULL(?,'')",
+                (company, account_no)).fetchone()
+            if dup: continue
+            c.execute(
+                """INSERT INTO subcontractors(name, work_type, bank_name, account_no, account_holder, leader_name)
+                   VALUES(?,?,?,?,?,?)""",
+                (company, usage or None, bank, account_no, holder, holder))
+            stats["subcontractors_added"] += 1
+
+    wb.close()
+    return stats
+
 def import_employee_directory(c, path, replace=False):
     """직원,주주명부 엑셀 → workers + worker_certifications + shareholders + companies 메타 + licenses.
 

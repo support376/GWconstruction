@@ -25,18 +25,31 @@ function shortLicName(name, max = 8) {
 
 function _handle401(r) {
   if (r.status === 401) {
-    // 현재 hash 를 보존해서 로그인 후 돌아오게 (자동 화면 전환 방지)
     try { sessionStorage.setItem('gwc_post_login_hash', location.hash || ''); } catch (e) {}
     location.href = '/login';
-    return new Promise(() => {}); // 더 이상 진행 안 함
+    return new Promise(() => {});
   }
   return r;
 }
+async function _parseResp(r) {
+  // 응답 본문 — JSON 시도, 실패 시 텍스트
+  let body;
+  try { body = await r.json(); } catch (e) { body = { detail: await r.text().catch(()=>'(빈 응답)') }; }
+  if (!r.ok) {
+    // 5xx/4xx: 에러 객체 던지기 — route 의 try/catch 가 받음
+    const msg = body?.detail || body?.error || `HTTP ${r.status}`;
+    const err = new Error(msg);
+    err.status = r.status;
+    err.body = body;
+    throw err;
+  }
+  return body;
+}
 const api = {
-  get: (path) => fetch(path).then(_handle401).then(r => r.json()),
-  post: (path, body) => fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(_handle401).then(r => r.json()),
-  put: (path, body) => fetch(path, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(_handle401).then(r => r.json()),
-  del: (path) => fetch(path, {method:'DELETE'}).then(_handle401).then(r => r.json()),
+  get: (path) => fetch(path).then(_handle401).then(_parseResp),
+  post: (path, body) => fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(_handle401).then(_parseResp),
+  put: (path, body) => fetch(path, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(_handle401).then(_parseResp),
+  del: (path) => fetch(path, {method:'DELETE'}).then(_handle401).then(_parseResp),
 };
 
 async function logout() {
@@ -116,25 +129,36 @@ const DEPRECATED_ROUTES = new Set([
 
 async function navigate() {
   let hash = location.hash.replace(/^#/, '') || '/morning';
-  // deprecated 라우트 가드
   if (DEPRECATED_ROUTES.has(hash)) {
     location.hash = '#/workers';
     return;
   }
   $$('.sb-item').forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + hash));
   $('#app').innerHTML = '<div class="card card-pad">로딩 중…</div>';
-  // 모바일에서 사이드바 자동 닫기
   document.getElementById('sidebar')?.classList.remove('open');
-  // /company/123 같은 동적 라우트 처리
   const m = hash.match(/^\/company\/(\d+)$/);
   if (m) {
     $$('.sb-item').forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#/companies'));
     try { await renderCompanyDetail(+m[1]); }
-    catch (e) { $('#app').innerHTML = '<div class="card card-pad">오류: ' + e + '</div>'; }
+    catch (e) { _renderError(e); }
     return;
   }
   const fn = routes[hash] || routes['/morning'];
-  try { await fn(); } catch (e) { $('#app').innerHTML = '<div class="card card-pad">오류: ' + e + '</div>'; }
+  try { await fn(); } catch (e) { _renderError(e); }
+}
+
+function _renderError(e) {
+  // 상세 에러 화면 — detail + status + trace
+  const msg = (e && e.message) ? e.message : String(e);
+  const status = e?.status ? `HTTP ${e.status}` : '';
+  const trace = e?.body?.trace || '';
+  $('#app').innerHTML = `
+    <div class="card card-pad" style="background:#fdedec; border-color:#f5b7b1; color:#922b21;">
+      <h3 style="margin-bottom:8px">⚠️ 오류 ${status}</h3>
+      <div style="font-size:13px; margin-bottom:8px;"><b>${msg}</b></div>
+      ${trace ? `<details><summary style="cursor:pointer; font-size:11px">trace</summary><pre style="font-size:10.5px; white-space:pre-wrap; margin-top:6px; padding:8px; background:#fbeaea; border-radius:4px; max-height:300px; overflow:auto;">${trace.replace(/</g,'&lt;')}</pre></details>` : ''}
+      <div style="margin-top:10px"><a class="btn btn-sm" href="#/workers">← 직원 관리로 돌아가기</a></div>
+    </div>`;
 }
 window.addEventListener('hashchange', navigate);
 
@@ -748,20 +772,31 @@ route('/workers', async () => {
     $('#btn-upload-label').textContent = '⏳ 업로드 중…';
     try {
       const res = await fetch('/api/workers/upload-excel', { method: 'POST', body: fd });
-      const r = await res.json();
-      if (!r.ok) {
-        alert('업로드 실패: ' + (r.error || '알 수 없는 오류') + '\n\n' + (r.trace||'').slice(0, 500));
+      let r;
+      try { r = await res.json(); }
+      catch (e) {
+        const txt = await res.text().catch(()=>'(empty)');
+        alert(`HTTP ${res.status}\nJSON 아님:\n` + txt.slice(0, 800));
+        return;
+      }
+      console.log('[upload-excel]', res.status, r);
+      if (!res.ok) {
+        alert(`실패 HTTP ${res.status}\n${r.detail || r.error || '(메시지 없음)'}\n\n${(r.trace||'').slice(0,500)}`);
+      } else if (!r.ok) {
+        alert('업로드 실패: ' + (r.error || JSON.stringify(r)) + '\n\n' + (r.trace||'').slice(0, 500));
       } else {
+        const s = r.stats||{}, fin = r.final||{};
         alert(`✅ 업로드 완료\n\n` +
-          `직원 신규 ${r.stats.workers_added||0}건 / 갱신 ${r.stats.workers_updated||0}건\n` +
-          `자격증 추가 ${r.stats.certs_added||0}건\n` +
-          `주주 추가 ${r.stats.shareholders||0}건\n` +
+          `직원 신규 ${s.workers_added||0}건 / 갱신 ${s.workers_updated||0}건\n` +
+          `자격증 추가 ${s.certs_added||0}건\n` +
+          `주주 추가 ${s.shareholders||0}건\n` +
           `자격증→면허 자동 등재 ${r.auto_registered||0}건\n\n` +
-          `총 직원 ${r.final.workers}명 (정규직 ${r.final.office}, 재직 ${r.final.active}) · 자격증 ${r.final.certs}건`);
+          `총 직원 ${fin.workers||0}명 (정규직 ${fin.office||0}, 재직 ${fin.active||0}) · 자격증 ${fin.certs||0}건`);
         navigate();
       }
     } catch (err) {
-      alert('서버 통신 실패: ' + err);
+      alert('서버 통신 실패: ' + (err.message||err));
+      console.error(err);
     } finally {
       $('#btn-upload-label').innerHTML = '📥 엑셀 올리기 <input type="file" id="upload-input" accept=".xlsx,.xlsm,.xls" style="display:none">';
     }
@@ -3956,6 +3991,896 @@ route('/competitors', async () => {
       </div>
     `;
   });
+});
+
+// ============================================================
+// 💰 급여·노무 모듈 (Phase 7)
+// ============================================================
+let _payrollState = { yearMonth: null, companyId: '', search: '' };
+
+function _currentYM() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+}
+
+// ====== 일용직 paste 임포트 — 엑셀 행 복사 → 여기에 paste ======
+function pasteDailyModal() {
+  modal('📋 일용직 일괄 등록 — Excel 행 복붙', `
+    <div style="font-size:12px; line-height:1.6; color:var(--text); margin-bottom:10px;">
+      <b>사용법</b>:
+      <ol style="margin-left:18px; margin-top:4px;">
+        <li>Excel 에서 일용직명단 시트 열기</li>
+        <li>R3 부터 마지막 사람까지 <b>행 전체 선택</b> (행 번호 클릭 → Shift+클릭)</li>
+        <li><b>Ctrl+C</b></li>
+        <li>아래 칸에 <b>Ctrl+V</b></li>
+        <li><b>저장</b> 클릭</li>
+      </ol>
+      <div style="font-size:11px; color:var(--text-muted); margin-top:6px;">
+        한 줄당 한 사람. 컬럼 순서: <b>이름 / 공종 / 주민번호 / 주소 / 은행 / 예금주 / 계좌 / 일당 / 연락처 / 비고</b><br>
+        (탭으로 자동 구분됨. 헤더 줄은 자동 스킵.)
+      </div>
+    </div>
+    <textarea id="paste-text" rows="14" style="width:100%; font-family:ui-monospace,monospace; font-size:11px; padding:8px; border:1px solid var(--border); border-radius:4px;" placeholder="이름	공종	주민번호	주소	은행	예금주	계좌	일당	연락처	비고
+오정만	직영인부	520205-1057335	충북 영동군 학산면	농협	오정만	302-0809-4379-11	120000	010-5334-6133
+..."></textarea>
+    <div style="margin-top:8px; display:flex; align-items:center; gap:8px; font-size:12px;">
+      <label style="margin:0; cursor:pointer;">
+        <input type="checkbox" id="paste-replace"> 기존 일용직 모두 삭제 후 새로 등록
+      </label>
+      <span style="flex:1"></span>
+      <span id="paste-line-count" style="font-size:11px; color:var(--text-muted);">0 줄</span>
+    </div>
+    <div id="paste-result" style="margin-top:10px;"></div>
+  `, async () => {
+    const text = $('#paste-text').value.trim();
+    if (!text) { alert('내용이 비어있습니다'); return false; }
+    const replace = $('#paste-replace').checked;
+    const btn = $('#m-save');
+    btn.disabled = true; btn.textContent = '⏳ 처리 중...';
+    try {
+      const r = await api.post('/api/payroll/paste-daily-workers', { text, replace });
+      const errLines = (r.errors||[]).join('\n');
+      $('#paste-result').innerHTML = `
+        <div style="background:#e7f6ec; border:1px solid #bce5c5; padding:10px; border-radius:6px; color:#196f3d; font-size:12px;">
+          <b>✅ 처리 완료</b><br>
+          전체 ${r.total_lines||0}줄 중 신규 ${r.added||0}명 / 갱신 ${r.updated||0}명<br>
+          헤더 스킵 ${r.skipped_header||0} · 형식이상 스킵 ${r.skipped_invalid||0}
+          ${errLines ? `<details style="margin-top:6px;"><summary style="cursor:pointer">에러 ${r.errors.length}건 (펼치기)</summary><pre style="font-size:10.5px; white-space:pre-wrap; user-select:text; margin-top:4px;">${errLines.replace(/</g,'&lt;')}</pre></details>` : ''}
+        </div>`;
+      setTimeout(() => { $('#modal-root').innerHTML=''; navigate(); }, 1500);
+      return false;  // 모달 자동 닫지 않음 (결과 보여주기)
+    } catch (e) {
+      $('#paste-result').innerHTML = `<div style="background:#fdedec; border:1px solid #f5b7b1; padding:10px; border-radius:6px; color:#922b21; font-size:12px; user-select:text;">실패: ${(e.message||e).toString().replace(/</g,'&lt;')}</div>`;
+      btn.disabled = false; btn.textContent = '저장';
+      return false;
+    }
+  });
+  // 라인수 카운트
+  setTimeout(() => {
+    const ta = $('#paste-text');
+    if (!ta) return;
+    ta.addEventListener('input', () => {
+      const lines = (ta.value.match(/[^\n]+/g) || []).length;
+      const cnt = $('#paste-line-count');
+      if (cnt) cnt.textContent = `${lines} 줄`;
+    });
+    ta.focus();
+  }, 80);
+}
+
+// ====== /payroll/grid — 출역 매트릭스 (메인 입력 화면) ======
+route('/payroll/grid', async () => {
+  if (!_payrollState.yearMonth) _payrollState.yearMonth = _currentYM();
+  const ym = _payrollState.yearMonth;
+  const coId = _payrollState.companyId;
+  const [grid, companies] = await Promise.all([
+    api.get(`/api/payroll/grid?year_month=${ym}${coId?'&company_id='+coId:''}`),
+    api.get('/api/companies'),
+  ]);
+  // 검색 필터
+  let workers = grid.workers;
+  if (_payrollState.search) {
+    const q = _payrollState.search.toLowerCase();
+    workers = workers.filter(w =>
+      (w.name||'').toLowerCase().includes(q) ||
+      (w.job_role||'').toLowerCase().includes(q));
+  }
+  const days = grid.days_in_month;
+  // 직종별 그룹
+  const byJob = {};
+  workers.forEach(w => { (byJob[w.job_role||'(직종 미정)'] = byJob[w.job_role||'(직종 미정)'] || []).push(w); });
+  const jobs = Object.keys(byJob).sort();
+
+  // 합계 (전체)
+  const tot = {
+    days: workers.reduce((s,w)=>s+w.days_worked,0),
+    gross: workers.reduce((s,w)=>s+w.gross_pay,0),
+    deductions: workers.reduce((s,w)=>s+w.total_deductions,0),
+    net: workers.reduce((s,w)=>s+w.net_pay,0),
+    subject: workers.filter(w=>w.is_subject_4ins).length,
+    active: workers.filter(w=>w.days_worked>0).length,
+  };
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">📅 출역 매트릭스 — ${ym}</div>
+        <div class="page-sub">표시 ${workers.length}명 · 출역 ${tot.active}명 · 4대보험 ${tot.subject}명 · 총 ${tot.days}공수 · 노무비 ${fmtMoney(tot.gross)}</div>
+      </div>
+    </div>
+
+    <div class="card workers-toolbar" style="margin-bottom:10px">
+      <input type="month" id="pg-ym" value="${ym}">
+      <select id="pg-co">
+        <option value="">법인 전체</option>
+        ${companies.map(c => `<option value="${c.id}" ${String(coId)===String(c.id)?'selected':''}>${c.name}</option>`).join('')}
+      </select>
+      <input type="text" id="pg-q" placeholder="이름·직종 검색" value="${_payrollState.search||''}" style="min-width:160px">
+      <span style="flex:1"></span>
+      <button class="btn btn-sm btn-primary" id="pg-paste" title="Excel 에서 행 복사 → 여기 붙여넣기 (가장 안정적)">📋 붙여넣기로 일용직 추가</button>
+      <label class="btn btn-sm" id="pg-upload-label" title="2025년10월-일용-총괄.xlsx 같은 파일 (옵션)">
+        📥 엑셀 파일 올리기
+        <input type="file" id="pg-upload" accept=".xlsx,.xlsm,.xls" style="display:none">
+      </label>
+      <a class="btn btn-sm" href="#/payroll/monthly">📋 월별 명세서 →</a>
+    </div>
+
+    <div class="card" style="overflow-x:auto;">
+      <table class="payroll-grid">
+        <thead>
+          <tr class="hdr-day">
+            <th class="col-no">#</th>
+            <th class="col-name">이름</th>
+            <th class="col-job">직종</th>
+            ${Array.from({length:days},(_,i)=>i+1).map(d => `<th class="col-day">${d}</th>`).join('')}
+            <th class="col-sum">일수</th>
+            <th class="col-sum">단가</th>
+            <th class="col-sum">총액</th>
+            <th class="col-sum">공제</th>
+            <th class="col-sum">실수령</th>
+            <th class="col-sum">신고</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${jobs.map(job => {
+            const arr = byJob[job];
+            return `<tr class="job-group"><td colspan="${4+days+6}">📍 ${job} <span class="cnt">${arr.length}명</span></td></tr>` +
+              arr.map((w, i) => {
+                const set = new Set(w.attended_days);
+                const cells = Array.from({length:days},(_,d)=>{
+                  const dd = d+1;
+                  const on = set.has(dd);
+                  return `<td class="col-day day-cell ${on?'on':''}" data-w="${w.id}" data-d="${dd}">${on?'✓':''}</td>`;
+                }).join('');
+                return `<tr data-wid="${w.id}">
+                  <td class="col-no">${i+1}</td>
+                  <td class="col-name"><b>${w.name}</b>${w.exempt_employment_ins?' <span title="고용보험 제외(1952년 이전 출생)" style="color:#a35907; font-size:9px">⚠</span>':''}</td>
+                  <td class="col-job"><span style="font-size:10.5px; color:var(--text-muted)">${w.job_role||'-'}</span></td>
+                  ${cells}
+                  <td class="col-sum"><b>${w.days_worked}</b></td>
+                  <td class="col-sum">${fmt(w.daily_wage)}</td>
+                  <td class="col-sum">${fmt(w.gross_pay)}</td>
+                  <td class="col-sum" style="color:#c0392b">${fmt(w.total_deductions)}</td>
+                  <td class="col-sum"><b style="color:#196f3d">${fmt(w.net_pay)}</b></td>
+                  <td class="col-sum">${w.is_subject_4ins?'<span class="badge badge-orange" style="font-size:9.5px">4대</span>':w.days_worked>0?'<span class="badge badge-gray" style="font-size:9.5px">고용·산재</span>':'-'}</td>
+                </tr>`;
+              }).join('');
+          }).join('')}
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colspan="${3+days}" style="text-align:right; padding:8px"><b>합계</b></td>
+            <td class="col-sum"><b>${tot.days}</b></td>
+            <td></td>
+            <td class="col-sum"><b>${fmt(tot.gross)}</b></td>
+            <td class="col-sum" style="color:#c0392b"><b>${fmt(tot.deductions)}</b></td>
+            <td class="col-sum"><b style="color:#196f3d">${fmt(tot.net)}</b></td>
+            <td class="col-sum">4대 <b>${tot.subject}</b></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+    <div class="diff-banner" style="margin-top:8px; font-size:11.5px">
+      💡 <b>사용법:</b> 셀 클릭 = 출근/결근 토글. 총액 = 일수×단가. 공제는 자동 계산 (갑근세 일당 15만원 면세 적용).
+      4대보험 = 월 8일 이상 OR 220만원 이상. 우측 신고 컬럼: <span class="badge badge-orange" style="font-size:9.5px">4대</span>=4대보험 / <span class="badge badge-gray" style="font-size:9.5px">고용·산재</span>=고용·산재만.
+    </div>
+  `;
+
+  // 셀 클릭 = 토글
+  $$('.day-cell').forEach(cell => cell.onclick = async () => {
+    const wid = +cell.dataset.w;
+    const dd = +cell.dataset.d;
+    const dateStr = `${ym}-${String(dd).padStart(2,'0')}`;
+    const on = cell.classList.contains('on');
+    cell.style.opacity = '0.5';
+    try {
+      await api.post('/api/payroll/grid/toggle', {
+        worker_id: wid, date: dateStr, attended: !on,
+      });
+      navigate();   // 자동 재계산
+    } catch (e) { alert('실패: '+e); cell.style.opacity = '1'; }
+  });
+  $('#pg-ym').onchange = (e) => { _payrollState.yearMonth = e.target.value; navigate(); };
+  $('#pg-co').onchange = (e) => { _payrollState.companyId = e.target.value; navigate(); };
+  $('#pg-q').oninput = (e) => {
+    _payrollState.search = e.target.value;
+    clearTimeout(window.__pgTo); window.__pgTo = setTimeout(navigate, 300);
+  };
+  // 클립보드 paste 임포트
+  $('#pg-paste').onclick = () => pasteDailyModal();
+
+  // 일용직 엑셀 업로드 — 에러는 페이지 박스로 (alert 은 복사 안 됨)
+  $('#pg-upload').onchange = async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const replace = confirm(`"${file.name}" 업로드.\n[확인] = 기존 일용직·특고직·협력사 모두 삭제 후 재구축\n[취소] = 추가 모드`);
+    const fd = new FormData(); fd.append('file', file); fd.append('replace', String(replace));
+    $('#pg-upload-label').textContent = '⏳ 업로드 중…';
+    const showResult = (html, isError) => {
+      let box = $('#pg-upload-result');
+      if (!box) {
+        const tgt = $('.workers-toolbar') || $('#app');
+        const div = document.createElement('div');
+        div.id = 'pg-upload-result';
+        div.style.cssText = 'margin:10px 0; padding:14px 16px; border-radius:6px; user-select:text; cursor:text; max-height:400px; overflow:auto;';
+        tgt.parentNode.insertBefore(div, tgt.nextSibling);
+        box = div;
+      }
+      box.style.background = isError ? '#fdedec' : '#e7f6ec';
+      box.style.color = isError ? '#922b21' : '#196f3d';
+      box.style.border = '1px solid ' + (isError ? '#f5b7b1' : '#bce5c5');
+      box.innerHTML = html;
+    };
+    try {
+      const res = await fetch('/api/payroll/upload-daily-workers', { method:'POST', body:fd });
+      let r;
+      try { r = await res.json(); }
+      catch (parseErr) {
+        const txt = await res.text().catch(()=>'(empty)');
+        showResult(`<b>HTTP ${res.status} — JSON 아님</b><pre style="white-space:pre-wrap; user-select:text;">${txt.replace(/</g,'&lt;').slice(0,2000)}</pre>`, true);
+        return;
+      }
+      console.log('[upload-daily-workers]', res.status, r);
+      if (!res.ok) {
+        showResult(`<b>❌ 실패 HTTP ${res.status}</b><br><br><b>detail:</b> ${(r.detail||r.error||'(없음)').toString().replace(/</g,'&lt;')}<br><br><b>trace:</b><pre style="white-space:pre-wrap; user-select:text; font-size:11px; margin-top:4px;">${(r.trace||'').replace(/</g,'&lt;')}</pre>`, true);
+      } else if (!r.ok) {
+        showResult(`<b>❌ 임포트 실패</b><br>${(r.error||JSON.stringify(r)).replace(/</g,'&lt;')}<br><pre style="white-space:pre-wrap; user-select:text;">${(r.trace||'').replace(/</g,'&lt;')}</pre>`, true);
+      } else {
+        const s = r.stats || {};
+        showResult(`<b>✅ 업로드 완료</b><br>일용직 신규 ${s.daily_workers_added||0} / 갱신 ${s.daily_workers_updated||0}<br>특고직 ${s.operators_added||0}<br>협력사 ${s.subcontractors_added||0}`, false);
+        setTimeout(() => navigate(), 1500);
+      }
+    } catch (err) {
+      showResult(`<b>❌ 통신 실패</b><br>${(err.message||err).toString().replace(/</g,'&lt;')}`, true);
+      console.error(err);
+    }
+    finally { $('#pg-upload-label').innerHTML = '📥 일용직 엑셀 올리기 <input type="file" id="pg-upload" accept=".xlsx,.xlsm,.xls" style="display:none">'; }
+  };
+});
+
+// ====== /payroll/monthly — 월별 명세서 ======
+route('/payroll/monthly', async () => {
+  if (!_payrollState.yearMonth) _payrollState.yearMonth = _currentYM();
+  const ym = _payrollState.yearMonth;
+  const coId = _payrollState.companyId;
+  const [m, companies] = await Promise.all([
+    api.get(`/api/payroll/monthly?year_month=${ym}${coId?'&company_id='+coId:''}`),
+    api.get('/api/companies'),
+  ]);
+  const t = m.totals;
+  // 직영만 (출역>0)
+  const all = [...m.subject_4ins, ...m.not_subject];
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">📋 월별 명세서 — ${ym}</div>
+        <div class="page-sub">출역 ${t.active_workers}명 · 4대보험 대상 ${t.subject_4ins_count}명 · 일반 ${t.not_subject_count}명 · 총 ${fmtMoney(t.gross_pay)} · 실수령 ${fmtMoney(t.net_pay)}</div>
+      </div>
+    </div>
+
+    <div class="card workers-toolbar" style="margin-bottom:10px">
+      <input type="month" id="pm-ym" value="${ym}">
+      <select id="pm-co">
+        <option value="">법인 전체</option>
+        ${companies.map(c => `<option value="${c.id}" ${String(coId)===String(c.id)?'selected':''}>${c.name}</option>`).join('')}
+      </select>
+      <span style="flex:1"></span>
+      <a class="btn btn-sm" href="#/payroll/grid">📅 출역 매트릭스 ←</a>
+    </div>
+
+    <div class="stat-grid" style="margin-bottom:14px">
+      <div class="stat accent"><div class="label">총액 (Gross)</div><div class="value">${fmtMoney(t.gross_pay)}</div><div class="delta">총 공수 ${t.total_days}공수</div></div>
+      <div class="stat warning"><div class="label">공제 합계</div><div class="value">${fmtMoney(t.total_deductions)}</div><div class="delta">갑근세·4대보험 등</div></div>
+      <div class="stat success"><div class="label">실수령</div><div class="value">${fmtMoney(t.net_pay)}</div></div>
+      <div class="stat"><div class="label">퇴직공제 (사업주)</div><div class="value">${fmtMoney(t.retirement_fund)}</div><div class="delta">일 6,500원 적립</div></div>
+    </div>
+
+    <div class="card" style="overflow-x:auto;">
+      <table class="payroll-detail-table">
+        <thead><tr>
+          <th>#</th><th>이름</th><th>직종</th><th>주민번호</th>
+          <th class="num">일수</th><th class="num">단가</th><th class="num">총액</th>
+          <th class="num">갑근세</th><th class="num">주민세</th>
+          <th class="num">고용</th><th class="num">국민</th><th class="num">건강</th><th class="num">장기</th>
+          <th class="num">공제계</th><th class="num">실수령</th>
+          <th>은행 / 계좌</th><th>신고</th>
+        </tr></thead>
+        <tbody>
+          ${all.length === 0 ? '<tr><td colspan="17" style="text-align:center; padding:30px; color:var(--text-muted)">출역 데이터 없음. <a href="#/payroll/grid">출역 매트릭스</a> 에서 입력하세요.</td></tr>' :
+            all.map((w, i) => `<tr>
+              <td>${i+1}</td>
+              <td><b>${w.name}</b>${w.exempt_employment_ins?' <span style="color:#a35907; font-size:9px" title="1952년 이전 출생 — 고용보험 제외">⚠</span>':''}</td>
+              <td style="font-size:11px; color:var(--text-muted)">${w.job_role||'-'}</td>
+              <td style="font-size:11px; color:var(--text-muted); font-family:ui-monospace,monospace">${w.rrn||'-'}</td>
+              <td class="num">${w.days_worked}</td>
+              <td class="num">${fmt(w.daily_wage)}</td>
+              <td class="num"><b>${fmt(w.gross_pay)}</b></td>
+              <td class="num">${fmt(w.income_tax)}</td>
+              <td class="num">${fmt(w.local_tax)}</td>
+              <td class="num">${fmt(w.employment_insurance)}</td>
+              <td class="num">${fmt(w.national_pension)}</td>
+              <td class="num">${fmt(w.health_insurance)}</td>
+              <td class="num">${fmt(w.ltc_insurance)}</td>
+              <td class="num" style="color:#c0392b">${fmt(w.total_deductions)}</td>
+              <td class="num"><b style="color:#196f3d">${fmt(w.net_pay)}</b></td>
+              <td style="font-size:11px; color:var(--text-muted)">${w.bank_name||''} ${w.bank_account||''}</td>
+              <td>${w.is_subject_4ins?'<span class="badge badge-orange" style="font-size:9.5px">4대</span>':'<span class="badge badge-gray" style="font-size:9.5px">고용·산재</span>'}</td>
+            </tr>`).join('')}
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colspan="4" style="text-align:right">합계</td>
+            <td class="num"><b>${t.total_days}</b></td>
+            <td></td>
+            <td class="num"><b>${fmt(t.gross_pay)}</b></td>
+            <td class="num">${fmt(t.income_tax)}</td>
+            <td class="num">${fmt(t.local_tax)}</td>
+            <td class="num">${fmt(t.employment_insurance)}</td>
+            <td class="num">${fmt(t.national_pension)}</td>
+            <td class="num">${fmt(t.health_insurance)}</td>
+            <td class="num">${fmt(t.ltc_insurance)}</td>
+            <td class="num" style="color:#c0392b"><b>${fmt(t.total_deductions)}</b></td>
+            <td class="num"><b style="color:#196f3d">${fmt(t.net_pay)}</b></td>
+            <td colspan="2"></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  `;
+  $('#pm-ym').onchange = (e) => { _payrollState.yearMonth = e.target.value; navigate(); };
+  $('#pm-co').onchange = (e) => { _payrollState.companyId = e.target.value; navigate(); };
+});
+
+// ====== /payroll/report — 신고 분류 ======
+route('/payroll/report', async () => {
+  if (!_payrollState.yearMonth) _payrollState.yearMonth = _currentYM();
+  const ym = _payrollState.yearMonth;
+  const coId = _payrollState.companyId;
+  const [m, subPays, eqPays, companies] = await Promise.all([
+    api.get(`/api/payroll/monthly?year_month=${ym}${coId?'&company_id='+coId:''}`),
+    api.get(`/api/payroll/subcontractor-payments?year_month=${ym}`),
+    api.get(`/api/payroll/equipment-payments`),
+    api.get('/api/companies'),
+  ]);
+  const t = m.totals;
+  const eqPaysFiltered = eqPays.filter(p => (p.paid_at||'').startsWith(ym));
+  const subPaysFiltered = subPays;
+  // 퇴직공제 합계
+  const retirement = m.workers_all.reduce((s,w)=>s+w.retirement_fund,0);
+  const totalAllSources = t.gross_pay + subPaysFiltered.reduce((s,p)=>s+(p.amount||0),0) + eqPaysFiltered.reduce((s,p)=>s+(p.amount||0),0);
+
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">📑 신고 분류 — ${ym}</div>
+        <div class="page-sub">월별 노무비 분류: 직영(4대보험 대상/비대상) · 외주 협력사 · 특고직 · 퇴직공제</div>
+      </div>
+    </div>
+
+    <div class="card workers-toolbar" style="margin-bottom:10px">
+      <input type="month" id="pr-ym" value="${ym}">
+      <select id="pr-co">
+        <option value="">법인 전체</option>
+        ${companies.map(c => `<option value="${c.id}" ${String(coId)===String(c.id)?'selected':''}>${c.name}</option>`).join('')}
+      </select>
+    </div>
+
+    <div class="stat-grid" style="margin-bottom:14px">
+      <div class="stat accent"><div class="label">총 노무비 (전 출처)</div><div class="value">${fmtMoney(totalAllSources)}</div></div>
+      <div class="stat"><div class="label">직영 일용직</div><div class="value">${fmtMoney(t.gross_pay)}</div><div class="delta">${t.active_workers}명 · ${t.total_days}공수</div></div>
+      <div class="stat"><div class="label">외주 협력사</div><div class="value">${fmtMoney(subPaysFiltered.reduce((s,p)=>s+(p.amount||0),0))}</div><div class="delta">${subPaysFiltered.length}건</div></div>
+      <div class="stat"><div class="label">특고직 (장비)</div><div class="value">${fmtMoney(eqPaysFiltered.reduce((s,p)=>s+(p.amount||0),0))}</div><div class="delta">${eqPaysFiltered.length}건</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head"><h3>① 직영 일용직 — 4대보험 대상 (${t.subject_4ins_count}명) · 신고: 4대보험 + 근로내용확인</h3></div>
+      <div style="overflow-x:auto"><table class="table">
+        <thead><tr><th>이름</th><th>주민</th><th>직종</th><th class="num">일수</th><th class="num">총액</th><th class="num">국민연금</th><th class="num">건강</th><th class="num">장기</th><th class="num">고용</th><th class="num">갑근세</th><th class="num">주민세</th><th class="num">실수령</th></tr></thead>
+        <tbody>${m.subject_4ins.length === 0 ? '<tr><td colspan="12" style="text-align:center; color:var(--text-muted)">대상자 없음</td></tr>' :
+          m.subject_4ins.map(w => `<tr>
+            <td><b>${w.name}</b></td><td style="font-size:11px">${w.rrn||'-'}</td><td>${w.job_role||'-'}</td>
+            <td class="num">${w.days_worked}</td><td class="num">${fmt(w.gross_pay)}</td>
+            <td class="num">${fmt(w.national_pension)}</td><td class="num">${fmt(w.health_insurance)}</td>
+            <td class="num">${fmt(w.ltc_insurance)}</td><td class="num">${fmt(w.employment_insurance)}</td>
+            <td class="num">${fmt(w.income_tax)}</td><td class="num">${fmt(w.local_tax)}</td>
+            <td class="num"><b>${fmt(w.net_pay)}</b></td></tr>`).join('')}</tbody>
+      </table></div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head"><h3>② 직영 일용직 — 4대보험 비대상 (${t.not_subject_count}명) · 신고: 고용·산재만 (근로내용확인)</h3></div>
+      <div style="overflow-x:auto"><table class="table">
+        <thead><tr><th>이름</th><th>주민</th><th>직종</th><th class="num">일수</th><th class="num">총액</th><th class="num">고용</th><th class="num">갑근세</th><th class="num">주민세</th><th class="num">실수령</th></tr></thead>
+        <tbody>${m.not_subject.length === 0 ? '<tr><td colspan="9" style="text-align:center; color:var(--text-muted)">대상자 없음</td></tr>' :
+          m.not_subject.map(w => `<tr>
+            <td><b>${w.name}</b></td><td style="font-size:11px">${w.rrn||'-'}</td><td>${w.job_role||'-'}</td>
+            <td class="num">${w.days_worked}</td><td class="num">${fmt(w.gross_pay)}</td>
+            <td class="num">${fmt(w.employment_insurance)}</td>
+            <td class="num">${fmt(w.income_tax)}</td><td class="num">${fmt(w.local_tax)}</td>
+            <td class="num"><b>${fmt(w.net_pay)}</b></td></tr>`).join('')}</tbody>
+      </table></div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head" style="display:flex; justify-content:space-between; align-items:center">
+        <h3>③ 외주 협력사 (${subPaysFiltered.length}건) · 노무비 신고 X · 사업자 거래 (세금계산서)</h3>
+        <a class="btn btn-sm" href="#/payroll/vendors">+ 협력사 입금 추가</a>
+      </div>
+      <div style="overflow-x:auto"><table class="table">
+        <thead><tr><th>업체명</th><th>업종</th><th>현장</th><th>기간</th><th class="num">금액</th><th>입금일</th><th>계좌</th><th>비고</th></tr></thead>
+        <tbody>${subPaysFiltered.length === 0 ? '<tr><td colspan="8" style="text-align:center; color:var(--text-muted)">입금 내역 없음</td></tr>' :
+          subPaysFiltered.map(p => `<tr>
+            <td><b>${p.subcontractor_name}</b></td><td>${p.work_type||'-'}</td><td>${p.site_name||'-'}</td>
+            <td style="font-size:11px">${p.work_period||'-'}</td>
+            <td class="num"><b>${fmt(p.amount)}</b></td>
+            <td style="font-size:11px">${(p.paid_at||'').slice(0,10)}</td>
+            <td style="font-size:11px; color:var(--text-muted)">${p.bank_name||''} ${p.account_no||''}</td>
+            <td style="font-size:11px">${p.note||'-'}</td></tr>`).join('')}</tbody>
+      </table></div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head" style="display:flex; justify-content:space-between; align-items:center">
+        <h3>④ 특고직 (장비) — ${eqPaysFiltered.length}건 · 사업자 거래 (세금계산서)</h3>
+        <a class="btn btn-sm" href="#/payroll/vendors">+ 특고직 입금 추가</a>
+      </div>
+      <div style="overflow-x:auto"><table class="table">
+        <thead><tr><th>운전자</th><th>장비</th><th>업체</th><th>현장</th><th class="num">일수</th><th class="num">단가</th><th class="num">금액</th><th>입금일</th></tr></thead>
+        <tbody>${eqPaysFiltered.length === 0 ? '<tr><td colspan="8" style="text-align:center; color:var(--text-muted)">입금 내역 없음</td></tr>' :
+          eqPaysFiltered.map(p => `<tr>
+            <td><b>${p.operator_name}</b></td><td>${p.equipment_type||'-'}</td>
+            <td style="font-size:11px">${p.vendor_name||'-'}</td><td>${p.site_name||'-'}</td>
+            <td class="num">${p.days_worked||0}</td><td class="num">${fmt(p.daily_rate||0)}</td>
+            <td class="num"><b>${fmt(p.amount)}</b></td>
+            <td style="font-size:11px">${(p.paid_at||'').slice(0,10)}</td></tr>`).join('')}</tbody>
+      </table></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>⑤ 퇴직공제 (건설근로자공제회) — 직영 일용직 전체 ${t.total_days}공수 × 6,500원 = ${fmtMoney(retirement)}</h3></div>
+      <div class="card-pad" style="font-size:12.5px; color:var(--text-muted)">
+        사업주 부담 (직원 공제 X). 매월 공제회에 신고 + 적립.
+        대상자: 위 ① + ② 의 모든 일용직 (출역 1일 이상).
+      </div>
+    </div>
+  `;
+  $('#pr-ym').onchange = (e) => { _payrollState.yearMonth = e.target.value; navigate(); };
+  $('#pr-co').onchange = (e) => { _payrollState.companyId = e.target.value; navigate(); };
+});
+
+// ====== /payroll/rates — 공제율·단가 마스터 ======
+route('/payroll/rates', async () => {
+  const [taxRates, wageRates] = await Promise.all([
+    api.get('/api/payroll/tax-rates'),
+    api.get('/api/payroll/wage-rates'),
+  ]);
+  const labels = {
+    pension: '국민연금', health: '건강보험', ltc: '장기요양 (건강 기준)',
+    employment: '고용보험', income_tax: '갑근세 율', income_tax_reduction: '갑근세 감면율',
+    local_tax: '주민세 (갑근세 기준)', income_tax_exempt: '갑근세 면세점 (일당)',
+    retirement_fund_per_day: '퇴직공제 (일당)',
+    ins_threshold_days: '4대보험 적용 기준 (일수)',
+    ins_threshold_amount: '4대보험 적용 기준 (월 금액)',
+  };
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">💵 단가·공제율 마스터</div>
+        <div class="page-sub">갑근세·4대보험·퇴직공제 비율 + 직종별 표준 일당. 매년 변경 시 여기서 수정.</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head"><h3>📊 공제율 (${taxRates[0]?.year || _currentYM().slice(0,4)})</h3></div>
+      <table class="table">
+        <thead><tr><th>항목</th><th>값</th><th>단위</th><th>설명</th><th></th></tr></thead>
+        <tbody>
+          ${taxRates.map(r => `<tr data-rid="${r.id}">
+            <td><b>${labels[r.rate_type] || r.rate_type}</b><div style="font-size:10px; color:var(--text-muted)">${r.rate_type}</div></td>
+            <td><input type="number" step="${r.is_amount?'1':'0.0001'}" value="${r.rate}" data-f="rate" style="width:140px; padding:4px 8px; font-family:ui-monospace,monospace;"></td>
+            <td>${r.is_amount ? '원' : '비율 (예: 0.045 = 4.5%)'}</td>
+            <td style="font-size:11.5px; color:var(--text-muted)">${r.note||''}</td>
+            <td><button class="btn btn-sm" data-save-tax="${r.id}">저장</button></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-head" style="display:flex; justify-content:space-between; align-items:center">
+        <h3>💼 직종별 표준 일당 (${wageRates.length}직종)</h3>
+        <button class="btn btn-sm btn-primary" id="add-wage">+ 직종 추가</button>
+      </div>
+      <table class="table">
+        <thead><tr><th>직종</th><th class="num">일당 (원)</th><th>적용시작</th><th>비고</th><th></th></tr></thead>
+        <tbody>
+          ${wageRates.map(r => `<tr data-wrid="${r.id}">
+            <td><input type="text" value="${r.job_role}" data-f="job_role" style="padding:4px 8px;"></td>
+            <td><input type="number" value="${r.daily_wage}" data-f="daily_wage" style="width:120px; padding:4px 8px; text-align:right; font-family:ui-monospace,monospace;"></td>
+            <td><input type="date" value="${(r.effective_from||'').slice(0,10)}" data-f="effective_from" style="padding:4px 8px;"></td>
+            <td><input type="text" value="${r.note||''}" data-f="note" style="padding:4px 8px;"></td>
+            <td>
+              <button class="btn btn-sm" data-save-wage="${r.id}">저장</button>
+              <button class="btn btn-sm btn-danger" data-del-wage="${r.id}">삭제</button>
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+  // 공제율 저장
+  $$('[data-save-tax]').forEach(b => b.onclick = async () => {
+    const tr = b.closest('tr');
+    const rid = b.dataset.saveTax;
+    const orig = taxRates.find(r => r.id == rid);
+    await api.put('/api/payroll/tax-rates/'+rid, {
+      year: orig.year, rate_type: orig.rate_type,
+      rate: parseFloat(tr.querySelector('[data-f=rate]').value),
+      is_amount: orig.is_amount, note: orig.note,
+    });
+    alert('저장됨'); navigate();
+  });
+  // 단가 저장
+  $$('[data-save-wage]').forEach(b => b.onclick = async () => {
+    const tr = b.closest('tr');
+    const rid = b.dataset.saveWage;
+    await api.put('/api/payroll/wage-rates/'+rid, {
+      job_role: tr.querySelector('[data-f=job_role]').value,
+      daily_wage: parseInt(tr.querySelector('[data-f=daily_wage]').value),
+      effective_from: tr.querySelector('[data-f=effective_from]').value || null,
+      note: tr.querySelector('[data-f=note]').value || null,
+    });
+    alert('저장됨');
+  });
+  $$('[data-del-wage]').forEach(b => b.onclick = async () => {
+    if (!confirm('삭제?')) return;
+    await api.del('/api/payroll/wage-rates/'+b.dataset.delWage);
+    navigate();
+  });
+  $('#add-wage').onclick = async () => {
+    const job = prompt('직종명 (예: 미장공)');
+    if (!job) return;
+    const wage = prompt('일당 (원)', '180000');
+    if (!wage) return;
+    await api.post('/api/payroll/wage-rates', {
+      job_role: job, daily_wage: parseInt(wage),
+      effective_from: today(), note: null,
+    });
+    navigate();
+  };
+});
+
+// ====== /payroll/vendors — 협력사·특고직 ======
+let _vendorTab = 'sub';   // 'sub' | 'eq' | 'sub_pay' | 'eq_pay'
+route('/payroll/vendors', async () => {
+  const [subs, eqs, subPays, eqPays, companies, sites] = await Promise.all([
+    api.get('/api/payroll/subcontractors'),
+    api.get('/api/payroll/equipment-operators'),
+    api.get('/api/payroll/subcontractor-payments'),
+    api.get('/api/payroll/equipment-payments'),
+    api.get('/api/companies'),
+    api.get('/api/sites?active_only=false'),
+  ]);
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">🏗 협력사 / 특고직 / 입금내역</div>
+        <div class="page-sub">외주 노무비 + 장비 사용료 — 사업자 거래 (직영 일용직과 별도 신고)</div>
+      </div>
+    </div>
+
+    <div class="ref-tabs">
+      <button class="ref-tab ${_vendorTab==='sub'?'active':''}" data-vt="sub">🏢 협력사 (${subs.length})</button>
+      <button class="ref-tab ${_vendorTab==='eq'?'active':''}" data-vt="eq">🚜 특고직 (${eqs.length})</button>
+      <button class="ref-tab ${_vendorTab==='sub_pay'?'active':''}" data-vt="sub_pay">💸 협력사 입금 (${subPays.length})</button>
+      <button class="ref-tab ${_vendorTab==='eq_pay'?'active':''}" data-vt="eq_pay">💰 특고직 입금 (${eqPays.length})</button>
+    </div>
+
+    <div id="vendor-content"></div>
+  `;
+  $$('.ref-tab').forEach(b => b.onclick = () => { _vendorTab = b.dataset.vt; navigate(); });
+
+  if (_vendorTab === 'sub') {
+    $('#vendor-content').innerHTML = `
+      <div class="card">
+        <div class="card-head" style="display:flex; justify-content:space-between"><h3>외주 협력사</h3><button class="btn btn-sm btn-primary" id="add-sub">+ 협력사 추가</button></div>
+        <table class="table">
+          <thead><tr><th>업체명</th><th>업종</th><th>사업자번호</th><th>반장</th><th>연락처</th><th>은행 / 계좌</th><th></th></tr></thead>
+          <tbody>${subs.length === 0 ? '<tr><td colspan="7" style="text-align:center; color:var(--text-muted)">협력사 없음</td></tr>' :
+            subs.map(s => `<tr>
+              <td><b>${s.name}</b></td><td>${s.work_type||'-'}</td>
+              <td style="font-size:11px">${s.business_no||'-'}</td>
+              <td>${s.leader_name||'-'}</td><td>${s.phone||'-'}</td>
+              <td style="font-size:11px">${s.bank_name||''} ${s.account_no||''} ${s.account_holder?`(${s.account_holder})`:''}</td>
+              <td>
+                <button class="btn btn-sm" data-edit-sub="${s.id}">수정</button>
+                <button class="btn btn-sm btn-danger" data-del-sub="${s.id}">삭제</button>
+              </td></tr>`).join('')}</tbody>
+        </table>
+      </div>`;
+    $('#add-sub').onclick = () => subcontractorModal(null);
+    $$('[data-edit-sub]').forEach(b => b.onclick = () => subcontractorModal(subs.find(s => s.id == b.dataset.editSub)));
+    $$('[data-del-sub]').forEach(b => b.onclick = async () => {
+      if (!confirm('삭제?')) return;
+      await api.del('/api/payroll/subcontractors/'+b.dataset.delSub); navigate();
+    });
+  }
+  else if (_vendorTab === 'eq') {
+    $('#vendor-content').innerHTML = `
+      <div class="card">
+        <div class="card-head" style="display:flex; justify-content:space-between"><h3>특고직 (장비 운전자)</h3><button class="btn btn-sm btn-primary" id="add-eq">+ 특고직 추가</button></div>
+        <table class="table">
+          <thead><tr><th>이름</th><th>장비</th><th>소속업체</th><th>주민/사업자번호</th><th class="num">일단가</th><th>연락처</th><th>계좌</th><th></th></tr></thead>
+          <tbody>${eqs.length === 0 ? '<tr><td colspan="8" style="text-align:center; color:var(--text-muted)">특고직 없음</td></tr>' :
+            eqs.map(o => `<tr>
+              <td><b>${o.name}</b></td><td>${o.equipment_type||'-'}</td>
+              <td style="font-size:11px">${o.vendor_name||'-'}</td>
+              <td style="font-size:10.5px; color:var(--text-muted)">${o.business_no||''}<br>${o.rrn||''}</td>
+              <td class="num">${fmt(o.daily_rate||0)}</td>
+              <td>${o.phone||'-'}</td>
+              <td style="font-size:11px">${o.bank_name||''} ${o.account_no||''}</td>
+              <td>
+                <button class="btn btn-sm" data-edit-eq="${o.id}">수정</button>
+                <button class="btn btn-sm btn-danger" data-del-eq="${o.id}">삭제</button>
+              </td></tr>`).join('')}</tbody>
+        </table>
+      </div>`;
+    $('#add-eq').onclick = () => operatorModal(null);
+    $$('[data-edit-eq]').forEach(b => b.onclick = () => operatorModal(eqs.find(o => o.id == b.dataset.editEq)));
+    $$('[data-del-eq]').forEach(b => b.onclick = async () => {
+      if (!confirm('삭제?')) return;
+      await api.del('/api/payroll/equipment-operators/'+b.dataset.delEq); navigate();
+    });
+  }
+  else if (_vendorTab === 'sub_pay') {
+    $('#vendor-content').innerHTML = `
+      <div class="card">
+        <div class="card-head" style="display:flex; justify-content:space-between"><h3>협력사 입금 내역</h3><button class="btn btn-sm btn-primary" id="add-subpay">+ 입금 추가</button></div>
+        <table class="table">
+          <thead><tr><th>업체</th><th>현장</th><th>기간</th><th class="num">금액</th><th>입금일</th><th>비고</th><th></th></tr></thead>
+          <tbody>${subPays.length === 0 ? '<tr><td colspan="7" style="text-align:center; color:var(--text-muted)">입금 내역 없음</td></tr>' :
+            subPays.map(p => `<tr>
+              <td><b>${p.subcontractor_name}</b><div style="font-size:10.5px; color:var(--text-muted)">${p.work_type||''}</div></td>
+              <td>${p.site_name||'-'}</td><td style="font-size:11px">${p.work_period||'-'}</td>
+              <td class="num"><b>${fmt(p.amount)}</b></td>
+              <td style="font-size:11px">${(p.paid_at||'').slice(0,10)}</td>
+              <td style="font-size:11px">${p.note||'-'}</td>
+              <td><button class="btn btn-sm btn-danger" data-del-subpay="${p.id}">삭제</button></td></tr>`).join('')}</tbody>
+        </table>
+      </div>`;
+    $('#add-subpay').onclick = () => subPaymentModal(subs, sites);
+    $$('[data-del-subpay]').forEach(b => b.onclick = async () => {
+      if (!confirm('삭제?')) return;
+      await api.del('/api/payroll/subcontractor-payments/'+b.dataset.delSubpay); navigate();
+    });
+  }
+  else if (_vendorTab === 'eq_pay') {
+    $('#vendor-content').innerHTML = `
+      <div class="card">
+        <div class="card-head" style="display:flex; justify-content:space-between"><h3>특고직 입금 내역</h3><button class="btn btn-sm btn-primary" id="add-eqpay">+ 입금 추가</button></div>
+        <table class="table">
+          <thead><tr><th>운전자</th><th>장비</th><th>현장</th><th class="num">일수</th><th class="num">단가</th><th class="num">금액</th><th>입금일</th><th></th></tr></thead>
+          <tbody>${eqPays.length === 0 ? '<tr><td colspan="8" style="text-align:center; color:var(--text-muted)">입금 내역 없음</td></tr>' :
+            eqPays.map(p => `<tr>
+              <td><b>${p.operator_name}</b></td><td>${p.equipment_type||'-'}</td>
+              <td>${p.site_name||'-'}</td>
+              <td class="num">${p.days_worked||0}</td>
+              <td class="num">${fmt(p.daily_rate||0)}</td>
+              <td class="num"><b>${fmt(p.amount)}</b></td>
+              <td style="font-size:11px">${(p.paid_at||'').slice(0,10)}</td>
+              <td><button class="btn btn-sm btn-danger" data-del-eqpay="${p.id}">삭제</button></td></tr>`).join('')}</tbody>
+        </table>
+      </div>`;
+    $('#add-eqpay').onclick = () => eqPaymentModal(eqs, sites);
+    $$('[data-del-eqpay]').forEach(b => b.onclick = async () => {
+      if (!confirm('삭제?')) return;
+      await api.del('/api/payroll/equipment-payments/'+b.dataset.delEqpay); navigate();
+    });
+  }
+});
+
+function subcontractorModal(s) {
+  const isNew = !s;
+  modal(isNew?'+ 협력사 추가':'협력사 수정', `
+    <div class="form-grid">
+      <div class="form-row"><label>업체명 *</label><input id="f-n" value="${s?.name||''}"></div>
+      <div class="form-row"><label>업종</label><input id="f-wt" value="${s?.work_type||''}" placeholder="형틀/철근/방수/조경"></div>
+      <div class="form-row"><label>사업자번호</label><input id="f-bn" value="${s?.business_no||''}"></div>
+      <div class="form-row"><label>반장</label><input id="f-ld" value="${s?.leader_name||''}"></div>
+      <div class="form-row"><label>연락처</label><input id="f-ph" value="${s?.phone||''}"></div>
+      <div class="form-row"><label>은행</label><input id="f-bk" value="${s?.bank_name||''}"></div>
+      <div class="form-row"><label>예금주</label><input id="f-ah" value="${s?.account_holder||''}"></div>
+      <div class="form-row"><label>계좌번호</label><input id="f-ac" value="${s?.account_no||''}"></div>
+    </div>
+    <div class="form-row"><label>주소</label><input id="f-ad" value="${s?.address||''}"></div>
+    <div class="form-row"><label>비고</label><input id="f-nt" value="${s?.note||''}"></div>
+  `, async () => {
+    const p = {
+      name: $('#f-n').value.trim(), work_type: $('#f-wt').value.trim()||null,
+      business_no: $('#f-bn').value.trim()||null, leader_name: $('#f-ld').value.trim()||null,
+      phone: $('#f-ph').value.trim()||null, bank_name: $('#f-bk').value.trim()||null,
+      account_holder: $('#f-ah').value.trim()||null, account_no: $('#f-ac').value.trim()||null,
+      address: $('#f-ad').value.trim()||null, note: $('#f-nt').value.trim()||null,
+    };
+    if (!p.name) { alert('업체명 필수'); return false; }
+    if (isNew) await api.post('/api/payroll/subcontractors', p);
+    else      await api.put('/api/payroll/subcontractors/'+s.id, p);
+    navigate();
+  });
+}
+
+function operatorModal(o) {
+  const isNew = !o;
+  modal(isNew?'+ 특고직 추가':'특고직 수정', `
+    <div class="form-grid">
+      <div class="form-row"><label>이름 *</label><input id="f-n" value="${o?.name||''}"></div>
+      <div class="form-row"><label>장비종류</label><input id="f-et" value="${o?.equipment_type||''}" placeholder="B/H, D/T15TON, 5T살수, 추레라"></div>
+      <div class="form-row"><label>소속업체</label><input id="f-vd" value="${o?.vendor_name||''}" placeholder="글로벌운수, 통일중기"></div>
+      <div class="form-row"><label>일단가</label><input id="f-dr" type="number" value="${o?.daily_rate||0}"></div>
+      <div class="form-row"><label>주민번호</label><input id="f-rrn" value="${o?.rrn||''}"></div>
+      <div class="form-row"><label>사업자번호</label><input id="f-bn" value="${o?.business_no||''}"></div>
+      <div class="form-row"><label>연락처</label><input id="f-ph" value="${o?.phone||''}"></div>
+      <div class="form-row"><label>은행</label><input id="f-bk" value="${o?.bank_name||''}"></div>
+      <div class="form-row"><label>예금주</label><input id="f-ah" value="${o?.account_holder||''}"></div>
+      <div class="form-row"><label>계좌</label><input id="f-ac" value="${o?.account_no||''}"></div>
+    </div>
+    <div class="form-row"><label>비고</label><input id="f-nt" value="${o?.note||''}"></div>
+  `, async () => {
+    const p = {
+      name: $('#f-n').value.trim(), equipment_type: $('#f-et').value.trim()||null,
+      vendor_name: $('#f-vd').value.trim()||null, daily_rate: parseInt($('#f-dr').value)||0,
+      rrn: $('#f-rrn').value.trim()||null, business_no: $('#f-bn').value.trim()||null,
+      phone: $('#f-ph').value.trim()||null, bank_name: $('#f-bk').value.trim()||null,
+      account_holder: $('#f-ah').value.trim()||null, account_no: $('#f-ac').value.trim()||null,
+      note: $('#f-nt').value.trim()||null,
+    };
+    if (!p.name) { alert('이름 필수'); return false; }
+    if (isNew) await api.post('/api/payroll/equipment-operators', p);
+    else      await api.put('/api/payroll/equipment-operators/'+o.id, p);
+    navigate();
+  });
+}
+
+function subPaymentModal(subs, sites) {
+  modal('+ 협력사 입금 추가', `
+    <div class="form-grid">
+      <div class="form-row"><label>협력사 *</label>
+        <select id="f-sc"><option value="">선택</option>${subs.map(s=>`<option value="${s.id}">${s.name} (${s.work_type||''})</option>`).join('')}</select>
+      </div>
+      <div class="form-row"><label>현장</label>
+        <select id="f-st"><option value="">미지정</option>${sites.map(s=>`<option value="${s.id}">${s.name}</option>`).join('')}</select>
+      </div>
+      <div class="form-row"><label>작업기간</label><input id="f-wp" placeholder="예: 2025-10"></div>
+      <div class="form-row"><label>입금일</label><input id="f-pd" type="date" value="${today()}"></div>
+      <div class="form-row" style="grid-column:span 2"><label>금액 *</label><input id="f-am" type="number" placeholder="원"></div>
+    </div>
+    <div class="form-row"><label>비고</label><input id="f-nt" placeholder="세금계산서 번호 등"></div>
+  `, async () => {
+    const p = {
+      subcontractor_id: +$('#f-sc').value, site_id: +$('#f-st').value || null,
+      work_period: $('#f-wp').value || null, paid_at: $('#f-pd').value || null,
+      amount: parseInt($('#f-am').value), note: $('#f-nt').value || null,
+    };
+    if (!p.subcontractor_id || !p.amount) { alert('협력사 + 금액 필수'); return false; }
+    await api.post('/api/payroll/subcontractor-payments', p);
+    navigate();
+  });
+}
+
+function eqPaymentModal(eqs, sites) {
+  modal('+ 특고직 입금 추가', `
+    <div class="form-grid">
+      <div class="form-row"><label>특고직 *</label>
+        <select id="f-op"><option value="">선택</option>${eqs.map(o=>`<option value="${o.id}" data-rate="${o.daily_rate||0}">${o.name} (${o.equipment_type||''})</option>`).join('')}</select>
+      </div>
+      <div class="form-row"><label>현장</label>
+        <select id="f-st"><option value="">미지정</option>${sites.map(s=>`<option value="${s.id}">${s.name}</option>`).join('')}</select>
+      </div>
+      <div class="form-row"><label>일수</label><input id="f-dy" type="number" value="1"></div>
+      <div class="form-row"><label>일단가</label><input id="f-dr" type="number"></div>
+      <div class="form-row"><label>입금일</label><input id="f-pd" type="date" value="${today()}"></div>
+      <div class="form-row"><label>총액 *</label><input id="f-am" type="number" placeholder="자동계산 또는 수기"></div>
+    </div>
+    <div class="form-row"><label>비고</label><input id="f-nt"></div>
+  `, async () => {
+    const p = {
+      operator_id: +$('#f-op').value, site_id: +$('#f-st').value || null,
+      days_worked: parseInt($('#f-dy').value)||0, daily_rate: parseInt($('#f-dr').value)||0,
+      amount: parseInt($('#f-am').value), paid_at: $('#f-pd').value || null,
+      note: $('#f-nt').value || null,
+    };
+    if (!p.operator_id || !p.amount) { alert('특고직 + 총액 필수'); return false; }
+    await api.post('/api/payroll/equipment-payments', p);
+    navigate();
+  });
+  // 자동 계산 헬퍼
+  setTimeout(() => {
+    const compute = () => {
+      const opt = $('#f-op').selectedOptions[0];
+      if (opt && opt.dataset.rate && !$('#f-dr').value) $('#f-dr').value = opt.dataset.rate;
+      const dy = parseInt($('#f-dy').value)||0, dr = parseInt($('#f-dr').value)||0;
+      if (dy && dr) $('#f-am').value = dy * dr;
+    };
+    $('#f-op').onchange = compute;
+    $('#f-dy').oninput = compute;
+    $('#f-dr').oninput = compute;
+  }, 50);
+}
+
+// ====== /payroll/dashboard — 월별 노무비 추이 ======
+route('/payroll/dashboard', async () => {
+  const year = new Date().getFullYear();
+  const data = await api.get(`/api/payroll/dashboard?year=${year}`);
+  const months = data.months;
+  const total = months.reduce((s,m)=>s+m.grand_total,0);
+  const direct = months.reduce((s,m)=>s+m.direct_labor,0);
+  const sub = months.reduce((s,m)=>s+m.subcontractor_total,0);
+  const eq = months.reduce((s,m)=>s+m.equipment_total,0);
+  $('#app').innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">📊 월별 노무비 추이 — ${year}년</div>
+        <div class="page-sub">직영 + 외주 + 특고직 통합 — 누적 ${fmtMoney(total)}</div>
+      </div>
+    </div>
+    <div class="stat-grid" style="margin-bottom:14px">
+      <div class="stat accent"><div class="label">총 노무비</div><div class="value">${fmtMoney(total)}</div></div>
+      <div class="stat"><div class="label">직영 일용직</div><div class="value">${fmtMoney(direct)}</div><div class="delta">${total?Math.round(direct/total*100):0}%</div></div>
+      <div class="stat"><div class="label">외주 협력사</div><div class="value">${fmtMoney(sub)}</div><div class="delta">${total?Math.round(sub/total*100):0}%</div></div>
+      <div class="stat"><div class="label">특고직</div><div class="value">${fmtMoney(eq)}</div><div class="delta">${total?Math.round(eq/total*100):0}%</div></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>월별 상세</h3></div>
+      <table class="table">
+        <thead><tr><th>월</th><th class="num">직영 (원)</th><th class="num">공수</th><th class="num">인원</th><th class="num">외주 (원)</th><th class="num">건수</th><th class="num">특고직 (원)</th><th class="num">건수</th><th class="num">합계</th></tr></thead>
+        <tbody>
+          ${months.map(m => `<tr>
+            <td><b>${m.year_month}</b></td>
+            <td class="num">${fmt(m.direct_labor)}</td>
+            <td class="num">${m.direct_person_days}</td>
+            <td class="num">${m.direct_unique_workers}</td>
+            <td class="num">${fmt(m.subcontractor_total)}</td>
+            <td class="num">${m.subcontractor_count}</td>
+            <td class="num">${fmt(m.equipment_total)}</td>
+            <td class="num">${m.equipment_count}</td>
+            <td class="num"><b>${fmt(m.grand_total)}</b></td>
+          </tr>`).join('')}
+        </tbody>
+        <tfoot>
+          <tr>
+            <td><b>${year}년 합계</b></td>
+            <td class="num"><b>${fmt(direct)}</b></td>
+            <td class="num"><b>${months.reduce((s,m)=>s+m.direct_person_days,0)}</b></td>
+            <td></td>
+            <td class="num"><b>${fmt(sub)}</b></td>
+            <td class="num"><b>${months.reduce((s,m)=>s+m.subcontractor_count,0)}</b></td>
+            <td class="num"><b>${fmt(eq)}</b></td>
+            <td class="num"><b>${months.reduce((s,m)=>s+m.equipment_count,0)}</b></td>
+            <td class="num"><b>${fmt(total)}</b></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  `;
 });
 
 // ============================================================
