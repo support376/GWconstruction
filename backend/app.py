@@ -373,7 +373,7 @@ SCHEMA_MIGRATIONS = [
     "ALTER TABLE workers ADD COLUMN job_specialty TEXT",
     "ALTER TABLE workers ADD COLUMN asbestos_certified INTEGER DEFAULT 0",
     "ALTER TABLE workers ADD COLUMN resigned_at TEXT",
-    "ALTER TABLE workers ADD COLUMN position TEXT",  -- 직책
+    "ALTER TABLE workers ADD COLUMN position TEXT",
     # companies 확장
     "ALTER TABLE companies ADD COLUMN incorporation_date TEXT",
     "ALTER TABLE companies ADD COLUMN registration_date TEXT",
